@@ -1,0 +1,21 @@
+{
+  "name": "morning-post",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Daily Telegram post generated from inp.one's hot-coins snapshot.",
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "fixtures:gen": "node tools/gen-fixtures.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
+  }
+}
