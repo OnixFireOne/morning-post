@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { plural } from "../src/format.js";
+import { plural, verbForm } from "../src/format.js";
 
 const COINS = ["монета", "монеты", "монет"] as const;
 const DAYS = ["день", "дня", "дней"] as const;
+const FALLS = ["падает", "падают"] as const;
 
 describe("plural", () => {
 	it.each([
@@ -42,5 +43,27 @@ describe("plural", () => {
 	it("treats negative numbers the same as their absolute value", () => {
 		expect(plural(-1, COINS)).toBe("монета");
 		expect(plural(-5, COINS)).toBe("монет");
+	});
+});
+
+describe("verbForm", () => {
+	it.each([
+		[1, "падает"],
+		[2, "падают"],
+		[11, "падают"],
+		[21, "падает"],
+		[101, "падает"],
+	])("verbForm(%i, [падает, падают]) === %s", (n, expected) => {
+		expect(verbForm(n, FALLS)).toBe(expected);
+	});
+
+	it("21 is singular, 11 is plural — the two-form rule diverges from plural()'s three forms", () => {
+		expect(verbForm(21, FALLS)).toBe("падает");
+		expect(verbForm(11, FALLS)).toBe("падают");
+	});
+
+	it("treats negative numbers the same as their absolute value", () => {
+		expect(verbForm(-1, FALLS)).toBe("падает");
+		expect(verbForm(-2, FALLS)).toBe("падают");
 	});
 });

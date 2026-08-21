@@ -1,15 +1,33 @@
 // Словарь фраз по веткам (раздел 4.2). Логика ветвления живёт в render.ts —
 // этот файл только формулировки, чтобы их можно было править не трогая код.
 import type { Facts } from "./facts.js";
-import { formatMagnitude, formatSignedPercent, plural } from "./format.js";
+import { formatMagnitude, formatSignedPercent, plural, verbForm } from "./format.js";
 
 // Формы объявлены один раз здесь — шаблоны ниже никогда не зашивают
-// "монета"/"монеты"/"монет" или "день"/"дня"/"дней" строками напрямую,
-// только через plural(). См. src/format.ts:plural().
+// "монета"/"монеты"/"монет", "день"/"дня"/"дней" или глаголы/причастия рядом
+// со счётчиком строками напрямую, только через plural()/verbForm().
 const COIN_FORMS = ["монета", "монеты", "монет"] as const;
 const DAY_FORMS = ["день", "дня", "дней"] as const;
 const coins = (n: number) => plural(n, COIN_FORMS);
 const days = (n: number) => plural(n, DAY_FORMS);
+
+// Глаголы/причастия рядом со счётчиком — двухформенное согласование
+// (verbForm), не то же самое, что три формы существительного (plural()).
+// falls/grows идут с "красным"/"зелёным" счётчиком соответственно (падают —
+// красные монеты, растут — зелёные); rising/falling — родительный падеж
+// после "против" ("против 21 растущей", "против 11 растущих").
+const FALLS_FORMS = ["падает", "падают"] as const;
+const GROWS_FORMS = ["растёт", "растут"] as const;
+const HOLDS_FORMS = ["держится", "держатся"] as const;
+const REMAINS_FORMS = ["остаётся", "остаются"] as const;
+const RISING_FORMS = ["растущей", "растущих"] as const;
+const FALLING_FORMS = ["падающей", "падающих"] as const;
+const falls = (n: number) => verbForm(n, FALLS_FORMS);
+const grows = (n: number) => verbForm(n, GROWS_FORMS);
+const holds = (n: number) => verbForm(n, HOLDS_FORMS);
+const remains = (n: number) => verbForm(n, REMAINS_FORMS);
+const rising = (n: number) => verbForm(n, RISING_FORMS);
+const falling = (n: number) => verbForm(n, FALLING_FORMS);
 
 function dayOfYear(dateKey: string): number {
 	const [y, m, d] = dateKey.split("-").map(Number) as [number, number, number];
@@ -55,25 +73,26 @@ type PhraseVariant = (facts: Facts) => string;
 
 export const RED_STREAK_VARIANTS: readonly PhraseVariant[] = [
 	(f) =>
-		`${ordinalWordRu(f.streak)} день подряд рой красный: биток медленно сползает, большинство монет в минусе — ${f.red} падают против ${f.green} растущих в основном рое.`,
-	(f) => `${ordinalWordRu(f.streak)} день подряд рынок в минусе: ${f.red} ${coins(f.red)} падают, только ${f.green} держатся в плюсе.`,
+		`${ordinalWordRu(f.streak)} день подряд рой красный: биток медленно сползает, большинство монет в минусе — ${f.red} ${falls(f.red)} против ${f.green} ${rising(f.green)} в основном рое.`,
 	(f) =>
-		`Красная серия не отпускает: уже ${f.streak} ${days(f.streak)} подряд рой в минусе — ${f.red} ${coins(f.red)} падают против ${f.green} растущих.`,
+		`${ordinalWordRu(f.streak)} день подряд рынок в минусе: ${f.red} ${coins(f.red)} ${falls(f.red)}, только ${f.green} ${holds(f.green)} в плюсе.`,
+	(f) =>
+		`Красная серия не отпускает: уже ${f.streak} ${days(f.streak)} подряд рой в минусе — ${f.red} ${coins(f.red)} ${falls(f.red)} против ${f.green} ${rising(f.green)}.`,
 ];
 
 export const RED_STREAK_SHORT: PhraseVariant = (f) => `Красный рой уже ${f.streak} ${days(f.streak)} подряд: ${f.red} против ${f.green}.`;
 
 export const RED_FIRST_VARIANTS: readonly PhraseVariant[] = [
-	(f) => `Рой развернулся в минус: ${f.red} ${coins(f.red)} падают против ${f.green} растущих.`,
-	(f) => `После зелёных дней рой покраснел: ${f.red} ${coins(f.red)} в минусе, ${f.green} держатся в плюсе.`,
-	(f) => `Разворот вниз: падают ${f.red} ${coins(f.red)}, растут только ${f.green}.`,
+	(f) => `Рой развернулся в минус: ${f.red} ${coins(f.red)} ${falls(f.red)} против ${f.green} ${rising(f.green)}.`,
+	(f) => `После зелёных дней рой покраснел: ${f.red} ${coins(f.red)} в минусе, ${f.green} ${holds(f.green)} в плюсе.`,
+	(f) => `Разворот вниз: ${falls(f.red)} ${f.red} ${coins(f.red)}, ${grows(f.green)} только ${f.green}.`,
 ];
 
 export const RED_FIRST_SHORT: PhraseVariant = (f) => `Рой в минусе: ${f.red} против ${f.green}.`;
 
 export const GREEN_STREAK_VARIANTS: readonly PhraseVariant[] = [
-	(f) => `${f.streak}-й день рой держится в зелёном: ${f.green} ${coins(f.green)} в плюсе против ${f.red} падающих.`,
-	(f) => `Зелёная серия продолжается — ${f.streak}-й день подряд: ${f.green} ${coins(f.green)} растут, ${f.red} в минусе.`,
+	(f) => `${f.streak}-й день рой держится в зелёном: ${f.green} ${coins(f.green)} в плюсе против ${f.red} ${falling(f.red)}.`,
+	(f) => `Зелёная серия продолжается — ${f.streak}-й день подряд: ${f.green} ${coins(f.green)} ${grows(f.green)}, ${f.red} в минусе.`,
 	(f) => `Рой зеленеет уже ${f.streak} ${days(f.streak)} подряд: в плюсе ${f.green} ${coins(f.green)}, в минусе ${f.red}.`,
 ];
 
@@ -81,15 +100,15 @@ export const GREEN_STREAK_SHORT: PhraseVariant = (f) => `Зелёный рой �
 
 export const GREEN_FIRST_VARIANTS: readonly PhraseVariant[] = [
 	(f) => `Рой зеленеет после падения: ${f.green} ${coins(f.green)} в плюсе против ${f.red} в минусе.`,
-	(f) => `Рынок развернулся вверх: ${f.green} ${coins(f.green)} растут, ${f.red} остаются в минусе.`,
-	(f) => `Зелёный разворот: в плюсе ${f.green} ${coins(f.green)} против ${f.red} падающих.`,
+	(f) => `Рынок развернулся вверх: ${f.green} ${coins(f.green)} ${grows(f.green)}, ${f.red} ${remains(f.red)} в минусе.`,
+	(f) => `Зелёный разворот: в плюсе ${f.green} ${coins(f.green)} против ${f.red} ${falling(f.red)}.`,
 ];
 
 export const GREEN_FIRST_SHORT: PhraseVariant = (f) => `Рой зеленеет: ${f.green} против ${f.red}.`;
 
 export const MIXED_VARIANTS: readonly PhraseVariant[] = [
 	(f) => `Рынок разошёлся: ${f.green} ${coins(f.green)} в плюсе, ${f.red} в минусе — единого направления нет.`,
-	(f) => `Ни одного явного тренда: ${f.green} ${coins(f.green)} растут, ${f.red} падают почти поровну.`,
+	(f) => `Ни одного явного тренда: ${f.green} ${coins(f.green)} ${grows(f.green)}, ${f.red} ${falls(f.red)} почти поровну.`,
 	(f) => `Рой разбрёлся в разные стороны: ${f.green} в плюсе против ${f.red} в минусе.`,
 ];
 

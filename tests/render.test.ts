@@ -111,6 +111,32 @@ describe("buildParagraphs: picture paragraph branch selection", () => {
 	});
 });
 
+describe("buildParagraphs: verb/participle agreement at red = 1 (integration, not just the bare verbForm unit)", () => {
+	it("uses singular verb forms ('растёт'/'падает'), not plural, when a count is exactly 1", () => {
+		// red = 1, green = 1 -> total 2, neither ratio >= 0.6 -> swarmState "mixed".
+		// ts is 2026-01-01 (Moscow) -> dayOfYear 1 -> pickVariant lands on
+		// MIXED_VARIANTS[1], the one with a verb attached to each count.
+		const snap: HotCoinsSnapshot = {
+			version: 1,
+			ts: "2026-01-01T06:00:00.000Z",
+			btc: { price: 50_000, change24h: 1 },
+			mainSwarm: [
+				{ id: "coin-a", ticker: "AAA", change24h: 5, price: 1, marketCap: null },
+				{ id: "coin-b", ticker: "BBB", change24h: -5, price: 1, marketCap: null },
+			],
+			edgePins: [],
+		};
+		const facts = computeFacts(snap, EMPTY_HISTORY);
+		expect(facts.red).toBe(1);
+		expect(facts.green).toBe(1);
+		expect(facts.swarmState).toBe("mixed");
+
+		const { picture } = buildParagraphs(facts);
+		expect(picture).toBe("Ни одного явного тренда: 1 монета растёт, 1 падает почти поровну.");
+		expect(picture).not.toMatch(/1 монета растут|1 монета падают|1 растут|1 падают/);
+	});
+});
+
 describe("buildParagraphs: observation paragraph branch selection", () => {
 	it("quiet BTC + wild edges -> quiet-dump branch", () => {
 		const facts = factsFor("red-first-day.json"); // btc -0.59%, maxAbsEdgeChange 25
