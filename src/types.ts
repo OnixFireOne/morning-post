@@ -18,3 +18,11 @@ export type SwarmCoin = {
 	price: number;
 	marketCap: number | null;
 };
+
+// Where the snapshot actually lands in the page (раздел 2) — capture.ts reads
+// this through page.evaluate(). Undefined without ?snapshot=1.
+declare global {
+	interface Window {
+		__HOT_COINS_SNAPSHOT__?: HotCoinsSnapshot;
+	}
+}

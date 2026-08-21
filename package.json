@@ -11,7 +11,15 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "fixtures:gen": "node tools/gen-fixtures.mjs"
+    "fixtures:gen": "node tools/gen-fixtures.mjs",
+    "dry": "cross-env DRY_RUN=1 tsx src/index.ts",
+    "dry:fixture": "cross-env DRY_RUN=1 tsx src/index.ts"
+  },
+  "dependencies": {
+    "cross-env": "10.1.0",
+    "dotenv": "17.4.2",
+    "playwright": "1.62.1",
+    "tsx": "4.23.12"
   },
   "devDependencies": {
     "@types/node": "24.13.3",
