@@ -1,0 +1,43 @@
+name: Manual dry run
+
+# Только ручной запуск из веб-интерфейса — никакого schedule (раздел 6:
+# расписание живёт на VPS, через системный cron, не здесь).
+on:
+  workflow_dispatch: {}
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    # Тот же образ, что и Dockerfile — одна и та же версия Chromium/Node
+    # что в проде, а не то, что случайно окажется на ubuntu-latest.
+    container:
+      image: mcr.microsoft.com/playwright:v1.62.1-jammy
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - name: Dry run against the live site
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+          CHART_SELECTOR: "#hot-coins-chart"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TARGET_CHAT_ID: ${{ secrets.TELEGRAM_TARGET_CHAT_ID }}
+          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          TZ: Europe/Moscow
+          STATE_FILE: ./data/state.json
+          DRY_RUN: "1"
+          MIN_SWARM_SIZE: "20"
+        run: npx tsx src/index.ts
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dry-run-output
+          path: out/
+          if-no-files-found: ignore

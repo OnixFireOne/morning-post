@@ -1,0 +1,13 @@
+# One-shot: `docker compose run --rm morning-post` делает один пост и
+# выходит. Никакого `docker compose up` — сервис не демон, restart: "no".
+services:
+  morning-post:
+    image: ghcr.io/onixfireone/morning-post:latest
+    build: .
+    restart: "no"
+    env_file:
+      - .env
+    volumes:
+      # STATE_FILE в .env — ./data/state.json, тот же путь и внутри контейнера
+      # (WORKDIR /app) — история переживает пересоздание контейнера.
+      - ./data:/app/data

@@ -1,0 +1,14 @@
+node_modules
+.git
+.env
+data
+out
+dist
+fixtures
+tests
+tools
+plan
+*.log
+README.md
+.gitattributes
+.gitignore
