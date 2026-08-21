@@ -1,5 +1,6 @@
 import { chromium } from "playwright";
-import { parseSnapshot } from "./snapshot.js";
+import { RetryExhaustedError } from "./errors.js";
+import { parseSnapshot, SnapshotContractError } from "./snapshot.js";
 import type { HotCoinsSnapshot } from "./types.js";
 
 export type CaptureOptions = {
@@ -79,7 +80,12 @@ const DEFAULT_RETRY: RetryOptions = { attempts: 2, delayMs: 30_000 };
 /**
  * Раздел 8: при неудаче — ретрай с новым контекстом браузера (каждый вызов
  * captureOnce уже поднимает и закрывает свой собственный browser). Ошибка
- * никогда не глотается молча — после исчерпания попыток бросаем последнюю.
+ * никогда не глотается молча — после исчерпания попыток бросаем
+ * RetryExhaustedError, чтобы index.ts мог указать в алерте число ретраев.
+ *
+ * Контракт снапшота (version !== 1) — исключение: это не транзиентный сбой,
+ * ретраи его не починят, поэтому SnapshotContractError пробрасывается сразу,
+ * без ожидания и без переупаковки в RetryExhaustedError.
  */
 export async function captureSnapshotAndScreenshot(opts: CaptureOptions, retry: RetryOptions = DEFAULT_RETRY): Promise<CaptureResult> {
 	let lastError: unknown;
@@ -87,6 +93,7 @@ export async function captureSnapshotAndScreenshot(opts: CaptureOptions, retry: 
 		try {
 			return await captureOnce(opts);
 		} catch (err) {
+			if (err instanceof SnapshotContractError) throw err;
 			lastError = err;
 			const message = err instanceof Error ? err.message : String(err);
 			console.error(`[capture] attempt ${attempt}/${retry.attempts} failed: ${message}`);
@@ -95,5 +102,6 @@ export async function captureSnapshotAndScreenshot(opts: CaptureOptions, retry: 
 			}
 		}
 	}
-	throw lastError;
+	const message = lastError instanceof Error ? lastError.message : String(lastError);
+	throw new RetryExhaustedError(`capture failed after ${retry.attempts} attempts: ${message}`, retry.attempts, { cause: lastError });
 }
