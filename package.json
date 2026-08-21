@@ -13,7 +13,9 @@
     "test:watch": "vitest",
     "fixtures:gen": "node tools/gen-fixtures.mjs",
     "dry": "cross-env DRY_RUN=1 tsx src/index.ts",
-    "dry:fixture": "cross-env DRY_RUN=1 tsx src/index.ts"
+    "dry:fixture": "cross-env DRY_RUN=1 tsx src/index.ts",
+    "post": "cross-env DRY_RUN=0 tsx src/index.ts",
+    "post:force": "cross-env DRY_RUN=0 tsx src/index.ts --force"
   },
   "dependencies": {
     "cross-env": "10.1.0",
