@@ -32,3 +32,19 @@ export function formatBtcPrice(price: number): string {
 	const digits = price >= 1000 ? 0 : 2;
 	return new Intl.NumberFormat("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(price);
 }
+
+/**
+ * Standard Russian plural agreement for a cardinal number: forms[0] for 1
+ * (but not 11), forms[1] for 2-4 (but not 12-14), forms[2] otherwise —
+ * `plural(21, ["монета", "монеты", "монет"])` → "монета", `plural(5, ...)` →
+ * "монет". Ordinals ("21-й день") don't go through this — they're always
+ * singular regardless of the number, a different rule entirely.
+ */
+export function plural(n: number, forms: readonly [string, string, string]): string {
+	const abs = Math.abs(Math.trunc(n));
+	const mod10 = abs % 10;
+	const mod100 = abs % 100;
+	if (mod10 === 1 && mod100 !== 11) return forms[0];
+	if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return forms[1];
+	return forms[2];
+}

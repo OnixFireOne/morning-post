@@ -1,7 +1,15 @@
 // Словарь фраз по веткам (раздел 4.2). Логика ветвления живёт в render.ts —
 // этот файл только формулировки, чтобы их можно было править не трогая код.
 import type { Facts } from "./facts.js";
-import { formatMagnitude, formatSignedPercent } from "./format.js";
+import { formatMagnitude, formatSignedPercent, plural } from "./format.js";
+
+// Формы объявлены один раз здесь — шаблоны ниже никогда не зашивают
+// "монета"/"монеты"/"монет" или "день"/"дня"/"дней" строками напрямую,
+// только через plural(). См. src/format.ts:plural().
+const COIN_FORMS = ["монета", "монеты", "монет"] as const;
+const DAY_FORMS = ["день", "дня", "дней"] as const;
+const coins = (n: number) => plural(n, COIN_FORMS);
+const days = (n: number) => plural(n, DAY_FORMS);
 
 function dayOfYear(dateKey: string): number {
 	const [y, m, d] = dateKey.split("-").map(Number) as [number, number, number];
@@ -48,39 +56,40 @@ type PhraseVariant = (facts: Facts) => string;
 export const RED_STREAK_VARIANTS: readonly PhraseVariant[] = [
 	(f) =>
 		`${ordinalWordRu(f.streak)} день подряд рой красный: биток медленно сползает, большинство монет в минусе — ${f.red} падают против ${f.green} растущих в основном рое.`,
-	(f) => `${ordinalWordRu(f.streak)} день подряд рынок в минусе: ${f.red} монет падают, только ${f.green} держатся в плюсе.`,
-	(f) => `Красная серия не отпускает — ${ordinalWordRu(f.streak).toLowerCase()} день подряд: ${f.red} монет в минусе против ${f.green} растущих.`,
+	(f) => `${ordinalWordRu(f.streak)} день подряд рынок в минусе: ${f.red} ${coins(f.red)} падают, только ${f.green} держатся в плюсе.`,
+	(f) =>
+		`Красная серия не отпускает: уже ${f.streak} ${days(f.streak)} подряд рой в минусе — ${f.red} ${coins(f.red)} падают против ${f.green} растущих.`,
 ];
 
-export const RED_STREAK_SHORT: PhraseVariant = (f) => `Красный рой ${f.streak}-й день подряд: ${f.red} против ${f.green}.`;
+export const RED_STREAK_SHORT: PhraseVariant = (f) => `Красный рой уже ${f.streak} ${days(f.streak)} подряд: ${f.red} против ${f.green}.`;
 
 export const RED_FIRST_VARIANTS: readonly PhraseVariant[] = [
-	(f) => `Рой развернулся в минус: ${f.red} монет падают против ${f.green} растущих.`,
-	(f) => `После зелёных дней рой покраснел: ${f.red} монет в минусе, ${f.green} держатся в плюсе.`,
-	(f) => `Разворот вниз: падают ${f.red} монет, растут только ${f.green}.`,
+	(f) => `Рой развернулся в минус: ${f.red} ${coins(f.red)} падают против ${f.green} растущих.`,
+	(f) => `После зелёных дней рой покраснел: ${f.red} ${coins(f.red)} в минусе, ${f.green} держатся в плюсе.`,
+	(f) => `Разворот вниз: падают ${f.red} ${coins(f.red)}, растут только ${f.green}.`,
 ];
 
 export const RED_FIRST_SHORT: PhraseVariant = (f) => `Рой в минусе: ${f.red} против ${f.green}.`;
 
 export const GREEN_STREAK_VARIANTS: readonly PhraseVariant[] = [
-	(f) => `${f.streak}-й день рой держится в зелёном: ${f.green} монет в плюсе против ${f.red} падающих.`,
-	(f) => `Зелёная серия продолжается — ${f.streak}-й день подряд: ${f.green} монет растут, ${f.red} в минусе.`,
-	(f) => `Рой зеленеет уже ${f.streak}-й день: в плюсе ${f.green} монет, в минусе ${f.red}.`,
+	(f) => `${f.streak}-й день рой держится в зелёном: ${f.green} ${coins(f.green)} в плюсе против ${f.red} падающих.`,
+	(f) => `Зелёная серия продолжается — ${f.streak}-й день подряд: ${f.green} ${coins(f.green)} растут, ${f.red} в минусе.`,
+	(f) => `Рой зеленеет уже ${f.streak} ${days(f.streak)} подряд: в плюсе ${f.green} ${coins(f.green)}, в минусе ${f.red}.`,
 ];
 
-export const GREEN_STREAK_SHORT: PhraseVariant = (f) => `Зелёный рой ${f.streak}-й день подряд: ${f.green} против ${f.red}.`;
+export const GREEN_STREAK_SHORT: PhraseVariant = (f) => `Зелёный рой уже ${f.streak} ${days(f.streak)} подряд: ${f.green} против ${f.red}.`;
 
 export const GREEN_FIRST_VARIANTS: readonly PhraseVariant[] = [
-	(f) => `Рой зеленеет после падения: ${f.green} монет в плюсе против ${f.red} в минусе.`,
-	(f) => `Рынок развернулся вверх: ${f.green} монет растут, ${f.red} остаются в минусе.`,
-	(f) => `Зелёный разворот: в плюсе ${f.green} монет против ${f.red} падающих.`,
+	(f) => `Рой зеленеет после падения: ${f.green} ${coins(f.green)} в плюсе против ${f.red} в минусе.`,
+	(f) => `Рынок развернулся вверх: ${f.green} ${coins(f.green)} растут, ${f.red} остаются в минусе.`,
+	(f) => `Зелёный разворот: в плюсе ${f.green} ${coins(f.green)} против ${f.red} падающих.`,
 ];
 
 export const GREEN_FIRST_SHORT: PhraseVariant = (f) => `Рой зеленеет: ${f.green} против ${f.red}.`;
 
 export const MIXED_VARIANTS: readonly PhraseVariant[] = [
-	(f) => `Рынок разошёлся: ${f.green} монет в плюсе, ${f.red} в минусе — единого направления нет.`,
-	(f) => `Ни одного явного тренда: ${f.green} монет растут, ${f.red} падают почти поровну.`,
+	(f) => `Рынок разошёлся: ${f.green} ${coins(f.green)} в плюсе, ${f.red} в минусе — единого направления нет.`,
+	(f) => `Ни одного явного тренда: ${f.green} ${coins(f.green)} растут, ${f.red} падают почти поровну.`,
 	(f) => `Рой разбрёлся в разные стороны: ${f.green} в плюсе против ${f.red} в минусе.`,
 ];
 
