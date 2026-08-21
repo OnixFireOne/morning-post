@@ -1,0 +1,7 @@
+{
+  "days": [
+    { "date": "2026-08-15", "swarmState": "red", "btcChange": -2.4, "postedAt": "2026-08-15T06:00:09Z", "messageId": 998 },
+    { "date": "2026-08-16", "swarmState": "red", "btcChange": -3.1, "postedAt": "2026-08-16T06:00:11Z", "messageId": 999 },
+    { "date": "2026-08-17", "swarmState": "red", "btcChange": -1.8, "postedAt": "2026-08-17T06:00:14Z", "messageId": 1001 }
+  ]
+}
