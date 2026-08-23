@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadSnapshotFromFile } from "../src/snapshot.js";
@@ -8,7 +9,7 @@ import { buildCaption, buildParagraphs, CAPTION_LIMIT } from "../src/render.js";
 import { escapeHtml, formatBtcPercent, formatSignedPercent } from "../src/format.js";
 import {
 	BTC_LEADS_VARIANTS,
-	CALM_DAY_VARIANTS,
+	CORRECTION_VARIANTS,
 	GREEN_FIRST_VARIANTS,
 	GREEN_STREAK_VARIANTS,
 	MIXED_SHORT,
@@ -16,6 +17,7 @@ import {
 	NEUTRAL_NO_BTC_VARIANTS,
 	NEUTRAL_WITH_BTC_VARIANTS,
 	QUIET_DUMP_VARIANTS,
+	REBOUND_VARIANTS,
 	RED_FIRST_VARIANTS,
 	RED_STREAK_VARIANTS,
 } from "../src/phrases.js";
@@ -23,8 +25,25 @@ import {
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
 const EMPTY_HISTORY: StateHistory = { days: [] };
 
+const ALL_FIXTURE_NAMES = [
+	"real-day.json",
+	"red-streak.json",
+	"red-first-day.json",
+	"green.json",
+	"mixed.json",
+	"boring.json",
+	"no-btc.json",
+	"edge-empty.json",
+	"red-boundary-60.json",
+	"escape-html.json",
+];
+
 function factsFor(name: string, history: StateHistory = EMPTY_HISTORY): Facts {
 	return computeFacts(loadSnapshotFromFile(path.join(FIXTURES_DIR, name)), history);
+}
+
+function historyFixture(name: string): StateHistory {
+	return JSON.parse(readFileSync(path.join(FIXTURES_DIR, "history", name), "utf8"));
 }
 
 describe("format helpers", () => {
@@ -138,32 +157,86 @@ describe("buildParagraphs: verb/participle agreement at red = 1 (integration, no
 });
 
 describe("buildParagraphs: observation paragraph branch selection", () => {
-	it("quiet BTC + wild edges -> quiet-dump branch", () => {
-		const facts = factsFor("red-first-day.json"); // btc -0.59%, maxAbsEdgeChange 25
+	it("prevState green -> swarmState red: correction branch, ahead of btc-leads even though |btc%| >= 3", () => {
+		const facts = factsFor("red-streak.json", historyFixture("green-to-red.json"));
+		expect(facts.prevState).toBe("green");
+		expect(facts.swarmState).toBe("red");
+		expect(Math.abs(facts.btc!.change24h)).toBeGreaterThanOrEqual(3); // btc-leads would otherwise also match
+		expect(CORRECTION_VARIANTS.map((v) => v(facts))).toContain(buildParagraphs(facts).observation);
+	});
+
+	it("prevState red -> swarmState green: rebound branch, ahead of btc-leads even though |btc%| >= 3", () => {
+		const facts = factsFor("green.json", historyFixture("red-then-green.json"));
+		expect(facts.prevState).toBe("red");
+		expect(facts.swarmState).toBe("green");
+		expect(Math.abs(facts.btc!.change24h)).toBeGreaterThanOrEqual(3);
+		expect(REBOUND_VARIANTS.map((v) => v(facts))).toContain(buildParagraphs(facts).observation);
+	});
+
+	it("a gap right before today does not trigger the correction branch, even with an older matching entry", () => {
+		const facts = factsFor("red-streak.json", historyFixture("green-gap-before-today.json"));
+		expect(facts.prevState).toBeNull();
+		expect(BTC_LEADS_VARIANTS.map((v) => v(facts))).toContain(buildParagraphs(facts).observation);
+	});
+
+	it("quiet BTC + a wild leader -> quiet-dump branch", () => {
+		const facts = factsFor("red-first-day.json"); // btc -0.59%, maxAbsLeaderChange 25
 		expect(QUIET_DUMP_VARIANTS.map((v) => v(facts))).toContain(buildParagraphs(facts).observation);
 	});
 
 	it("|btc%| >= 3 -> btc-leads branch", () => {
-		const facts = factsFor("red-streak.json"); // btc -4.1%
+		const facts = factsFor("red-streak.json"); // btc -4.1%, empty history -> prevState null
 		expect(BTC_LEADS_VARIANTS.map((v) => v(facts))).toContain(buildParagraphs(facts).observation);
 	});
 
-	it("edges under 8% -> calm-day branch, regardless of btc", () => {
-		expect(CALM_DAY_VARIANTS.map((v) => v(factsFor("boring.json")))).toContain(buildParagraphs(factsFor("boring.json")).observation);
-		const emptyEdges = factsFor("edge-empty.json"); // btc 0.9%, edges 0
-		expect(CALM_DAY_VARIANTS.map((v) => v(emptyEdges))).toContain(buildParagraphs(emptyEdges).observation);
-	});
-
-	it("otherwise, with btc known -> neutral-with-btc branch", () => {
-		const facts = factsFor("mixed.json"); // btc 1.6%, maxAbsEdgeChange 11.5
-		expect(NEUTRAL_WITH_BTC_VARIANTS.map((v) => v(facts))).toContain(buildParagraphs(facts).observation);
+	it("otherwise, with btc known -> neutral-with-btc branch (no calm-day branch exists anymore)", () => {
+		for (const name of ["mixed.json", "boring.json", "edge-empty.json"]) {
+			const facts = factsFor(name);
+			expect(NEUTRAL_WITH_BTC_VARIANTS.map((v) => v(facts))).toContain(buildParagraphs(facts).observation);
+		}
 	});
 
 	it("otherwise, with btc missing -> neutral-no-btc branch, and never mentions BTC", () => {
-		const facts = factsFor("no-btc.json"); // btc null, maxAbsEdgeChange 13.2
+		const facts = factsFor("no-btc.json"); // btc null, maxAbsLeaderChange 13.2
 		const { observation } = buildParagraphs(facts);
 		expect(NEUTRAL_NO_BTC_VARIANTS.map((v) => v(facts))).toContain(observation);
 		expect(observation).not.toMatch(/биток|BTC/i);
+	});
+});
+
+describe("buildParagraphs: no more edge-of-the-swarm claims (раздел про инцидент 23.08)", () => {
+	// The old "calm day" branch measured maxAbsEdgeChange (edgePins only, often
+	// empty) and reported it as real volatility — that's exactly what produced
+	// "±0%" in prod on a day with ±17-18% leaders. The branch is gone; these
+	// are regression guards so it (or wording like it) can't come back quietly.
+	const FORBIDDEN_CALM_SUBSTRINGS = ["Спокойный день", "штиле", "волатильность на минимуме", "не превысили", "никто не вышел", "затиш"];
+	// The specific removed phrasing, not a bare "кра" substring check — "рой
+	// красный" is legitimate wanted text and must not trip this.
+	const FORBIDDEN_EDGE_PHRASES = ["краёв роя", "краях роя", "краям роя", "края роя", "на краях", "у краёв"];
+
+	it("never mentions calm-day language when maxAbsLeaderChange >= 8, across every fixture at once", () => {
+		const offenders: string[] = [];
+		for (const name of ALL_FIXTURE_NAMES) {
+			const facts = factsFor(name);
+			if (facts.maxAbsLeaderChange < 8) continue;
+			const caption = buildCaption(facts).toLowerCase();
+			for (const phrase of FORBIDDEN_CALM_SUBSTRINGS) {
+				if (caption.includes(phrase.toLowerCase())) offenders.push(`${name}: "${phrase}"`);
+			}
+		}
+		expect(offenders).toEqual([]);
+	});
+
+	it("never contains ±0% or any 'edge of the swarm' phrasing, across every fixture at once", () => {
+		const offenders: string[] = [];
+		for (const name of ALL_FIXTURE_NAMES) {
+			const caption = buildCaption(factsFor(name));
+			if (caption.includes("±0%")) offenders.push(`${name}: "±0%"`);
+			for (const phrase of FORBIDDEN_EDGE_PHRASES) {
+				if (caption.includes(phrase)) offenders.push(`${name}: "${phrase}"`);
+			}
+		}
+		expect(offenders).toEqual([]);
 	});
 });
 
@@ -193,7 +266,7 @@ describe("buildCaption", () => {
 	});
 
 	it("stays within the Telegram caption limit for every fixture", () => {
-		for (const name of ["real-day.json", "red-streak.json", "red-first-day.json", "green.json", "mixed.json", "boring.json", "no-btc.json", "edge-empty.json", "red-boundary-60.json", "escape-html.json"]) {
+		for (const name of ALL_FIXTURE_NAMES) {
 			expect(buildCaption(factsFor(name)).length).toBeLessThanOrEqual(CAPTION_LIMIT);
 		}
 	});

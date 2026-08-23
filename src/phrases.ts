@@ -115,16 +115,40 @@ export const MIXED_VARIANTS: readonly PhraseVariant[] = [
 export const MIXED_SHORT: PhraseVariant = (f) => `Разброс: ${f.green} в плюсе, ${f.red} в минусе.`;
 
 // --- Абзац 2: наблюдение ---
-// BTC_LEADS и NEUTRAL_WITH_BTC читают facts.btc напрямую: render.ts выбирает эти
-// ветки только когда facts.btc уже проверен на не-null (см. pickObservation).
+// Порядок веток (render.ts:pickObservation), первая подошедшая выигрывает:
+// 1. prevState "green" -> swarmState "red": коррекция.
+// 2. prevState "red" -> swarmState "green": отскок.
+// 3-5. BTC_LEADS/NEUTRAL_WITH_BTC читают facts.btc напрямую: render.ts выбирает
+//    их только когда facts.btc уже проверен на не-null.
+//
+// Ветка "спокойный день" (была: maxAbsEdgeChange < 8) удалена целиком — она
+// была неверна по смыслу: edgePins в большинстве дней пуст, и "измеренное"
+// значение волатильности от пустого массива — не показатель затишья, а дыра
+// в данных (см. инцидент 23.08: «±0%» при лидерах ±17-18%).
+//
+// Ни здесь, ни в других ветках больше не упоминаются "края роя" — то же
+// самое: edgePins почти всегда пуст, а maxAbsLeaderChange считается по
+// лидерам (winners/losers), которые в основном приходят из mainSwarm.
+
+export const CORRECTION_VARIANTS: readonly PhraseVariant[] = [
+	() => `Похоже на коррекцию: вчера в плюсе было большинство монет, сегодня картина зеркальная.`,
+	() => `День назад рой был в основном зелёным — сегодня он развернулся, и в минусе уже большинство монет.`,
+	() => `Резкая смена курса: вчерашний рост сменился сегодняшним падением почти по всему рою.`,
+];
+
+export const REBOUND_VARIANTS: readonly PhraseVariant[] = [
+	() => `Рой отыгрывает вчерашнее падение.`,
+	() => `После вчерашнего минуса рой развернулся в плюс — коррекция явно в другую сторону.`,
+	() => `Вчера рой был красным, сегодня уже зеленеет — классический отскок после просадки.`,
+];
 
 export const QUIET_DUMP_VARIANTS: readonly PhraseVariant[] = [
 	(f) =>
-		`Интересно, что рынок падает без паники: биток теряет доли процента, а альты по краям роя штормит на ±${formatMagnitude(f.maxAbsEdgeChange)}%. Классическая картина «тихого» слива — деньги не уходят с рынка, а перебегают между монетами.`,
+		`Интересно, что рынок падает без паники: биток теряет доли процента, а альтов штормит на ±${formatMagnitude(f.maxAbsLeaderChange)}%. Классическая картина «тихого» слива — деньги не уходят с рынка, а перебегают между монетами.`,
 	(f) =>
-		`Биток почти не шевелится, а на краях роя штормит на ±${formatMagnitude(f.maxAbsEdgeChange)}% — деньги явно перетекают между монетами, а не покидают рынок.`,
+		`Биток почти не шевелится, а лидеров роя штормит на ±${formatMagnitude(f.maxAbsLeaderChange)}% — деньги явно перетекают между монетами, а не покидают рынок.`,
 	(f) =>
-		`Тихий день для битка и бурный для альтов: колебания на краях роя доходят до ±${formatMagnitude(f.maxAbsEdgeChange)}%, пока биток топчется на месте.`,
+		`Тихий день для битка и бурный для альтов: колебания у лидеров доходят до ±${formatMagnitude(f.maxAbsLeaderChange)}%, пока биток топчется на месте.`,
 ];
 
 export const BTC_LEADS_VARIANTS: readonly PhraseVariant[] = [
@@ -133,20 +157,14 @@ export const BTC_LEADS_VARIANTS: readonly PhraseVariant[] = [
 	(f) => `Рынок двигается вслед за битком: ${formatSignedPercent(f.btc!.change24h)} по BTC отражается на всём рое.`,
 ];
 
-export const CALM_DAY_VARIANTS: readonly PhraseVariant[] = [
-	(f) => `Спокойный день: даже на краях роя никто не вышел за ±${formatMagnitude(f.maxAbsEdgeChange)}%.`,
-	(f) => `Волатильность на минимуме: максимальное движение на краях роя — ±${formatMagnitude(f.maxAbsEdgeChange)}%.`,
-	(f) => `Рынок в штиле: даже самые резкие монеты на краях роя не превысили ±${formatMagnitude(f.maxAbsEdgeChange)}%.`,
-];
-
 export const NEUTRAL_WITH_BTC_VARIANTS: readonly PhraseVariant[] = [
-	(f) => `Контраст дня: биток двигается на ${formatSignedPercent(f.btc!.change24h)}, пока альты на краях роя разбегаются заметно шире.`,
-	(f) => `Биток держится спокойнее рынка — его ${formatSignedPercent(f.btc!.change24h)} против куда более резких скачков на краях роя.`,
-	(f) => `Пока биток меняется на ${formatSignedPercent(f.btc!.change24h)}, альты на краях роя двигаются размашистее.`,
+	(f) => `Контраст дня: биток двигается на ${formatSignedPercent(f.btc!.change24h)}, пока альты разбегаются заметно шире.`,
+	(f) => `Биток держится спокойнее рынка — его ${formatSignedPercent(f.btc!.change24h)} против куда более резких скачков у лидеров.`,
+	(f) => `Пока биток меняется на ${formatSignedPercent(f.btc!.change24h)}, альты двигаются размашистее.`,
 ];
 
 export const NEUTRAL_NO_BTC_VARIANTS: readonly PhraseVariant[] = [
-	(f) => `Данных по битку сегодня нет, но альты на краях роя двигаются заметно — до ±${formatMagnitude(f.maxAbsEdgeChange)}%.`,
-	(f) => `Биток выпал из снапшота, зато на краях роя есть движение — колебания доходят до ±${formatMagnitude(f.maxAbsEdgeChange)}%.`,
-	(f) => `Без данных по битку картину дня определяют альты: на краях роя движение доходит до ±${formatMagnitude(f.maxAbsEdgeChange)}%.`,
+	(f) => `Данных по битку сегодня нет, но альты двигаются заметно — до ±${formatMagnitude(f.maxAbsLeaderChange)}%.`,
+	(f) => `Биток выпал из снапшота, зато движение есть — колебания у лидеров доходят до ±${formatMagnitude(f.maxAbsLeaderChange)}%.`,
+	(f) => `Без данных по битку картину дня определяют альты: движение доходит до ±${formatMagnitude(f.maxAbsLeaderChange)}%.`,
 ];

@@ -2,7 +2,7 @@ import type { Facts } from "./facts.js";
 import { escapeHtml, formatBtcPercent, formatBtcPrice, formatSignedPercent } from "./format.js";
 import {
 	BTC_LEADS_VARIANTS,
-	CALM_DAY_VARIANTS,
+	CORRECTION_VARIANTS,
 	GREEN_FIRST_SHORT,
 	GREEN_FIRST_VARIANTS,
 	GREEN_STREAK_SHORT,
@@ -13,6 +13,7 @@ import {
 	NEUTRAL_WITH_BTC_VARIANTS,
 	pickVariant,
 	QUIET_DUMP_VARIANTS,
+	REBOUND_VARIANTS,
 	RED_FIRST_SHORT,
 	RED_FIRST_VARIANTS,
 	RED_STREAK_SHORT,
@@ -24,8 +25,7 @@ const CTA = "Вся карта в реальном времени → inp.one";
 // Порог для веток "тихий слив" / "биток ведёт" в абзаце-наблюдении (раздел 4.2).
 const QUIET_BTC_THRESHOLD = 1;
 const LEADING_BTC_THRESHOLD = 3;
-const CALM_EDGE_THRESHOLD = 8;
-const QUIET_DUMP_EDGE_THRESHOLD = 15;
+const QUIET_DUMP_LEADER_THRESHOLD = 15;
 
 export type PostParagraphs = {
 	picture: string;
@@ -52,16 +52,24 @@ function pickShortPicture(facts: Facts): string {
 	return MIXED_SHORT(facts);
 }
 
-/** Ветки читают facts.btc сами (через `!`) только там, где мы уже проверили его на не-null. */
+/**
+ * Порядок веток (первая подошедшая выигрывает): разворот состояния (коррекция
+ * после зелёного/отскок после красного) важнее любых чисел за сегодня — это
+ * читателю интереснее, чем то, что биток стоит на месте. Ветки читают
+ * facts.btc сами (через `!`) только там, где мы уже проверили его на не-null.
+ */
 function pickObservation(facts: Facts): string {
-	if (facts.btc && Math.abs(facts.btc.change24h) < QUIET_BTC_THRESHOLD && facts.maxAbsEdgeChange > QUIET_DUMP_EDGE_THRESHOLD) {
+	if (facts.prevState === "green" && facts.swarmState === "red") {
+		return pickVariant(CORRECTION_VARIANTS, facts.dateKey)(facts);
+	}
+	if (facts.prevState === "red" && facts.swarmState === "green") {
+		return pickVariant(REBOUND_VARIANTS, facts.dateKey)(facts);
+	}
+	if (facts.btc && Math.abs(facts.btc.change24h) < QUIET_BTC_THRESHOLD && facts.maxAbsLeaderChange > QUIET_DUMP_LEADER_THRESHOLD) {
 		return pickVariant(QUIET_DUMP_VARIANTS, facts.dateKey)(facts);
 	}
 	if (facts.btc && Math.abs(facts.btc.change24h) >= LEADING_BTC_THRESHOLD) {
 		return pickVariant(BTC_LEADS_VARIANTS, facts.dateKey)(facts);
-	}
-	if (facts.maxAbsEdgeChange < CALM_EDGE_THRESHOLD) {
-		return pickVariant(CALM_DAY_VARIANTS, facts.dateKey)(facts);
 	}
 	if (facts.btc) {
 		return pickVariant(NEUTRAL_WITH_BTC_VARIANTS, facts.dateKey)(facts);

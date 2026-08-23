@@ -31,9 +31,12 @@ export type Facts = {
 	total: number;
 	swarmState: SwarmState;
 	streak: number;
+	/** swarmState за календарно предыдущий день (по state.json); null — дыра в истории или первый запуск. */
+	prevState: SwarmState | null;
 	losers: SwarmCoin[]; // asc by change24h
 	winners: SwarmCoin[]; // desc by change24h
-	maxAbsEdgeChange: number;
+	/** max(|winners[0]|, |losers[0]|) — по уже отфильтрованным лидерам, не по edgePins (те часто пусты). */
+	maxAbsLeaderChange: number;
 };
 
 function moscowDateKey(iso: string): string {
@@ -66,8 +69,7 @@ function isStableLike(coin: SwarmCoin): boolean {
 }
 
 /** Дыра в истории обрывает стрик — не считаем дни до пропуска (раздел 4.1). */
-function computeStreak(dateKey: string, swarmState: SwarmState, history: StateHistory): number {
-	const byDate = new Map(history.days.map((d) => [d.date, d]));
+function computeStreak(dateKey: string, swarmState: SwarmState, byDate: ReadonlyMap<string, StateDay>): number {
 	let streak = 1;
 	let cursor = shiftDateKey(dateKey, -1);
 	for (;;) {
@@ -77,6 +79,15 @@ function computeStreak(dateKey: string, swarmState: SwarmState, history: StateHi
 		cursor = shiftDateKey(cursor, -1);
 	}
 	return streak;
+}
+
+/**
+ * Состояние роя за вчера — именно вчерашняя запись, а не последняя в
+ * истории: дыра в истории (пропущенный день) даёт null, даже если более
+ * старая запись есть. Та же логика поиска "дня минус один", что у стрика.
+ */
+function computePrevState(dateKey: string, byDate: ReadonlyMap<string, StateDay>): SwarmState | null {
+	return byDate.get(shiftDateKey(dateKey, -1))?.swarmState ?? null;
 }
 
 export function computeFacts(snapshot: HotCoinsSnapshot, history: StateHistory): Facts {
@@ -98,14 +109,19 @@ export function computeFacts(snapshot: HotCoinsSnapshot, history: StateHistory):
 		else if (green / total >= RED_GREEN_STATE_RATIO) swarmState = "green";
 	}
 
+	// edgePins — только источник монет-кандидатов в лидеры, больше ничего не
+	// считаем от него напрямую: он пуст в большинстве дней, и вычисление
+	// "измеренного" значения от пустого массива — ровно та грабля, из-за
+	// которой в проде 23.08 «±0%» ушло в текст как реальное затишье.
 	const leaderPool = [...snapshot.mainSwarm, ...snapshot.edgePins].filter((c) => !isStableLike(c));
 	const winners = [...leaderPool].sort((a, b) => b.change24h - a.change24h);
 	const losers = [...leaderPool].sort((a, b) => a.change24h - b.change24h);
 
-	// reduce from a 0 seed, not Math.max(...edgePins) — that's -Infinity when edgePins is empty.
-	const maxAbsEdgeChange = snapshot.edgePins.reduce((max, c) => Math.max(max, Math.abs(c.change24h)), 0);
+	const maxAbsLeaderChange = Math.max(winners[0] ? Math.abs(winners[0].change24h) : 0, losers[0] ? Math.abs(losers[0].change24h) : 0);
 
-	const streak = computeStreak(dateKey, swarmState, history);
+	const byDate = new Map(history.days.map((d) => [d.date, d]));
+	const streak = computeStreak(dateKey, swarmState, byDate);
+	const prevState = computePrevState(dateKey, byDate);
 
-	return { dateLabel, dateKey, btc: snapshot.btc, red, green, total, swarmState, streak, losers, winners, maxAbsEdgeChange };
+	return { dateLabel, dateKey, btc: snapshot.btc, red, green, total, swarmState, streak, prevState, losers, winners, maxAbsLeaderChange };
 }

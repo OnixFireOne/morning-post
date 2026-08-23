@@ -188,7 +188,8 @@ function btcField(mainSwarm, change24h) {
 	});
 }
 
-// --- edge-empty: no edge pins at all — maxAbsEdgeChange must reduce from 0, not Math.max(...[]) ---
+// --- edge-empty: no edge pins at all — leaders (and maxAbsLeaderChange) must
+// still come from mainSwarm, not silently read as 0 (раздел про инцидент 23.08) ---
 {
 	const mainSwarm = buildSwarm(7, { totalNonNeutral: 66, redCount: 30, magMin: 0.5, magMax: 6, btcChange: 0.9 });
 	write("edge-empty.json", {

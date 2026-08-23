@@ -84,15 +84,50 @@ describe("computeFacts: leaders", () => {
 	});
 });
 
-describe("computeFacts: maxAbsEdgeChange", () => {
-	it("is 0 (not -Infinity or NaN) when edgePins is empty — reduce with a 0 seed", () => {
-		const facts = computeFacts(snapshot("edge-empty.json"), EMPTY_HISTORY);
-		expect(facts.maxAbsEdgeChange).toBe(0);
-		expect(Number.isFinite(facts.maxAbsEdgeChange)).toBe(true);
+describe("computeFacts: maxAbsLeaderChange", () => {
+	it("is derived from winners[0]/losers[0] (already-filtered leaders), not from edgePins directly", () => {
+		expect(computeFacts(snapshot("red-first-day.json"), EMPTY_HISTORY).maxAbsLeaderChange).toBe(25);
 	});
 
-	it("is the largest absolute edge change otherwise", () => {
-		expect(computeFacts(snapshot("red-first-day.json"), EMPTY_HISTORY).maxAbsEdgeChange).toBe(25);
+	it("is still correct when edgePins is empty — the leaders come from mainSwarm instead of silently reading 0", () => {
+		// This is the exact bug from the 23.08 incident: edgePins empty must not
+		// mean "measured 0 volatility" — the leaders are still real movers in mainSwarm.
+		const facts = computeFacts(snapshot("edge-empty.json"), EMPTY_HISTORY);
+		expect(facts.maxAbsLeaderChange).toBeGreaterThan(0);
+		expect(facts.maxAbsLeaderChange).toBe(Math.max(Math.abs(facts.winners[0]!.change24h), Math.abs(facts.losers[0]!.change24h)));
+	});
+
+	it("is 0 only when there are truly no leaders left after filtering stablecoins", () => {
+		const snap: HotCoinsSnapshot = {
+			version: 1,
+			ts: "2026-08-21T06:00:00.000Z",
+			btc: null,
+			mainSwarm: [{ id: "usdgo", ticker: "USDGO", change24h: 0, price: 1, marketCap: null }],
+			edgePins: [],
+		};
+		const facts = computeFacts(snap, EMPTY_HISTORY);
+		expect(facts.winners).toHaveLength(0);
+		expect(facts.losers).toHaveLength(0);
+		expect(facts.maxAbsLeaderChange).toBe(0);
+	});
+});
+
+describe("computeFacts: prevState", () => {
+	// fixtures/red-streak.json is dated 2026-08-18 (Europe/Moscow); green.json is
+	// dated 2026-08-20 — every history fixture below is anchored to one of those
+	// dates as "today".
+	it("is null on the very first run (empty history)", () => {
+		expect(computeFacts(snapshot("red-streak.json"), EMPTY_HISTORY).prevState).toBeNull();
+	});
+
+	it("is the swarmState of the calendar day immediately before today", () => {
+		expect(computeFacts(snapshot("red-streak.json"), history("green-to-red.json")).prevState).toBe("green");
+		expect(computeFacts(snapshot("green.json"), history("red-then-green.json")).prevState).toBe("red");
+	});
+
+	it("is null on a gap right before today, even with an older entry present — not the last entry in history", () => {
+		const facts = computeFacts(snapshot("red-streak.json"), history("green-gap-before-today.json"));
+		expect(facts.prevState).toBeNull();
 	});
 });
 
