@@ -142,14 +142,15 @@ type RenderedPost = {
 };
 
 /**
- * v2 step 6: when AI is disabled this calls nothing but the untouched v1
- * buildCaption()/buildParagraphs() — same functions, same facts, so the
- * caption is byte-for-byte what v1 always produced. AI_ENABLED=0 in
- * .env/.env.example — never flip this without a human running the full
- * dry:fixture verification first (plan/ai-start-integration.md, section 9).
+ * v2 step 6: when AI is disabled (or `skipAi` is set — see the call site in
+ * main()) this calls nothing but the untouched v1 buildCaption()/
+ * buildParagraphs() — same functions, same facts, so the caption is
+ * byte-for-byte what v1 always produced. AI_ENABLED=0 in .env/.env.example —
+ * never flip this without a human running the full dry:fixture verification
+ * first (plan/ai-start-integration.md, section 9).
  */
-async function renderPost(facts: Facts, history: StateHistory): Promise<RenderedPost> {
-	if (!env.aiEnabled) {
+async function renderPost(facts: Facts, history: StateHistory, skipAi: boolean): Promise<RenderedPost> {
+	if (!env.aiEnabled || skipAi) {
 		return {
 			caption: buildCaption(facts),
 			paragraphs: buildParagraphs(facts),
@@ -259,9 +260,17 @@ async function main() {
 	currentStep = "facts";
 	const history = readState(env.stateFile);
 	const facts = computeFacts(snapshot, history);
+	const alreadyPosted = findPostedDay(history, facts.dateKey);
 
 	currentStep = "render";
-	const rendered = await renderPost(facts, history);
+	// v2: skip the AI request when this run can't actually publish anyway
+	// (already posted today, no --force) — usage.jsonl is an accounting log of
+	// real attempts, and a manual no-op rerun spending a real request would
+	// pollute it. Exempt in dry-run: dry:fixture is how the AI path gets
+	// previewed, and a fixture's dateKey essentially never matches real
+	// prod state.
+	const skipAi = !env.dryRun && Boolean(alreadyPosted) && !env.force;
+	const rendered = await renderPost(facts, history, skipAi);
 	console.log(rendered.caption);
 
 	if (env.dryRun) {
@@ -309,7 +318,6 @@ async function main() {
 
 	// Раздел 5: если за сегодняшнюю (московскую) дату уже есть пост — выходим
 	// без публикации, код 0, без алерта. --force обходит эту проверку.
-	const alreadyPosted = findPostedDay(history, facts.dateKey);
 	if (alreadyPosted && !env.force) {
 		console.log(`[state] already posted for ${facts.dateKey} (messageId=${alreadyPosted.messageId}) — skipping. Use --force to repost.`);
 		return;
