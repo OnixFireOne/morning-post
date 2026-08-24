@@ -33,6 +33,7 @@ import { computeFacts, type Facts, type StateHistory } from "../src/facts.js";
 import { buildParagraphs, type PostParagraphs } from "../src/render.js";
 import { loadSnapshotFromFile } from "../src/snapshot.js";
 import { readState } from "../src/state.js";
+import type { HotCoinsSnapshot } from "../src/types.js";
 
 const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const FIXTURES_DIR = path.join(REPO_ROOT, "fixtures");
@@ -50,6 +51,17 @@ const ALL_FIXTURE_NAMES = [
 	"red-boundary-60.json",
 	"escape-html.json",
 ];
+
+// Current buildSystemPrompt() output is ~2800 chars — this ceiling gives
+// comfortable room to grow (e.g. a new prompt-version rule) while still
+// catching genuine bloat: an accidental duplication, a debug string left in,
+// or anything else that would silently start eating into every single day's
+// token budget. system is static (buildSystemPrompt() takes no arguments),
+// so this check is really about catching *code* regressions, not per-day
+// data variance — checked once per report, not once per fixture.
+const SYSTEM_PROMPT_NORM_MAX_CHARS = 4000;
+
+const HISTORY_ALLOWED_KEYS = new Set(["dateLabel", "swarmState", "picture", "observation"]);
 
 /** Section 5's six checks plus item 7 (streak digit, added after 24.08 — see validator.ts's own comment) and the pre-check for invalid JSON. */
 const VALIDATOR_ITEM_LABELS: Record<ValidationFailureReason, string> = {
@@ -106,9 +118,38 @@ export type CompareOptions = {
 	outFile: string;
 };
 
-function loadFacts(fixtureName: string, stateHistory: StateHistory) {
+function loadSnapshotAndFacts(fixtureName: string, stateHistory: StateHistory): { snapshot: HotCoinsSnapshot; facts: Facts } {
 	const snapshot = loadSnapshotFromFile(path.join(FIXTURES_DIR, fixtureName));
-	return computeFacts(snapshot, stateHistory);
+	return { snapshot, facts: computeFacts(snapshot, stateHistory) };
+}
+
+type Section31Check = {
+	rawSnapshotFieldsLeaked: string[];
+	unrelatedTickersLeaked: string[];
+	historyEntriesWithExtraKeys: string[];
+};
+
+/**
+ * Section 3.1's own three concerns, checked against the exact string sent to
+ * the model — not a re-derivation, a direct inspection of buildUserPrompt()'s
+ * output. Same technique tests/ai-payload.test.ts already uses for the first
+ * two (no shared src/ function to reuse — that test doesn't call one either,
+ * it's a plain substring/field check both times).
+ */
+function checkSection31(userJson: string, payload: AiPayload, snapshot: HotCoinsSnapshot): Section31Check {
+	const rawSnapshotFieldsLeaked = ["mainSwarm", "edgePins", "marketCap"].filter((field) => userJson.includes(field));
+
+	const winnerTicker = payload.today.topGainer?.ticker;
+	const loserTicker = payload.today.topLoser?.ticker;
+	const allCoins = [...snapshot.mainSwarm, ...snapshot.edgePins];
+	const unrelatedTickersLeaked = [...new Set(allCoins.filter((c) => c.ticker !== winnerTicker && c.ticker !== loserTicker).map((c) => c.ticker))].filter((ticker) => userJson.includes(ticker));
+
+	const historyEntriesWithExtraKeys = payload.history
+		.map((entry, i) => ({ i, extra: Object.keys(entry).filter((k) => !HISTORY_ALLOWED_KEYS.has(k)) }))
+		.filter((e) => e.extra.length > 0)
+		.map((e) => `history[${e.i}]: ${e.extra.join(", ")}`);
+
+	return { rawSnapshotFieldsLeaked, unrelatedTickersLeaked, historyEntriesWithExtraKeys };
 }
 
 async function runOne(
@@ -169,14 +210,26 @@ function formatRawUsageBlock(rawUsage: unknown): string {
 	return ["**Сырой usage от прокси (как есть, без интерпретации):**", "```json", JSON.stringify(rawUsage, null, 2), "```"].join("\n");
 }
 
-/** Shown once per fixture, above its AI runs — the template half of the pairwise comparison (section 9's actual ask: template vs AI, not AI in isolation). buildParagraphs() is a pure local call, no request, no cost. */
-function formatFixtureHeader(fixtureName: string, facts: Facts, payload: AiPayload, template: PostParagraphs): string {
-	return [
+function formatSection31Line(label: string, leaked: string[]): string {
+	return leaked.length === 0 ? `  - ✅ ${label}` : `  - ❌ ${label}: ${leaked.join(", ")}`;
+}
+
+/**
+ * Shown once per fixture, above its AI runs. Two things, both free (no
+ * request): the template half of the pairwise comparison (section 9's actual
+ * ask: template vs AI, not AI in isolation — buildParagraphs() is a pure
+ * local call), and the user message's own length plus, when the system
+ * prompt is within norm, its full JSON body and a section-3.1 check (no raw
+ * snapshot, no unrelated coin tickers, no extra fields on history entries).
+ */
+function formatFixtureHeader(fixtureName: string, facts: Facts, payload: AiPayload, template: PostParagraphs, userPrompt: string, systemInNorm: boolean, snapshot: HotCoinsSnapshot): string {
+	const lines = [
 		`## ${fixtureName}`,
 		"",
 		`- swarmState: ${facts.swarmState}`,
 		`- streak: ${facts.streak}`,
 		`- allowedNumbers: ${payload.allowedNumbers.join(", ")}`,
+		`- Длина user-сообщения: ${userPrompt.length} символов`,
 		"",
 		"### Шаблон (buildParagraphs, без запроса к модели)",
 		"",
@@ -185,7 +238,26 @@ function formatFixtureHeader(fixtureName: string, facts: Facts, payload: AiPaylo
 		"",
 		"**Абзац 2 (observation):**",
 		`> ${template.observation}`,
-	].join("\n");
+	];
+
+	if (systemInNorm) {
+		const check = checkSection31(userPrompt, payload, snapshot);
+		lines.push(
+			"",
+			"### user-JSON (сверка с п.3.1: сырой снапшот, полный список монет, лишние поля истории)",
+			"",
+			"```json",
+			JSON.stringify(payload, null, 2),
+			"```",
+			"",
+			"Проверка п.3.1:",
+			formatSection31Line("сырой снапшот отсутствует (mainSwarm/edgePins/marketCap)", check.rawSnapshotFieldsLeaked),
+			formatSection31Line("нет тикеров посторонних монет", check.unrelatedTickersLeaked),
+			formatSection31Line("history без лишних полей", check.historyEntriesWithExtraKeys),
+		);
+	}
+
+	return lines.join("\n");
 }
 
 function formatRunSection(fr: FixtureRun, totalRuns: number): string {
@@ -291,15 +363,24 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 	const allRuns: FixtureRun[] = [];
 	const sections: string[] = [];
 
+	// Computed once — system is static (buildSystemPrompt() takes no
+	// arguments), so checking it per-fixture would just repeat the same
+	// number ten times. If it's anomalously large, the per-fixture user-JSON
+	// dump/section-3.1 check is skipped everywhere: a bloated system prompt is the
+	// more urgent, systemic problem (it repeats on every single request),
+	// and ten JSON dumps wouldn't tell the reader anything a bloated system
+	// prompt doesn't already explain by itself.
+	const system = buildSystemPrompt();
+	const systemInNorm = system.length <= SYSTEM_PROMPT_NORM_MAX_CHARS;
+
 	for (const fixtureName of opts.fixtureNames) {
-		const facts = loadFacts(fixtureName, opts.stateHistory);
+		const { snapshot, facts } = loadSnapshotAndFacts(fixtureName, opts.stateHistory);
 		const aiHistory = stateHistoryToAiHistory(opts.stateHistory, facts.dateKey);
 		const payload = buildAiPayload(facts, aiHistory);
-		const system = buildSystemPrompt();
 		const user = buildUserPrompt(payload);
 		const template = buildParagraphs(facts);
 
-		sections.push(formatFixtureHeader(fixtureName, facts, payload, template));
+		sections.push(formatFixtureHeader(fixtureName, facts, payload, template, user, systemInNorm, snapshot));
 
 		for (let run = 1; run <= opts.runsPerFixture; run++) {
 			process.stdout.write(`[ai:compare] ${fixtureName} run ${run}/${opts.runsPerFixture}... `);
@@ -319,6 +400,10 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 		`- Фикстур: ${opts.fixtureNames.length}, прогонов на фикстуру: ${opts.runsPerFixture}, всего прогонов: ${opts.fixtureNames.length * opts.runsPerFixture}`,
 		"- Ретраи и фолбэк отключены — каждый прогон это ровно одна попытка одной моделью, без ретрая на содержательный отказ.",
 		"- Стоимость везде в кредитах прокси (1 кредит = 50 000 токенов), не в $ — см. AI_PRICE_IN/AI_PRICE_OUT в .env.",
+		`- Длина system-сообщения: ${system.length} символов (норма: до ${SYSTEM_PROMPT_NORM_MAX_CHARS}) — ${systemInNorm ? "✅ в норме" : "⚠️ аномально большой"}`,
+		...(systemInNorm
+			? []
+			: ["  Дамп user-JSON и проверка п.3.1 пропущены для всех фикстур — сначала разберитесь с системным промптом, раздутый промпт бьёт по каждому запросу, а не по одной фикстуре."]),
 	].join("\n");
 
 	const report = [header, ...sections, formatSummary(allRuns, opts.balance)].join("\n\n");
