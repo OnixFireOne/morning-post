@@ -15,13 +15,15 @@
     "dry": "cross-env DRY_RUN=1 tsx src/index.ts",
     "dry:fixture": "cross-env DRY_RUN=1 tsx src/index.ts",
     "post": "cross-env DRY_RUN=0 tsx src/index.ts",
-    "post:force": "cross-env DRY_RUN=0 tsx src/index.ts --force"
+    "post:force": "cross-env DRY_RUN=0 tsx src/index.ts --force",
+    "ai:models": "tsx src/ai/listModels.ts"
   },
   "dependencies": {
     "cross-env": "10.1.0",
     "dotenv": "17.4.2",
     "playwright": "1.62.1",
-    "tsx": "4.23.12"
+    "tsx": "4.23.12",
+    "undici": "8.10.0"
   },
   "devDependencies": {
     "@types/node": "24.13.3",
