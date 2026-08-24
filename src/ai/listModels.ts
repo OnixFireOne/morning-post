@@ -1,7 +1,7 @@
 // Manual command: `npm run ai:models`. This is the one place in the project
 // allowed to hit the real network on purpose, and only when a human runs it —
 // never invoked by index.ts, never invoked by a test. First step of local
-// rollout (раздел 2): fetch the provider's actual model ids instead of
+// rollout (section 2): fetch the provider's actual model ids instead of
 // guessing them from Anthropic's own documentation.
 import "dotenv/config";
 import { createAiClient } from "./client.js";

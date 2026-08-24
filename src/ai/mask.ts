@@ -1,5 +1,5 @@
 // Pure string helpers so proxy credentials and the API key never end up
-// verbatim in logs, alerts, or ./out/*.ai.json (раздел 2/3.2 of the v2 spec).
+// verbatim in logs, alerts, or ./out/*.ai.json (sections 2/3.2 of the v2 spec).
 // Both functions are total: an unparsable URL returns a safe placeholder
 // instead of throwing, since callers use these specifically when something
 // has already gone wrong and building an error message must not itself fail.

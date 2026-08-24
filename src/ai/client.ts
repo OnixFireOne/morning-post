@@ -1,4 +1,4 @@
-// Thin OpenAI-compatible transport (раздел 2 of the v2 spec). One request in,
+// Thin OpenAI-compatible transport (section 2 of the v2 spec). One request in,
 // one structured result out — retries, model fallback, budget, and the
 // validator all live above this file and never see the provider's raw shape.
 // Never logs `apiKey` or an unmasked `proxyUrl`; on any network-level failure
@@ -220,7 +220,7 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 	}
 
 	// Unlike generate(), this throws — it's only ever called from the manual
-	// `ai:models` CLI (раздел 2), where a plain try/catch at the call site is
+	// `ai:models` CLI (section 2), where a plain try/catch at the call site is
 	// simpler than a parallel result-object contract nothing else needs.
 	async function listModels(): Promise<AiModel[]> {
 		const response = await fetchImpl(joinUrl(opts.baseUrl, "/models"), {
