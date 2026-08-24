@@ -1,0 +1,1 @@
+{"picture": "", "observation": "Всё спокойно, биток держится ровно.", "direction": "red"}

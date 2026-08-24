@@ -1,0 +1,1 @@
+{"picture": "The swarm turned negative: 133 coins are falling against 14 rising out of 147 total.", "observation": "Bitcoin is calm today, down 2.1%, no panic in the market at all.", "direction": "red"}
