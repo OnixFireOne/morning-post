@@ -310,6 +310,29 @@ describe("buildParagraphsAI: pricing uses the model that actually answered", () 
 	});
 });
 
+describe("buildParagraphsAI: totalTokensIn/totalTokensOut", () => {
+	it("sums promptTokens/completionTokens across every attempt — never totalTokens, never just the last attempt, never doubled", async () => {
+		// totalTokens on each canned response is deliberately NOT promptTokens +
+		// completionTokens (999, 888) — if the aggregation ever summed the wrong
+		// field, or re-read a value already folded in, this would catch it
+		// instead of silently passing on numbers that happen to agree by
+		// coincidence, the way promptTokens+completionTokens===totalTokens does
+		// in every other fixture in this file.
+		const { client } = fakeClient("provider.example.com", [
+			okResult(fixtureText("number-not-in-facts"), { usage: { promptTokens: 150, completionTokens: 60, totalTokens: 999, cachedTokens: null } }),
+			okResult(fixtureText("good"), { usage: { promptTokens: 90, completionTokens: 40, totalTokens: 888, cachedTokens: null } }),
+		]);
+		const options = baseOptions({ client, maxAttemptsPerModel: 2 });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(result.source).toBe("ai"); // sanity: the retry did succeed
+		expect(result.attempts).toBe(2);
+		expect(result.totalTokensIn).toBe(240); // 150 + 90
+		expect(result.totalTokensOut).toBe(100); // 60 + 40
+	});
+});
+
 describe("buildParagraphsAI: never throws", () => {
 	it("falls back to the template when the client itself throws unexpectedly", async () => {
 		const client: AiClient = {
