@@ -64,6 +64,16 @@ function escapeRegExp(s: string): string {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** Shared by item 3's HTML-tag check and item 6's language check — strips the day's own tickers (plus "BTC") so an allowed ticker that happens to look like markup or Latin script isn't mistaken for the real thing. */
+function stripKnownTickers(text: string, payload: AiPayload): string {
+	const tickers = [payload.today.topGainer?.ticker, payload.today.topLoser?.ticker, "BTC"].filter((t): t is string => Boolean(t));
+	let stripped = text;
+	for (const ticker of tickers) {
+		stripped = stripped.replace(new RegExp(escapeRegExp(ticker), "giu"), "");
+	}
+	return stripped;
+}
+
 // `\b` is ASCII-only in JS regex — it does not treat Cyrillic letters as
 // "word" characters at all, so a boundary right after "дня" and before a
 // space silently fails to match (non-word char on both sides, by \b's own
@@ -124,35 +134,34 @@ const URL_RE = /https?:\/\/|www\./iu;
 const HTML_TAG_RE = /<\/?[a-z][^>]*>/iu;
 const EMOJI_RE = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
 
-const FORBIDDEN_PATTERNS: readonly { re: RegExp; label: string }[] = [
+const FORBIDDEN_PATTERNS: readonly { re: RegExp; label: string; stripTickers?: boolean }[] = [
 	{ re: FORECAST_RE, label: "forecast language" },
 	{ re: ADVICE_RE, label: "buy/sell advice" },
 	{ re: MOONSHOT_RE, label: "moonshot promise" },
 	{ re: HASHTAG_RE, label: "hashtag" },
 	{ re: URL_RE, label: "URL" },
-	{ re: HTML_TAG_RE, label: "HTML tag" },
+	// An allowed leader ticker can itself look like an HTML tag —
+	// fixtures/escape-html.json's topLoser ticker is literally "<b>X", and a
+	// model reproducing it verbatim (which is allowed) was getting rejected
+	// as if it had written real markup. Strip the day's own tickers first,
+	// same technique item 6 already uses for the Cyrillic-ratio check — the
+	// pattern itself stays exactly as strict, only what it's tested against
+	// changes.
+	{ re: HTML_TAG_RE, label: "HTML tag", stripTickers: true },
 	// The template's own paragraphs never use emoji — no established "allowed
 	// set" exists for prose, so any emoji at all is out until one is defined.
 	{ re: EMOJI_RE, label: "emoji" },
 ];
 
-function findForbiddenPattern(text: string): string | null {
-	for (const { re, label } of FORBIDDEN_PATTERNS) {
-		if (re.test(text)) return label;
+function findForbiddenPattern(text: string, payload: AiPayload): string | null {
+	for (const { re, label, stripTickers } of FORBIDDEN_PATTERNS) {
+		const target = stripTickers ? stripKnownTickers(text, payload) : text;
+		if (re.test(target)) return label;
 	}
 	return null;
 }
 
-// --- item 6: language — share of Cyrillic letters, tickers and "BTC" stripped first ---
-
-function stripKnownTickers(text: string, payload: AiPayload): string {
-	const tickers = [payload.today.topGainer?.ticker, payload.today.topLoser?.ticker, "BTC"].filter((t): t is string => Boolean(t));
-	let stripped = text;
-	for (const ticker of tickers) {
-		stripped = stripped.replace(new RegExp(escapeRegExp(ticker), "giu"), "");
-	}
-	return stripped;
-}
+// --- item 6: language — share of Cyrillic letters, tickers and "BTC" stripped first (stripKnownTickers, defined above with item 3's forbidden-pattern check) ---
 
 function isRussianEnough(text: string, payload: AiPayload): boolean {
 	const stripped = stripKnownTickers(text, payload);
@@ -214,7 +223,7 @@ export function validateAiParagraphs(rawText: string, payload: AiPayload): Valid
 
 	const combined = `${picture}\n${observation}`;
 
-	const forbidden = findForbiddenPattern(combined);
+	const forbidden = findForbiddenPattern(combined, payload);
 	if (forbidden) return { ok: false, reason: "validator:forbidden_pattern", detail: forbidden };
 
 	if (parsed.direction !== payload.today.swarmState) {

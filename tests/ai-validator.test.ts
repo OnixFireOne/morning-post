@@ -79,6 +79,33 @@ describe("validateAiParagraphs: section 8 bad-response fixtures", () => {
 	it("rejects a multiplicity/fraction computed as words", () => expectRejected("derived-numbers", "validator:derived_numbers"));
 });
 
+describe("validateAiParagraphs: item 3 strips leader tickers before the HTML-tag check", () => {
+	// Mirrors fixtures/escape-html.json's actual topLoser ticker exactly —
+	// that's the real fixture that produced the false rejection.
+	const htmlTickerPayload = buildAiPayload(specExampleFacts({ losers: [{ id: "test-html-coin", ticker: "<b>X", change24h: -17, price: 1, marketCap: null }] }), []);
+
+	it("accepts a response that reproduces an allowed ticker containing HTML-like characters", () => {
+		const text = JSON.stringify({
+			picture: "Рой развернулся в минус: 133 монеты падают, растут только 14 из 147.",
+			observation: "Антигерой дня — <b>X с -17%: разброс между лидерами растёт.",
+			direction: "red",
+		});
+		const result = validateAiParagraphs(text, htmlTickerPayload);
+		expect(result.ok).toBe(true);
+	});
+
+	it("still rejects a genuine HTML tag that isn't part of an allowed ticker", () => {
+		const text = JSON.stringify({
+			picture: "Рой развернулся в минус: 133 монеты падают, растут только 14 из 147.",
+			observation: "<b>Внимание</b>: антигерой дня — <b>X с -17%.",
+			direction: "red",
+		});
+		const result = validateAiParagraphs(text, htmlTickerPayload);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:forbidden_pattern");
+	});
+});
+
 describe("validateAiParagraphs: item 9 (derived numbers in words) vs item 7 (day-count digit) don't collide", () => {
 	it("accepts an ordinal day-count word that shares the 'треть-' prefix with the fraction word треть", () => {
 		// "третьи" (agreeing with "сутки", a plural-only noun — "третий сутки"

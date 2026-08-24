@@ -156,6 +156,29 @@ describe("buildSystemPrompt: PROMPT_VERSION 3 additions — manual verification 
 	});
 });
 
+describe("buildSystemPrompt: PROMPT_VERSION 4 additions — manual verification findings, 2026-08-25", () => {
+	const system = buildSystemPrompt();
+
+	it("bans mentioning dateLabel in the paragraphs — it's the post header's own line", () => {
+		// Found on the first --all run: two rejections out of ten were the
+		// model opening with "18 августа рой накрыло…" — the day number isn't
+		// in allowedNumbers, so item 1 already rejected it correctly, but
+		// telling the model not to reach for the date at all avoids the wasted
+		// retry instead of just catching it after the fact.
+		expect(system).toMatch(/dateLabel.*не пиши её в абзацах/);
+	});
+
+	it("bans narrating the empty-history state itself, not just inventing a false past", () => {
+		// Found on the edge-empty fixture: the model wrote "Контекста прошлых
+		// дней нет, судим только по сегодняшнему срезу" — technically accurate,
+		// but it's the model describing its own input data. The reader never
+		// sees the payload and shouldn't be able to infer that such a field
+		// exists at all.
+		expect(system).toMatch(/Пустая history — повод молчать о прошлом, а не тема для абзаца/);
+		expect(system).toMatch(/не должен даже заподозрить/);
+	});
+});
+
 describe("buildUserPrompt", () => {
 	it("is exactly one JSON object, parseable end to end, with no wrapping prose", () => {
 		const user = buildUserPrompt(payload);
