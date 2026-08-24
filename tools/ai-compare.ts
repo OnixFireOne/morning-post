@@ -23,8 +23,7 @@ import "dotenv/config";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import type { AiClient } from "../src/ai/client.js";
-import { createAiClient } from "../src/ai/client.js";
+import { createAiClient, type AiClient, type AiUsage } from "../src/ai/client.js";
 import { buildAiPayload, stateHistoryToAiHistory, type AiPayload } from "../src/ai/payload.js";
 import { buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
 import { computeCost } from "../src/ai/usage.js";
@@ -63,7 +62,22 @@ const SYSTEM_PROMPT_NORM_MAX_CHARS = 4000;
 
 const HISTORY_ALLOWED_KEYS = new Set(["dateLabel", "swarmState", "picture", "observation"]);
 
-/** Section 5's six checks plus item 7 (streak digit, added after 24.08 — see validator.ts's own comment) and the pre-check for invalid JSON. */
+/**
+ * Empirical calibration, not documented by the proxy: three consecutive real
+ * requests (25.08, including one with a changed system prompt) showed
+ * prompt_tokens exceeding the proxy's own billed input by exactly this many
+ * tokens every time — 5620−3081, 5617−3078, 5861−3322, all =2539. Proxy-side
+ * overhead unrelated to our text or to caching (it didn't move when the
+ * system prompt did). Undocumented and may change silently, so it lives in
+ * exactly this one place — report display only. It must never reach
+ * usage.jsonl/ai.json/state.json: those record prompt_tokens exactly as the
+ * API returned it, and an append-only log can't be corrected retroactively —
+ * mixing calibrated and raw numbers into it with no marker of where the
+ * line is would make the whole log unusable.
+ */
+const PROXY_INPUT_TOKEN_OVERHEAD = 2539;
+
+/** Section 5's six checks plus item 7 (streak digit) and item 9 (derived numbers in words, both added after 24.08 — see validator.ts's own comments) and the pre-check for invalid JSON. */
 const VALIDATOR_ITEM_LABELS: Record<ValidationFailureReason, string> = {
 	invalid_json: "невалидный JSON (до проверок раздела 5)",
 	"validator:numbers": "п.1 числа",
@@ -73,6 +87,7 @@ const VALIDATOR_ITEM_LABELS: Record<ValidationFailureReason, string> = {
 	"validator:empty_or_cutoff": "п.5 пустой/оборванный абзац",
 	"validator:streak_digit": "п.7 цифра в счёте дней",
 	"validator:language": "п.6 язык",
+	"validator:derived_numbers": "п.9 кратности/доли словами",
 };
 
 type RunOutcome =
@@ -205,6 +220,21 @@ function formatCostLine(costEstimate: number | null): string {
 	return costEstimate !== null ? `- Стоимость (оценка): ${costEstimate.toFixed(4)} кредитов` : `- Стоимость: не посчитана (цена для этой модели не задана в .env)`;
 }
 
+/**
+ * Same formula computeCost() already uses — just called with promptTokens
+ * reduced by PROXY_INPUT_TOKEN_OVERHEAD first. Returns null (no line) under
+ * the exact same conditions computeCost() itself would: no usage, or either
+ * price knob unset for this model.
+ */
+function formatCalibratedCostLine(tokensIn: number | null, tokensOut: number | null, priceInPerMillion: number | null, priceOutPerMillion: number | null): string | null {
+	if (tokensIn === null || tokensOut === null) return null;
+	const calibratedTokensIn = Math.max(0, tokensIn - PROXY_INPUT_TOKEN_OVERHEAD);
+	const calibratedUsage: AiUsage = { promptTokens: calibratedTokensIn, completionTokens: tokensOut, totalTokens: calibratedTokensIn + tokensOut, cachedTokens: null };
+	const calibratedCost = computeCost(calibratedUsage, priceInPerMillion, priceOutPerMillion);
+	if (calibratedCost === null) return null;
+	return `- Оценка с поправкой на оверхед прокси (−${PROXY_INPUT_TOKEN_OVERHEAD} входных токенов): ${calibratedCost.toFixed(4)} кредитов — эмпирическая калибровка по панели прокси, не данные API.`;
+}
+
 /** As-is, no interpretation — exactly what client.ts's AiGenerateResult.rawUsage carries, for comparing against the proxy's own billing panel by eye. */
 function formatRawUsageBlock(rawUsage: unknown): string {
 	return ["**Сырой usage от прокси (как есть, без интерпретации):**", "```json", JSON.stringify(rawUsage, null, 2), "```"].join("\n");
@@ -260,7 +290,7 @@ function formatFixtureHeader(fixtureName: string, facts: Facts, payload: AiPaylo
 	return lines.join("\n");
 }
 
-function formatRunSection(fr: FixtureRun, totalRuns: number): string {
+function formatRunSection(fr: FixtureRun, totalRuns: number, priceInPerMillion: number | null, priceOutPerMillion: number | null): string {
 	const { run, outcome } = fr;
 	const header = `### ИИ — прогон ${run}/${totalRuns}`;
 
@@ -271,6 +301,7 @@ function formatRunSection(fr: FixtureRun, totalRuns: number): string {
 	const tokensLine = `- Токены: in=${outcome.tokensIn ?? "н/д"} out=${outcome.tokensOut ?? "н/д"}`;
 	const timeLine = `- Время ответа: ${outcome.durationMs} ms`;
 	const costLine = formatCostLine(outcome.costEstimate);
+	const calibratedCostLine = formatCalibratedCostLine(outcome.tokensIn, outcome.tokensOut, priceInPerMillion, priceOutPerMillion);
 
 	if (outcome.kind === "accepted") {
 		return [
@@ -279,6 +310,7 @@ function formatRunSection(fr: FixtureRun, totalRuns: number): string {
 			"- Вердикт: ✅ принято",
 			tokensLine,
 			costLine,
+			...(calibratedCostLine ? [calibratedCostLine] : []),
 			timeLine,
 			"",
 			formatRawUsageBlock(outcome.rawUsage),
@@ -299,6 +331,7 @@ function formatRunSection(fr: FixtureRun, totalRuns: number): string {
 		`- Вердикт: ❌ отклонено — ${VALIDATOR_ITEM_LABELS[outcome.reason]}: ${outcome.detail}`,
 		tokensLine,
 		costLine,
+		...(calibratedCostLine ? [calibratedCostLine] : []),
 		timeLine,
 		"",
 		formatRawUsageBlock(outcome.rawUsage),
@@ -388,7 +421,7 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 			console.log(outcome.kind === "accepted" ? "ok" : outcome.kind === "rejected" ? `rejected (${outcome.reason})` : `transport (${outcome.label})`);
 			const fr: FixtureRun = { fixtureName, run, outcome };
 			allRuns.push(fr);
-			sections.push(formatRunSection(fr, opts.runsPerFixture));
+			sections.push(formatRunSection(fr, opts.runsPerFixture, opts.priceInPerMillion, opts.priceOutPerMillion));
 		}
 	}
 
