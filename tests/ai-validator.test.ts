@@ -76,6 +76,39 @@ describe("validateAiParagraphs: section 8 bad-response fixtures", () => {
 	it("rejects a paragraph over the length limit", () => expectRejected("over-length", "validator:length"));
 	it("rejects an English-language response", () => expectRejected("english", "validator:language"));
 	it("rejects a digit used as a day-streak count, regardless of facts.streak's actual value", () => expectRejected("streak-digit", "validator:streak_digit"));
+	it("rejects a multiplicity/fraction computed as words", () => expectRejected("derived-numbers", "validator:derived_numbers"));
+});
+
+describe("validateAiParagraphs: item 9 (derived numbers in words) vs item 7 (day-count digit) don't collide", () => {
+	it("accepts an ordinal day-count word that shares the 'треть-' prefix with the fraction word треть", () => {
+		// "третьи" (agreeing with "сутки", a plural-only noun — "третий сутки"
+		// would be ungrammatical) starts with the exact same letters as "треть"
+		// (one third). item 9 matches "треть" as a bare word only, specifically
+		// so this legitimate, spec-required day-count phrasing keeps passing.
+		const result = validateAiParagraphs(response("day-count-third"), payload);
+		expect(result.ok).toBe(true);
+	});
+
+	it.each(["вдвое", "втрое", "вчетверо", "в два раза", "в десять раз", "половина", "половины", "четверть", "четвертью", "две трети"])(
+		"rejects %s as a self-computed ratio/fraction",
+		(phrase) => {
+			const text = JSON.stringify({ picture: `Рой красный: красных монет ${phrase} больше, чем зелёных.`, observation: "Биток держится спокойно, паники на рынке нет совсем.", direction: "red" });
+			const result = validateAiParagraphs(text, payload);
+			expect(result.ok, `expected "${phrase}" to be rejected`).toBe(false);
+			if (!result.ok) expect(result.reason).toBe("validator:derived_numbers");
+		},
+	);
+
+	it("does not reject the bare word треть's non-fraction relatives (третий/третьего/третьему/третьих)", () => {
+		// Extra direct coverage beyond the fixture above — every oblique-case
+		// form of the ordinal "third" that isn't "третий" itself starts with
+		// "треть", and none of them should trip item 9.
+		for (const word of ["третий", "третьего", "третьему", "третьих", "третьим", "третьими"]) {
+			const text = JSON.stringify({ picture: `Рой красный ${word} день подряд без единой красной цифры в тексте.`, observation: "Биток держится спокойно, паники на рынке нет совсем.", direction: "red" });
+			const result = validateAiParagraphs(text, payload);
+			expect(result.ok, `expected "${word}" not to trip item 9`).toBe(true);
+		}
+	});
 });
 
 describe("validateAiParagraphs: numbers vs streak-digit are independent checks", () => {

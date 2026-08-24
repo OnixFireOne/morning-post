@@ -43,6 +43,7 @@ const ALL_REASONS: ValidationFailureReason[] = [
 	"validator:empty_or_cutoff",
 	"validator:streak_digit",
 	"validator:language",
+	"validator:derived_numbers",
 ];
 
 describe("buildSystemPrompt: length limit comes from the same constant the validator reads", () => {
@@ -108,7 +109,7 @@ describe("buildSystemPrompt: covers the rest of section 4", () => {
 	});
 });
 
-describe("buildSystemPrompt: PROMPT_VERSION 2 additions — обкатка findings, 24.08", () => {
+describe("buildSystemPrompt: PROMPT_VERSION 2 additions — manual verification findings, 2026-08-24", () => {
 	const system = buildSystemPrompt();
 
 	it("tells the model not to invent anything about previous days when history is empty", () => {
@@ -119,15 +120,39 @@ describe("buildSystemPrompt: PROMPT_VERSION 2 additions — обкатка findi
 		// above) doesn't cover inventing something history never said at all.
 		expect(system).toMatch(/history пуст/);
 	});
+});
 
-	it("tells the model not to restate the BTC price/percent or leader tickers/percents already shown in the post's own deterministic lines", () => {
-		// Found during manual verification: the model repeated BTC's exact price ($77,788) in
-		// picture even though that number already has its own dedicated line in
-		// the post — a validator pass (the price legitimately is in
-		// allowedNumbers) but a stutter for the reader. This is a style rule,
-		// not a numbers-whitelist one, so it belongs in the prompt, not
-		// validator.ts.
-		expect(system).toMatch(/не пиши эти же цифры и тикеры ещё раз/);
+describe("buildSystemPrompt: PROMPT_VERSION 3 additions — manual verification findings, 2026-08-25", () => {
+	const system = buildSystemPrompt();
+
+	it("bans restating the BTC/leader lines' own price/percent, but allows naming the leader tickers", () => {
+		// v2's rule banned tickers too, which made the model go vague ("один из
+		// лидеров вырвался особенно резко") instead of naming names — the
+		// ticker itself isn't a duplicate of anything, only its number is
+		// (that number already has its own dedicated line in the post).
+		expect(system).toMatch(/эти цифры \(но не сами тикеры\) не пиши ещё раз/);
+		expect(system).toMatch(/Тикеры лидеров называть можно и нужно/);
+	});
+
+	it("keeps the BTC-in-words guidance from v2 unchanged", () => {
+		expect(system).toMatch(/биток рванул вверх/i);
+	});
+
+	it("bans multiplicities and fractions spoken as words, even when arithmetically correct for today's numbers", () => {
+		// Found during manual verification: "зелёных монет в десять раз больше,
+		// чем красных" was arithmetically right for that day's split, but it's a
+		// ratio the model computed itself — the same phrase on a different
+		// day's counts would be a silent miscalculation, and ЧИСЛА's plain
+		// allowedNumbers check has no digit to catch it on since it's spelled
+		// out as a word.
+		expect(system).toMatch(/кратности и доли/);
+		expect(system).toMatch(/вдвое/);
+		expect(system).toMatch(/половина/);
+		expect(system).toMatch(/треть/);
+	});
+
+	it("still allows qualitative comparisons without arithmetic", () => {
+		expect(system).toMatch(/Качественные сравнения без арифметики/);
 	});
 });
 

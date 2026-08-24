@@ -15,7 +15,8 @@ export type ValidationFailureReason =
 	| "validator:direction"
 	| "validator:empty_or_cutoff"
 	| "validator:streak_digit"
-	| "validator:language";
+	| "validator:language"
+	| "validator:derived_numbers";
 
 export type AiParagraphs = {
 	picture: string;
@@ -75,6 +76,34 @@ const DIGIT_DAY_COUNT_RE = new RegExp(`${NOT_WORD_BEFORE}\\d+(?!\\d)\\s*-?\\s*(?
 
 function findDigitDayCount(text: string): string | null {
 	const match = text.match(DIGIT_DAY_COUNT_RE);
+	return match ? match[0] : null;
+}
+
+// --- item 9: derived numbers spoken as words — a ratio or fraction the model
+// computed itself from other allowed numbers ("зелёных в десять раз больше"),
+// rather than copying a string verbatim from allowedNumbers. Arithmetically
+// correct for the day it was written doesn't mean grounded: the numbers
+// whitelist check (item 1) only looks at digit tokens, so it has nothing to
+// catch here, and the same phrase on a different day's counts would be a
+// silent miscalculation with no digit anywhere to flag.
+//
+// "треть" is matched as a bare word only, not stem-expanded like
+// половин*/четверть* below — день-count ordinals ("третий день",
+// "третьи сутки подряд", required verbatim by section 4's ДНИ ПОДРЯД rule)
+// share the "треть-" prefix in every form except the masculine nominative
+// ("третий" itself, spelled without a soft sign): третья, третье, третьи,
+// третьего, третьей... all start with "треть" + a vowel/consonant. A stem
+// match would silently reject correct day-count phrasing; the bare word
+// "треть" (nominative/accusative singular of the fraction, e.g. "треть
+// монет") never has anything following it, so NOT_WORD_AFTER already keeps
+// it from matching into "третьи" and friends.
+const DERIVED_NUMBER_WORDS_RE = new RegExp(
+	`${NOT_WORD_BEFORE}(?:вдвое|втрое|вчетверо|в\\s+(?:два|три|четыре|пять|шесть|семь|восемь|девять|десять)\\s+раз(?:а)?|половин\\p{L}*|четверть\\p{L}*|две\\s+трети|треть)${NOT_WORD_AFTER}`,
+	"iu",
+);
+
+function findDerivedNumberWords(text: string): string | null {
+	const match = text.match(DERIVED_NUMBER_WORDS_RE);
 	return match ? match[0] : null;
 }
 
@@ -162,8 +191,8 @@ function endsLikeASentence(text: string): boolean {
 /**
  * Section 5, checks in this order (first failure wins — order doesn't change
  * correctness, each check is independent): parse -> non-empty/not cut off ->
- * length -> forbidden content -> direction -> streak-as-day-count -> number
- * whitelist -> language.
+ * length -> forbidden content -> direction -> streak-as-day-count ->
+ * derived-number-words -> number whitelist -> language.
  */
 export function validateAiParagraphs(rawText: string, payload: AiPayload): ValidationResult {
 	const parsed = parseAiJson(rawText);
@@ -195,6 +224,9 @@ export function validateAiParagraphs(rawText: string, payload: AiPayload): Valid
 
 	const digitDayCount = findDigitDayCount(combined);
 	if (digitDayCount) return { ok: false, reason: "validator:streak_digit", detail: `"${digitDayCount}" — day-streak must be spoken as a word, never a digit` };
+
+	const derivedNumberWords = findDerivedNumberWords(combined);
+	if (derivedNumberWords) return { ok: false, reason: "validator:derived_numbers", detail: `"${derivedNumberWords}" — a ratio/fraction in words is a self-computed number, not a copy from allowedNumbers` };
 
 	const badNumber = findDisallowedNumber(combined, payload.allowedNumbers);
 	if (badNumber) return { ok: false, reason: "validator:numbers", detail: `"${badNumber}" is not in allowedNumbers` };
