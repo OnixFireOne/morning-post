@@ -108,6 +108,29 @@ describe("buildSystemPrompt: covers the rest of section 4", () => {
 	});
 });
 
+describe("buildSystemPrompt: PROMPT_VERSION 2 additions — обкатка findings, 24.08", () => {
+	const system = buildSystemPrompt();
+
+	it("tells the model not to invent anything about previous days when history is empty", () => {
+		// Found during manual verification: with an empty history the model
+		// twice guessed at an "after the quiet" narrative that never happened.
+		// The rule has to name the empty-history case explicitly — "don't
+		// repeat history's own wording" (the pre-existing anti-repeat rule
+		// above) doesn't cover inventing something history never said at all.
+		expect(system).toMatch(/history пуст/);
+	});
+
+	it("tells the model not to restate the BTC price/percent or leader tickers/percents already shown in the post's own deterministic lines", () => {
+		// Found during manual verification: the model repeated BTC's exact price ($77,788) in
+		// picture even though that number already has its own dedicated line in
+		// the post — a validator pass (the price legitimately is in
+		// allowedNumbers) but a stutter for the reader. This is a style rule,
+		// not a numbers-whitelist one, so it belongs in the prompt, not
+		// validator.ts.
+		expect(system).toMatch(/не пиши эти же цифры и тикеры ещё раз/);
+	});
+});
+
 describe("buildUserPrompt", () => {
 	it("is exactly one JSON object, parseable end to end, with no wrapping prose", () => {
 		const user = buildUserPrompt(payload);
