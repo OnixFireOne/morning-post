@@ -16,7 +16,8 @@
     "dry:fixture": "cross-env DRY_RUN=1 tsx src/index.ts",
     "post": "cross-env DRY_RUN=0 tsx src/index.ts",
     "post:force": "cross-env DRY_RUN=0 tsx src/index.ts --force",
-    "ai:models": "tsx src/ai/listModels.ts"
+    "ai:models": "tsx src/ai/listModels.ts",
+    "ai:compare": "tsx tools/ai-compare.ts"
   },
   "dependencies": {
     "cross-env": "10.1.0",
