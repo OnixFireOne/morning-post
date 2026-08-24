@@ -13,11 +13,12 @@
 // first-attempt failure rate before anything smooths it over.
 //
 // No prod logic is reimplemented: buildAiPayload, buildSystemPrompt/
-// buildUserPrompt, validateAiParagraphs, computeCost and
-// stateHistoryToAiHistory are the exact functions the production path calls,
-// imported as-is. This file only adds argument parsing, one bare
-// client.generate() call per run (skipping generate.ts's loop), and
-// markdown formatting.
+// buildUserPrompt, validateAiParagraphs, computeCost, stateHistoryToAiHistory
+// and buildParagraphs (the template fallback, shown alongside each AI run for
+// a pairwise read — section 9's actual ask) are the exact functions the
+// production path calls, imported as-is. This file only adds argument
+// parsing, one bare client.generate() call per run (skipping generate.ts's
+// loop), and markdown formatting.
 import "dotenv/config";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -28,7 +29,8 @@ import { buildAiPayload, stateHistoryToAiHistory, type AiPayload } from "../src/
 import { buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
 import { computeCost } from "../src/ai/usage.js";
 import { validateAiParagraphs, type ValidationFailureReason } from "../src/ai/validator.js";
-import { computeFacts, type StateHistory } from "../src/facts.js";
+import { computeFacts, type Facts, type StateHistory } from "../src/facts.js";
+import { buildParagraphs, type PostParagraphs } from "../src/render.js";
 import { loadSnapshotFromFile } from "../src/snapshot.js";
 import { readState } from "../src/state.js";
 
@@ -148,9 +150,28 @@ function formatCostLine(costEstimate: number | null): string {
 	return costEstimate !== null ? `- Стоимость (оценка): ${costEstimate.toFixed(4)} кредитов` : `- Стоимость: не посчитана (цена для этой модели не задана в .env)`;
 }
 
+/** Shown once per fixture, above its AI runs — the template half of the pairwise comparison (section 9's actual ask: template vs AI, not AI in isolation). buildParagraphs() is a pure local call, no request, no cost. */
+function formatFixtureHeader(fixtureName: string, facts: Facts, payload: AiPayload, template: PostParagraphs): string {
+	return [
+		`## ${fixtureName}`,
+		"",
+		`- swarmState: ${facts.swarmState}`,
+		`- streak: ${facts.streak}`,
+		`- allowedNumbers: ${payload.allowedNumbers.join(", ")}`,
+		"",
+		"### Шаблон (buildParagraphs, без запроса к модели)",
+		"",
+		"**Абзац 1 (picture):**",
+		`> ${template.picture}`,
+		"",
+		"**Абзац 2 (observation):**",
+		`> ${template.observation}`,
+	].join("\n");
+}
+
 function formatRunSection(fr: FixtureRun, totalRuns: number): string {
-	const { fixtureName, run, outcome } = fr;
-	const header = `### ${fixtureName} — прогон ${run}/${totalRuns}`;
+	const { run, outcome } = fr;
+	const header = `### ИИ — прогон ${run}/${totalRuns}`;
 
 	if (outcome.kind === "transport") {
 		return [header, "", `- Вердикт: ⚠️ transport — ${outcome.label}${outcome.errorMessage ? ` (${outcome.errorMessage})` : ""}`, `- Время ответа: ${outcome.durationMs} ms`, `- Токены: н/д`].join("\n");
@@ -253,6 +274,9 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 		const payload = buildAiPayload(facts, aiHistory);
 		const system = buildSystemPrompt();
 		const user = buildUserPrompt(payload);
+		const template = buildParagraphs(facts);
+
+		sections.push(formatFixtureHeader(fixtureName, facts, payload, template));
 
 		for (let run = 1; run <= opts.runsPerFixture; run++) {
 			process.stdout.write(`[ai:compare] ${fixtureName} run ${run}/${opts.runsPerFixture}... `);
