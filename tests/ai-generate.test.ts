@@ -56,6 +56,7 @@ function okResult(content: string, overrides: Partial<AiGenerateResult> = {}): A
 		durationMs: 500,
 		errorKind: null,
 		errorMessage: null,
+		rawUsage: null,
 		...overrides,
 	};
 }
@@ -71,6 +72,7 @@ function failResult(errorKind: NonNullable<AiErrorKind>, overrides: Partial<AiGe
 		durationMs: 100,
 		errorKind,
 		errorMessage: "boom",
+		rawUsage: null,
 		...overrides,
 	};
 }

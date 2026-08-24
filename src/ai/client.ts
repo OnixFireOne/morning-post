@@ -42,6 +42,16 @@ export type AiGenerateResult = {
 	errorKind: AiErrorKind;
 	/** Sanitized — never contains the API key or an unmasked proxy URL. null on success. */
 	errorMessage: string | null;
+	/**
+	 * The provider's own `usage` object, exactly as received — no field
+	 * renaming, no derived values, none of this client's own interpretation.
+	 * For manual inspection only (e.g. tools/ai-compare.ts dumping it so a
+	 * human can check the proxy's actual billing math against computeCost()'s
+	 * estimate); production code (generate.ts) never reads this field, only
+	 * the normalized `usage` above. null whenever there's no parsed body at
+	 * all (any transport-level failure) or the provider omitted usage.
+	 */
+	rawUsage: unknown;
 };
 
 export type AiModel = {
@@ -155,6 +165,7 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 				durationMs,
 				errorKind: aborted ? "timeout" : "network",
 				errorMessage: aborted ? `request timed out after ${params.timeoutMs}ms` : sanitizeNetworkError(opts.baseUrl, opts.proxyUrl),
+				rawUsage: null,
 			};
 		} finally {
 			clearTimeout(timeout);
@@ -173,6 +184,7 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 				durationMs,
 				errorKind: "http_error",
 				errorMessage: `HTTP ${response.status}`,
+				rawUsage: null,
 			};
 		}
 
@@ -193,6 +205,7 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 				durationMs,
 				errorKind: "http_error",
 				errorMessage: "response body was not valid JSON",
+				rawUsage: null,
 			};
 		}
 
@@ -216,6 +229,11 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 			durationMs,
 			errorKind: null,
 			errorMessage: null,
+			// The parsed OpenAiChatCompletion type only names the fields this
+			// client interprets — a real response can carry more (provider-specific
+			// cost/cache fields), and JSON.parse() keeps them at runtime even though
+			// the type above doesn't name them. data.usage as-is, unlike `usage`.
+			rawUsage: data.usage ?? null,
 		};
 	}
 

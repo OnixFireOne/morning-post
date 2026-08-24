@@ -64,6 +64,32 @@ describe("createAiClient: generate — success", () => {
 		expect(result.usageReported).toBe(false);
 	});
 
+	it("exposes the provider's usage block completely unparsed in rawUsage, including fields the normalized `usage` doesn't model", async () => {
+		const fetchImpl: FetchLike = async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({
+				choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
+				// estimated_cost isn't a field OpenAiChatCompletion's type names at
+				// all — proving rawUsage passes through the runtime object as-is,
+				// not just the subset this client happens to interpret.
+				usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, estimated_cost: 0.0042 },
+			}),
+		});
+		const result = await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+		expect(result.rawUsage).toEqual({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, estimated_cost: 0.0042 });
+	});
+
+	it("rawUsage is null (not an empty object) when the provider omits the usage block entirely", async () => {
+		const fetchImpl: FetchLike = async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({ choices: [{ message: { content: "hi" }, finish_reason: "stop" }] }),
+		});
+		const result = await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+		expect(result.rawUsage).toBeNull();
+	});
+
 	it("reads cached tokens when the provider reports them, null when it doesn't", async () => {
 		const withCache: FetchLike = async () => ({
 			ok: true,
@@ -93,6 +119,7 @@ describe("createAiClient: generate — failure classification", () => {
 		expect(result.errorKind).toBe("http_error");
 		expect(result.content).toBeNull();
 		expect(result.usage).toBeNull();
+		expect(result.rawUsage).toBeNull(); // no body was ever parsed — nothing to dump
 	});
 
 	it("marks a 2xx response with a non-JSON body as http_error too, not a crash", async () => {
@@ -122,6 +149,7 @@ describe("createAiClient: generate — failure classification", () => {
 		expect(result.ok).toBe(false);
 		expect(result.errorKind).toBe("timeout");
 		expect(result.errorMessage).toContain("20ms");
+		expect(result.rawUsage).toBeNull();
 	});
 
 	it("marks a thrown network error as network, with a message that never contains proxy credentials or the raw underlying error", async () => {

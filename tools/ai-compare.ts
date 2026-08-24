@@ -73,6 +73,8 @@ type RunOutcome =
 			tokensOut: number | null;
 			durationMs: number;
 			costEstimate: number | null;
+			/** The proxy's own usage block, untouched — see AiGenerateResult.rawUsage in client.ts. */
+			rawUsage: unknown;
 	  }
 	| {
 			kind: "rejected";
@@ -83,6 +85,7 @@ type RunOutcome =
 			tokensOut: number | null;
 			durationMs: number;
 			costEstimate: number | null;
+			rawUsage: unknown;
 	  }
 	| { kind: "transport"; label: string; errorMessage: string | null; durationMs: number };
 
@@ -141,13 +144,29 @@ async function runOne(
 			tokensOut,
 			durationMs: result.durationMs,
 			costEstimate,
+			rawUsage: result.rawUsage,
 		};
 	}
-	return { kind: "rejected", reason: validation.reason, detail: validation.detail, rawResponse: rawText, tokensIn, tokensOut, durationMs: result.durationMs, costEstimate };
+	return {
+		kind: "rejected",
+		reason: validation.reason,
+		detail: validation.detail,
+		rawResponse: rawText,
+		tokensIn,
+		tokensOut,
+		durationMs: result.durationMs,
+		costEstimate,
+		rawUsage: result.rawUsage,
+	};
 }
 
 function formatCostLine(costEstimate: number | null): string {
 	return costEstimate !== null ? `- Стоимость (оценка): ${costEstimate.toFixed(4)} кредитов` : `- Стоимость: не посчитана (цена для этой модели не задана в .env)`;
+}
+
+/** As-is, no interpretation — exactly what client.ts's AiGenerateResult.rawUsage carries, for comparing against the proxy's own billing panel by eye. */
+function formatRawUsageBlock(rawUsage: unknown): string {
+	return ["**Сырой usage от прокси (как есть, без интерпретации):**", "```json", JSON.stringify(rawUsage, null, 2), "```"].join("\n");
 }
 
 /** Shown once per fixture, above its AI runs — the template half of the pairwise comparison (section 9's actual ask: template vs AI, not AI in isolation). buildParagraphs() is a pure local call, no request, no cost. */
@@ -190,6 +209,8 @@ function formatRunSection(fr: FixtureRun, totalRuns: number): string {
 			costLine,
 			timeLine,
 			"",
+			formatRawUsageBlock(outcome.rawUsage),
+			"",
 			"**Абзац 1 (picture):**",
 			`> ${outcome.picture}`,
 			"",
@@ -207,6 +228,8 @@ function formatRunSection(fr: FixtureRun, totalRuns: number): string {
 		tokensLine,
 		costLine,
 		timeLine,
+		"",
+		formatRawUsageBlock(outcome.rawUsage),
 		"",
 		"**Сырой ответ модели:**",
 		"```",
