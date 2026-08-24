@@ -11,3 +11,6 @@ services:
       # STATE_FILE в .env — ./data/state.json, тот же путь и внутри контейнера
       # (WORKDIR /app) — история переживает пересоздание контейнера.
       - ./data:/app/data
+      # v2: OUT_DIR в .env — ./out, тот же путь внутри контейнера. Без этого
+      # тома ai.json/usage.jsonl умирают вместе с контейнером на VPS.
+      - ./out:/app/out
