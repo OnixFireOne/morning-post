@@ -77,7 +77,8 @@ function pickObservation(facts: Facts): string {
 	return pickVariant(NEUTRAL_NO_BTC_VARIANTS, facts.dateKey)(facts);
 }
 
-function buildLeaderLines(facts: Facts): { winnerLine: string; loserLine: string } {
+/** Exported for v2 (шаг 6): AI-sourced paragraphs still need these two deterministic lines, identical to the template path. */
+export function buildLeaderLines(facts: Facts): { winnerLine: string; loserLine: string } {
 	const winner = facts.winners[0];
 	const loser = facts.losers[0];
 	if (!winner || !loser) {
@@ -113,20 +114,34 @@ function assembleCaption(facts: Facts, paragraphs: PostParagraphs, picture: stri
 }
 
 /**
- * Склеивает caption и деградирует его при превышении лимита Telegram (раздел
- * 4.3): сначала убирается абзац-наблюдение, затем берётся короткий вариант
- * абзаца-картины. Заголовок, строка BTC, строки лидеров и CTA не режутся
- * никогда — если и короткий вариант не помог, дальше деградировать некуда.
+ * Склеивает caption из уже готовых абзацев (любого источника — шаблон или
+ * ИИ, раздел 1 v2: "тем же интерфейсом") и деградирует его при превышении
+ * лимита Telegram (раздел 4.3 v1): сначала убирается абзац-наблюдение, затем
+ * — если дан короткий вариант картины дня — используется он. Заголовок,
+ * строка BTC, строки лидеров и CTA не режутся никогда.
+ *
+ * `shortPicture` опционален: у ИИ-абзацев нет короткого варианта (см. решение
+ * по переполнению v2 — если после удаления наблюдения текст всё ещё не
+ * влезает, это отказ всего ИИ-пути целиком, не повод резать чужой текст).
+ * Без `shortPicture` деградация останавливается на втором шаге; вызывающий
+ * код (шаг 6) сам решает, что делать, если и это не помогло.
  */
-export function buildCaption(facts: Facts): string {
-	const paragraphs = buildParagraphs(facts);
-
+export function buildCaptionFromParagraphs(facts: Facts, paragraphs: PostParagraphs, shortPicture?: string): string {
 	let caption = assembleCaption(facts, paragraphs, paragraphs.picture, true);
 	if (caption.length <= CAPTION_LIMIT) return caption;
 
 	caption = assembleCaption(facts, paragraphs, paragraphs.picture, false);
 	if (caption.length <= CAPTION_LIMIT) return caption;
 
+	if (shortPicture !== undefined) {
+		caption = assembleCaption(facts, paragraphs, shortPicture, false);
+	}
+	return caption;
+}
+
+/** Unchanged v1 behaviour — template paragraphs, template short-picture fallback. */
+export function buildCaption(facts: Facts): string {
+	const paragraphs = buildParagraphs(facts);
 	const shortPicture = pickShortPicture(facts);
-	return assembleCaption(facts, paragraphs, shortPicture, false);
+	return buildCaptionFromParagraphs(facts, paragraphs, shortPicture);
 }
