@@ -48,6 +48,8 @@ export type AiGenerationResult = {
 	totalTokensIn: number;
 	totalTokensOut: number;
 	totalDurationMs: number;
+	/** Sum of every attempt's own cost (each priced by whichever model answered it), null only when no attempt had a computable cost — a missing price for one model doesn't zero out another's real spend. */
+	totalCost: number | null;
 };
 
 export type AiJsonAttempt = {
@@ -107,6 +109,8 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 	let attemptCounter = 0;
 	let totalTokensIn = 0;
 	let totalTokensOut = 0;
+	let totalCost = 0;
+	let anyCostKnown = false;
 
 	/** Shared exit for every failure path — the one place that falls back to the template and writes ai.json. */
 	function finish(): AiGenerationResult {
@@ -131,6 +135,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 			totalTokensIn,
 			totalTokensOut,
 			totalDurationMs: Date.now() - startedAt,
+			totalCost: anyCostKnown ? totalCost : null,
 		};
 	}
 
@@ -241,6 +246,10 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 					totalTokensIn += result.usage.promptTokens;
 					totalTokensOut += result.usage.completionTokens;
 				}
+				if (cost !== null) {
+					totalCost += cost;
+					anyCostKnown = true;
+				}
 
 				if (validation.ok) {
 					safeWriteAiJson(options.aiJsonFile, {
@@ -262,6 +271,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 						totalTokensIn,
 						totalTokensOut,
 						totalDurationMs: Date.now() - startedAt,
+						totalCost: anyCostKnown ? totalCost : null,
 					};
 				}
 

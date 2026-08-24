@@ -54,7 +54,8 @@ export type Facts = {
 	maxAbsLeaderChange: number;
 };
 
-function moscowDateKey(iso: string): string {
+/** v2: exported for usageReport.ts — grouping usage.jsonl's UTC timestamps into the same Moscow calendar day the rest of the app uses (streak, dateKey, etc.), not a naive UTC-date string match. */
+export function moscowDateKey(iso: string): string {
 	return new Intl.DateTimeFormat("en-CA", {
 		timeZone: MOSCOW_TZ,
 		year: "numeric",
@@ -71,7 +72,8 @@ function moscowDateLabel(iso: string): string {
 	}).format(new Date(iso));
 }
 
-function shiftDateKey(dateKey: string, deltaDays: number): string {
+/** v2: exported for usageReport.ts — computing the start of a weekly report's 7-day window. */
+export function shiftDateKey(dateKey: string, deltaDays: number): string {
 	const [y, m, d] = dateKey.split("-").map(Number) as [number, number, number];
 	const dt = new Date(Date.UTC(y, m - 1, d));
 	dt.setUTCDate(dt.getUTCDate() + deltaDays);

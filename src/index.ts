@@ -5,6 +5,7 @@ import { formatAlert, sendAlert } from "./alert.js";
 import { createAiClient } from "./ai/client.js";
 import { buildParagraphsAI, type AiModelConfig } from "./ai/generate.js";
 import { stateHistoryToAiHistory } from "./ai/payload.js";
+import { buildUsageReport } from "./ai/usageReport.js";
 import { captureSnapshotAndScreenshot } from "./capture.js";
 import { RetryExhaustedError } from "./errors.js";
 import { computeFacts, type Facts, type StateDay } from "./facts.js";
@@ -19,6 +20,8 @@ function readEnv() {
 	// префиксов вида `SNAPSHOT_FILE=... npm run dry`, которые не работают в
 	// PowerShell/cmd (раздел 6): `npm run dry:fixture -- fixtures/green.json`.
 	const snapshotFileOverride = args.find((a) => !a.startsWith("--"));
+	const stateFile = path.resolve(process.env.STATE_FILE || "data/state.json");
+	const usageReportMode = process.env.AI_USAGE_REPORT === "weekly" ? "weekly" : process.env.AI_USAGE_REPORT === "0" ? "0" : "daily";
 	return {
 		siteUrl: process.env.SITE_URL ?? "",
 		// `||`, not `??`, everywhere below: an empty string in .env (e.g. a value
@@ -28,7 +31,12 @@ function readEnv() {
 		minSwarmSize: Number(process.env.MIN_SWARM_SIZE || 20),
 		dryRun: process.env.DRY_RUN === "1",
 		outDir: path.resolve(process.env.OUT_DIR || "out"),
-		stateFile: path.resolve(process.env.STATE_FILE || "data/state.json"),
+		stateFile,
+		// Section 3.2: usage.jsonl lives in ./data (the same mounted volume as
+		// state.json), not ./out — an earlier version of this file put it in
+		// outDir by mistake; fixed here since section 3.3's balance tracking
+		// now depends on reading its real, documented location.
+		usageFile: path.join(path.dirname(stateFile), "usage.jsonl"),
 		force: args.includes("--force"),
 		telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || "",
 		telegramTargetChatId: process.env.TELEGRAM_TARGET_CHAT_ID || "",
@@ -54,6 +62,11 @@ function readEnv() {
 		// Not AI_BASE_URL's own proxy (AiClientOptions.proxyUrl) — this is the
 		// outbound network proxy for reaching it at all (section 2).
 		aiProxyUrl: process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "",
+		// Section 3.3: daily/weekly usage summary to the admin chat.
+		aiUsageReport: usageReportMode as "daily" | "weekly" | "0",
+		aiBalanceStart: process.env.AI_BALANCE_START ? Number(process.env.AI_BALANCE_START) : null,
+		aiBalanceAsOf: process.env.AI_BALANCE_AS_OF || null,
+		aiBalanceWarn: process.env.AI_BALANCE_WARN ? Number(process.env.AI_BALANCE_WARN) : null,
 	};
 }
 
@@ -137,6 +150,8 @@ type RenderedPost = {
 	tokensIn: number | null;
 	tokensOut: number | null;
 	attempts: number | null;
+	/** Sum of every attempt's own cost this run (see AiGenerationResult.totalCost) — null when AI was never attempted, or when no attempt had a computable price. */
+	totalCost: number | null;
 	/** Non-null exactly when the AI path was attempted and didn't produce what got published — drives the non-blocking fallback alert in main(). */
 	failureReason: string | null;
 };
@@ -161,6 +176,7 @@ async function renderPost(facts: Facts, history: StateHistory, skipAi: boolean):
 			tokensIn: null,
 			tokensOut: null,
 			attempts: null,
+			totalCost: null,
 			failureReason: null,
 		};
 	}
@@ -180,7 +196,7 @@ async function renderPost(facts: Facts, history: StateHistory, skipAi: boolean):
 		totalBudgetMs: env.aiTotalBudgetMs,
 		maxAttemptsPerModel: env.aiMaxAttempts,
 		promptVersion: env.promptVersion,
-		usageFile: path.join(env.outDir, "usage.jsonl"),
+		usageFile: env.usageFile,
 		aiJsonFile: path.join(env.outDir, `${facts.dateKey}.ai.json`),
 	});
 
@@ -199,6 +215,7 @@ async function renderPost(facts: Facts, history: StateHistory, skipAi: boolean):
 				tokensIn: result.totalTokensIn,
 				tokensOut: result.totalTokensOut,
 				attempts: result.attempts,
+				totalCost: result.totalCost,
 				failureReason: null,
 			};
 		}
@@ -212,6 +229,7 @@ async function renderPost(facts: Facts, history: StateHistory, skipAi: boolean):
 			tokensIn: result.totalTokensIn,
 			tokensOut: result.totalTokensOut,
 			attempts: result.attempts,
+			totalCost: result.totalCost,
 			failureReason: "AI paragraphs were valid but the caption still exceeded CAPTION_LIMIT after dropping the observation paragraph",
 		};
 	}
@@ -227,6 +245,7 @@ async function renderPost(facts: Facts, history: StateHistory, skipAi: boolean):
 		tokensIn: result.totalTokensIn,
 		tokensOut: result.totalTokensOut,
 		attempts: result.attempts,
+		totalCost: result.totalCost,
 		failureReason: result.failureReason,
 	};
 }
@@ -366,6 +385,44 @@ async function main() {
 	};
 	writeStateAtomic(env.stateFile, appendDay(history, day));
 	console.log(`[state] posted messageId=${message.message_id} for ${facts.dateKey}, saved to ${env.stateFile}`);
+
+	// Section 3.3: strictly after the post is out and the day is on record.
+	// Wrapped defensively — a bug in the summary itself (not just sendAlert(),
+	// which already never throws) must not turn a successful post into a
+	// failed run. buildUsageReport() already returns null when AI is
+	// disabled or AI_USAGE_REPORT="0"/not-Sunday-in-weekly-mode; the
+	// env.aiEnabled check here just avoids the usage.jsonl read entirely on
+	// the common AI_ENABLED=0 path.
+	if (env.aiEnabled) {
+		currentStep = "usage-report";
+		try {
+			const report = buildUsageReport({
+				aiEnabled: env.aiEnabled,
+				mode: env.aiUsageReport,
+				dateKey: facts.dateKey,
+				today: {
+					source: rendered.source,
+					model: rendered.model,
+					attempts: rendered.attempts ?? 0,
+					tokensIn: rendered.tokensIn,
+					tokensOut: rendered.tokensOut,
+					totalCost: rendered.totalCost,
+					failureReason: rendered.failureReason,
+				},
+				usageFile: env.usageFile,
+				dailyTokenWarn: env.aiDailyTokenWarn,
+				balanceStart: env.aiBalanceStart,
+				balanceAsOf: env.aiBalanceAsOf,
+				balanceWarn: env.aiBalanceWarn,
+			});
+			if (report) {
+				const delivered = await sendAlert({ botToken: env.telegramBotToken, chatId: env.telegramAdminChatId, text: report });
+				if (!delivered) console.error(report);
+			}
+		} catch (err) {
+			console.error("[usage-report] failed to build or send:", err instanceof Error ? err.message : err);
+		}
+	}
 }
 
 main().catch((error: unknown) => {

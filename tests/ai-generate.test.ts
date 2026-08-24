@@ -308,6 +308,28 @@ describe("buildParagraphsAI: pricing uses the model that actually answered", () 
 		const [line] = readUsageLines(options.usageFile);
 		expect(line!.costEstimate).toBeNull();
 	});
+
+	it("sums result.totalCost across a content-rejected primary attempt and a fallback that succeeds, each at its own price", async () => {
+		// Directly what the daily usage summary reports as "стоимость дня" —
+		// this has to be the sum of two different attempts priced by two
+		// different models, not one blended tariff applied to the total tokens.
+		const { client } = fakeClient("provider.example.com", [
+			okResult(fixtureText("number-not-in-facts"), { usage: { promptTokens: 100_000, completionTokens: 50_000, totalTokens: 150_000, cachedTokens: null } }),
+			okResult(fixtureText("good"), { usage: { promptTokens: 200_000, completionTokens: 100_000, totalTokens: 300_000, cachedTokens: null } }),
+		]);
+		const options = baseOptions({
+			client,
+			maxAttemptsPerModel: 1, // one content rejection exhausts the primary's own attempts and moves straight to fallback
+			primary: modelConfig("primary-model", { priceInPerMillion: 10, priceOutPerMillion: 20 }), // (100k/1M)*10 + (50k/1M)*20 = 2
+			fallback: modelConfig("fallback-model", { priceInPerMillion: 30, priceOutPerMillion: 60 }), // (200k/1M)*30 + (100k/1M)*60 = 12
+		});
+
+		const result = await buildParagraphsAI(options);
+
+		expect(result.source).toBe("ai"); // sanity: the fallback did succeed
+		expect(result.attempts).toBe(2);
+		expect(result.totalCost).toBe(14); // 2 + 12, not a single blended price on 300k/150k total tokens
+	});
 });
 
 describe("buildParagraphsAI: totalTokensIn/totalTokensOut", () => {
