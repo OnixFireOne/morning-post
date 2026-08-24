@@ -1,0 +1,18 @@
+{
+  "days": [
+    {
+      "date": "2026-08-20",
+      "swarmState": "green",
+      "btcChange": 6.3,
+      "postedAt": "2026-08-21T16:35:15.710Z",
+      "messageId": 384
+    },
+    {
+      "date": "2026-08-21",
+      "swarmState": "green",
+      "btcChange": 7.2,
+      "postedAt": "2026-08-21T16:15:59.800Z",
+      "messageId": 379
+    }
+  ]
+}

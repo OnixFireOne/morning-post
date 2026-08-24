@@ -2,8 +2,10 @@
 // snapshot, no mainSwarm/edgePins, no screenshot — every number here is
 // already a formatted string produced by the same formatters the template
 // post uses, so the model's job is to copy, not to compute or round.
-import type { Facts, SwarmState } from "../facts.js";
+import { dateKeyToLabel, type Facts, type StateHistory, type SwarmState } from "../facts.js";
 import { formatBtcPercent, formatBtcPrice, formatMagnitude, formatSignedPercent } from "../format.js";
+
+const MAX_HISTORY_DAYS_FOR_AI = 3;
 
 export type AiLeader = {
 	ticker: string;
@@ -88,4 +90,26 @@ export function buildAiPayload(facts: Facts, history: AiHistoryEntry[]): AiPaylo
 	};
 
 	return { today, history, allowedNumbers: collectAllowedNumbers(today) };
+}
+
+/**
+ * Bridges state.json (шаг 6) into the AI payload's history shape: the most
+ * recent days before `todayKey`, newest first, capped at 3 (section 3 says
+ * "2-3 предыдущих дня"). A record with no stored picture/observation — a
+ * pre-v2 entry, or a day the AI path never got as far as producing text —
+ * is skipped rather than passed through with empty strings: there's nothing
+ * to anti-repeat against, and an empty pair of paragraphs in `history` would
+ * just be noise the model has to ignore.
+ */
+export function stateHistoryToAiHistory(history: StateHistory, todayKey: string): AiHistoryEntry[] {
+	return history.days
+		.filter((day): day is typeof day & { picture: string; observation: string } => day.date < todayKey && Boolean(day.picture) && Boolean(day.observation))
+		.sort((a, b) => b.date.localeCompare(a.date))
+		.slice(0, MAX_HISTORY_DAYS_FOR_AI)
+		.map((day) => ({
+			dateLabel: dateKeyToLabel(day.date),
+			swarmState: day.swarmState,
+			picture: day.picture,
+			observation: day.observation,
+		}));
 }

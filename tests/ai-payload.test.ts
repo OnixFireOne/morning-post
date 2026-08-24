@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadSnapshotFromFile } from "../src/snapshot.js";
-import { computeFacts, type Facts, type StateHistory } from "../src/facts.js";
-import { buildAiPayload, collectAllowedNumbers, type AiHistoryEntry } from "../src/ai/payload.js";
+import { computeFacts, type Facts, type StateDay, type StateHistory } from "../src/facts.js";
+import { buildAiPayload, collectAllowedNumbers, stateHistoryToAiHistory, type AiHistoryEntry } from "../src/ai/payload.js";
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
 const EMPTY_HISTORY: StateHistory = { days: [] };
@@ -156,5 +157,59 @@ describe("collectAllowedNumbers", () => {
 	it("is the exact function buildAiPayload uses — calling it directly reproduces the same list", () => {
 		const today = buildAiPayload(specExampleFacts(), []).today;
 		expect(collectAllowedNumbers(today)).toEqual(buildAiPayload(specExampleFacts(), []).allowedNumbers);
+	});
+});
+
+describe("stateHistoryToAiHistory", () => {
+	function stateDay(date: string, overrides: Partial<StateDay> = {}): StateDay {
+		return { date, swarmState: "red", btcChange: -1, postedAt: `${date}T06:00:00Z`, messageId: 1, ...overrides };
+	}
+
+	it("maps the most recent days before todayKey, newest first, capped at 3", () => {
+		const history: StateHistory = {
+			days: [
+				stateDay("2026-08-18", { swarmState: "red", picture: "A", observation: "a" }),
+				stateDay("2026-08-19", { swarmState: "green", picture: "B", observation: "b" }),
+				stateDay("2026-08-20", { swarmState: "green", picture: "C", observation: "c" }),
+				stateDay("2026-08-21", { swarmState: "mixed", picture: "D", observation: "d" }),
+			],
+		};
+		const result = stateHistoryToAiHistory(history, "2026-08-22");
+		expect(result.map((h) => h.picture)).toEqual(["D", "C", "B"]); // newest first, only 3
+	});
+
+	it("excludes today and any day on/after it", () => {
+		const history: StateHistory = { days: [stateDay("2026-08-22", { picture: "today", observation: "x" })] };
+		expect(stateHistoryToAiHistory(history, "2026-08-22")).toEqual([]);
+	});
+
+	it("formats dateLabel from the date key, not from postedAt", () => {
+		const history: StateHistory = { days: [stateDay("2026-08-21", { picture: "P", observation: "O" })] };
+		expect(stateHistoryToAiHistory(history, "2026-08-22")).toEqual([{ dateLabel: "21 августа", swarmState: "red", picture: "P", observation: "O" }]);
+	});
+
+	it("skips days with no stored picture/observation, on the real pre-v2 file — not just a synthetic one", () => {
+		// fixtures/history/real-pre-v2-state.json is a verbatim copy of the real
+		// data/state.test.json from шаг 5's manual test run (messageId 379/384) —
+		// written before StateDay had picture/observation at all.
+		const realHistory = JSON.parse(readFileSync(path.join(FIXTURES_DIR, "history", "real-pre-v2-state.json"), "utf8")) as StateHistory;
+		expect(realHistory.days).toHaveLength(2); // sanity: the fixture really has both real entries
+
+		const result = stateHistoryToAiHistory(realHistory, "2026-08-22");
+
+		expect(result).toEqual([]); // neither entry has text — nothing to anti-repeat against, and no crash
+	});
+
+	it("a mix of pre-v2 and v2 entries only surfaces the ones with real text", () => {
+		const realHistory = JSON.parse(readFileSync(path.join(FIXTURES_DIR, "history", "real-pre-v2-state.json"), "utf8")) as StateHistory;
+		const withOneV2Day: StateHistory = {
+			days: [...realHistory.days, stateDay("2026-08-21", { swarmState: "green", picture: "Рой зеленеет.", observation: "Биток спокоен." })],
+		};
+		// appendDay would normally replace the pre-v2 2026-08-21 entry with this
+		// one; constructing it directly here since only the read-side (history
+		// filtering) is under test.
+		const result = stateHistoryToAiHistory(withOneV2Day, "2026-08-22");
+		expect(result).toHaveLength(1);
+		expect(result[0]!.picture).toBe("Рой зеленеет.");
 	});
 });

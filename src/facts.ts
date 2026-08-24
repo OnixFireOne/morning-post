@@ -16,6 +16,21 @@ export type StateDay = {
 	btcChange: number | null;
 	postedAt: string;
 	messageId: number;
+	// v2, all optional so pre-existing records (written before this field set
+	// existed — e.g. the real 20/21.08 entries from шаг 5's manual test run)
+	// keep parsing exactly as before: absent fields just read as undefined,
+	// nothing here requires a migration or a fallback default at read time.
+	/** The text actually posted — written for template days too, not just AI ones, so anti-repeat history has no holes on a day the AI path failed. */
+	picture?: string;
+	observation?: string;
+	source?: "ai" | "template";
+	/** null when source is "template" (or absent on pre-v2 records). */
+	model?: string | null;
+	provider?: string | null;
+	promptVersion?: number | null;
+	tokensIn?: number;
+	tokensOut?: number;
+	attempts?: number;
 };
 
 export type StateHistory = {
@@ -61,6 +76,24 @@ function shiftDateKey(dateKey: string, deltaDays: number): string {
 	const dt = new Date(Date.UTC(y, m - 1, d));
 	dt.setUTCDate(dt.getUTCDate() + deltaDays);
 	return dt.toISOString().slice(0, 10);
+}
+
+/**
+ * v2: formats a state.json date key ("2026-08-22") into "22 августа" for the
+ * AI history payload — unlike moscowDateLabel(), the input is already the
+ * Moscow calendar date (state.json stores it that way), not a UTC instant, so
+ * there's no timezone conversion to make. Formatted against a fixed "UTC"
+ * timeZone anyway (not the Date object's implicit local zone) purely to keep
+ * the day from shifting on a machine whose local zone differs from the one
+ * used to build the Date.UTC() value below.
+ */
+export function dateKeyToLabel(dateKey: string): string {
+	const [y, m, d] = dateKey.split("-").map(Number) as [number, number, number];
+	return new Intl.DateTimeFormat("ru-RU", {
+		timeZone: "UTC",
+		day: "numeric",
+		month: "long",
+	}).format(new Date(Date.UTC(y, m - 1, d)));
 }
 
 function isStableLike(coin: SwarmCoin): boolean {

@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadSnapshotFromFile } from "../src/snapshot.js";
-import { computeFacts, type StateHistory } from "../src/facts.js";
+import { computeFacts, dateKeyToLabel, type StateHistory } from "../src/facts.js";
 import type { HotCoinsSnapshot } from "../src/types.js";
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
@@ -166,5 +166,19 @@ describe("computeFacts: streak", () => {
 
 	it("resets to 1 when there's a gap right before today, even with older red history", () => {
 		expect(computeFacts(today, history("gap-before-today.json")).streak).toBe(1);
+	});
+});
+
+describe("dateKeyToLabel", () => {
+	it("formats a state.json date key the same way moscowDateLabel formats an ISO timestamp for that day", () => {
+		expect(dateKeyToLabel("2026-08-22")).toBe("22 августа");
+		expect(dateKeyToLabel("2026-01-01")).toBe("1 января");
+	});
+
+	it("doesn't shift the day regardless of a leading/trailing UTC offset concern — it's already a calendar date, not an instant", () => {
+		// Deliberately picking a date where a naive local-timezone format (no
+		// explicit timeZone) could shift the day on a machine west of UTC.
+		expect(dateKeyToLabel("2026-08-01")).toBe("1 августа");
+		expect(dateKeyToLabel("2026-12-31")).toBe("31 декабря");
 	});
 });
