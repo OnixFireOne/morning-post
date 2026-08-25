@@ -28,6 +28,7 @@ function usageLine(overrides: Partial<UsageRecord> = {}): string {
 		outcome: "ok",
 		finishReason: "stop",
 		costEstimate: 0.0552,
+		dryRun: false,
 		...overrides,
 	};
 	return JSON.stringify(record);
@@ -124,6 +125,53 @@ describe("buildUsageReport: the day's cost is priced per-attempt, not blended", 
 			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-24" }));
 			expect(report).toContain("Накопленный расход: 0.1300 кредитов за 2 дн.");
 			expect(report).toContain("Остаток баланса: 999.8700 кредитов");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("buildUsageReport: dryRun lines count toward balance/remaining but not the average/forecast (section 3.4)", () => {
+	it("a dryRun:true day's spend reduces the balance but is excluded from среднее/прогноз", () => {
+		const { file, dir } = tmpUsageFile([
+			usageLine({ timestamp: "2026-08-23T06:00:00.000Z", costEstimate: 2.0, dryRun: true }),
+			usageLine({ timestamp: "2026-08-24T06:00:00.000Z", costEstimate: 0.5, dryRun: false }),
+			usageLine({ timestamp: "2026-08-25T06:00:00.000Z", costEstimate: 0.5, dryRun: false }),
+		]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-23" }));
+			// накопленный расход/остаток: all three days, dry-run included — "потраченное потрачено"
+			expect(report).toContain("Накопленный расход: 3.0000 кредитов за 3 дн.");
+			expect(report).toContain("Остаток баланса: 997.0000 кредитов");
+			// среднее/прогноз: only the two real days — the dry-run burst doesn't inflate the modeled daily rate
+			expect(report).toContain("Среднее: 0.5000 кредитов/день, хватит примерно на 1994 дн.");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("a line with no dryRun key at all (written before section 3.4) is treated as real, not excluded", () => {
+		const oldLine = JSON.stringify({
+			timestamp: "2026-08-24T06:00:00.000Z",
+			attempt: 1,
+			provider: "proxy.example.com",
+			model: "claude-sonnet-4-7",
+			promptVersion: 4,
+			tokensIn: 100,
+			tokensOut: 50,
+			tokensTotal: 150,
+			cachedTokens: null,
+			usageReported: true,
+			durationMs: 900,
+			outcome: "ok",
+			finishReason: "stop",
+			costEstimate: 0.5,
+			// no "dryRun" key — a genuine pre-3.4 record
+		});
+		const { file, dir } = tmpUsageFile([oldLine]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-24" }));
+			expect(report).toContain("Среднее: 0.5000 кредитов/день");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

@@ -26,6 +26,8 @@ export type UsageRecord = {
 	finishReason: string | null;
 	/** null unless both AI_PRICE_IN/AI_PRICE_OUT (for whichever model answered) are set AND usage was reported. */
 	costEstimate: number | null;
+	/** true only when DRY_RUN=1 and the request was explicitly allowed via AI_ALLOW_REAL_IN_DRY=1 (section 3.4) — a manual obkatka spend, not a real morning post. Records from before this field existed have no key at all; readers must treat a missing value as false (production), never rewrite the line to add it. */
+	dryRun: boolean;
 };
 
 /**

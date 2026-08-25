@@ -76,14 +76,27 @@ function isSundayDateKey(dateKey: string): boolean {
 	return new Date(Date.UTC(y, m - 1, d)).getUTCDay() === 0;
 }
 
-type BalanceWindow = { accumulated: number; daysCount: number; remaining: number };
+type BalanceWindow = {
+	/** All records regardless of dryRun — "потраченное потрачено", a dry-run obkatka request still spent real proxy credits. */
+	accumulated: number;
+	daysCount: number;
+	remaining: number;
+	/** dryRun:false records only — feeds the average/forecast lines, so a burst of manual obkatka testing on one day doesn't inflate the modeled daily run-rate. */
+	realAccumulated: number;
+	realDaysCount: number;
+};
 
-/** Sums costEstimate (already priced per-attempt by whichever model answered it — see generate.ts) across every record whose Moscow day is on or after balanceAsOf. Records with costEstimate: null contribute 0, same as an untracked-price attempt already does everywhere else in this system. */
+/** Sums costEstimate (already priced per-attempt by whichever model answered it — see generate.ts) across every record whose Moscow day is on or after balanceAsOf. Records with costEstimate: null contribute 0, same as an untracked-price attempt already does everywhere else in this system. A record with no `dryRun` key at all (written before section 3.4) is treated as dryRun:false — a real production line — never rewritten to add the field, per the append-only rule. */
 function computeBalanceWindow(records: UsageRecord[], balanceStart: number, balanceAsOf: string): BalanceWindow {
 	const inWindow = records.filter((r) => moscowDateKey(r.timestamp) >= balanceAsOf);
 	const accumulated = inWindow.reduce((sum, r) => sum + (r.costEstimate ?? 0), 0);
 	const daysCount = new Set(inWindow.map((r) => moscowDateKey(r.timestamp))).size;
-	return { accumulated, daysCount, remaining: balanceStart - accumulated };
+
+	const realRecords = inWindow.filter((r) => (r.dryRun ?? false) === false);
+	const realAccumulated = realRecords.reduce((sum, r) => sum + (r.costEstimate ?? 0), 0);
+	const realDaysCount = new Set(realRecords.map((r) => moscowDateKey(r.timestamp))).size;
+
+	return { accumulated, daysCount, remaining: balanceStart - accumulated, realAccumulated, realDaysCount };
 }
 
 function formatCredits(n: number): string {
@@ -97,7 +110,10 @@ function formatBalanceLines(balance: BalanceWindow | null, balanceAsOf: string |
 		`Накопленный расход: ${formatCredits(balance.accumulated)} кредитов за ${balance.daysCount} дн. (с ${dateKeyToLabel(balanceAsOf)})`,
 		`Остаток баланса: ${formatCredits(balance.remaining)} кредитов — оценка снизу: прокси не биллит фиксированный оверхед входных токенов на попытку, реальный остаток немного больше.`,
 	];
-	const avgPerDay = balance.daysCount > 0 ? balance.accumulated / balance.daysCount : 0;
+	// Real-only rate — a dry-run obkatka burst on one day must not inflate the
+	// modeled daily spend, even though that same spend already reduced
+	// `remaining` above (it was real money either way).
+	const avgPerDay = balance.realDaysCount > 0 ? balance.realAccumulated / balance.realDaysCount : 0;
 	lines.push(
 		avgPerDay > 0
 			? `Среднее: ${formatCredits(avgPerDay)} кредитов/день, хватит примерно на ${Math.floor(balance.remaining / avgPerDay)} дн. при текущем темпе`

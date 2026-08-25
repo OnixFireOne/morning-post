@@ -2,16 +2,13 @@ import "dotenv/config";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { formatAlert, sendAlert } from "./alert.js";
-import { createAiClient } from "./ai/client.js";
-import { buildParagraphsAI, type AiModelConfig } from "./ai/generate.js";
-import { stateHistoryToAiHistory } from "./ai/payload.js";
 import { buildUsageReport } from "./ai/usageReport.js";
 import { captureSnapshotAndScreenshot } from "./capture.js";
 import { RetryExhaustedError } from "./errors.js";
-import { computeFacts, type Facts, type StateDay } from "./facts.js";
-import { buildCaption, buildCaptionFromParagraphs, buildLeaderLines, buildParagraphs, CAPTION_LIMIT, type PostParagraphs } from "./render.js";
+import { computeFacts, type StateDay } from "./facts.js";
+import { renderPost } from "./renderPost.js";
 import { loadSnapshotFromFile } from "./snapshot.js";
-import { appendDay, findPostedDay, readState, writeStateAtomic, type StateHistory } from "./state.js";
+import { appendDay, findPostedDay, readState, writeStateAtomic } from "./state.js";
 import { sendMessage, sendPhoto } from "./telegram.js";
 
 function readEnv() {
@@ -59,6 +56,10 @@ function readEnv() {
 		aiFallbackPriceIn: process.env.AI_FALLBACK_PRICE_IN ? Number(process.env.AI_FALLBACK_PRICE_IN) : null,
 		aiFallbackPriceOut: process.env.AI_FALLBACK_PRICE_OUT ? Number(process.env.AI_FALLBACK_PRICE_OUT) : null,
 		aiDailyTokenWarn: process.env.AI_DAILY_TOKEN_WARN ? Number(process.env.AI_DAILY_TOKEN_WARN) : null,
+		// Section 3.4: DRY_RUN=1 must never spend a real request on its own —
+		// this is the explicit opt-in a human sets on the command line for a
+		// deliberate obkatka run under DRY_RUN=1.
+		aiAllowRealInDry: process.env.AI_ALLOW_REAL_IN_DRY === "1",
 		// Not AI_BASE_URL's own proxy (AiClientOptions.proxyUrl) — this is the
 		// outbound network proxy for reaching it at all (section 2).
 		aiProxyUrl: process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "",
@@ -139,117 +140,6 @@ process.on("unhandledRejection", (reason) => {
 		.finally(() => setTimeout(() => process.exit(1), 5000).unref());
 });
 
-type RenderedPost = {
-	caption: string;
-	paragraphs: PostParagraphs;
-	source: "ai" | "template";
-	model: string | null;
-	provider: string | null;
-	promptVersion: number | null;
-	/** null when AI was never attempted at all (AI_ENABLED=0) — omitted from StateDay rather than written as 0. */
-	tokensIn: number | null;
-	tokensOut: number | null;
-	attempts: number | null;
-	/** Sum of every attempt's own cost this run (see AiGenerationResult.totalCost) — null when AI was never attempted, or when no attempt had a computable price. */
-	totalCost: number | null;
-	/** Non-null exactly when the AI path was attempted and didn't produce what got published — drives the non-blocking fallback alert in main(). */
-	failureReason: string | null;
-};
-
-/**
- * v2 step 6: when AI is disabled (or `skipAi` is set — see the call site in
- * main()) this calls nothing but the untouched v1 buildCaption()/
- * buildParagraphs() — same functions, same facts, so the caption is
- * byte-for-byte what v1 always produced. AI_ENABLED=0 in .env/.env.example —
- * never flip this without a human running the full dry:fixture verification
- * first (plan/ai-start-integration.md, section 9).
- */
-async function renderPost(facts: Facts, history: StateHistory, skipAi: boolean): Promise<RenderedPost> {
-	if (!env.aiEnabled || skipAi) {
-		return {
-			caption: buildCaption(facts),
-			paragraphs: buildParagraphs(facts),
-			source: "template",
-			model: null,
-			provider: null,
-			promptVersion: null,
-			tokensIn: null,
-			tokensOut: null,
-			attempts: null,
-			totalCost: null,
-			failureReason: null,
-		};
-	}
-
-	const aiHistory = stateHistoryToAiHistory(history, facts.dateKey);
-	const client = createAiClient({ baseUrl: env.aiBaseUrl, apiKey: env.aiApiKey, proxyUrl: env.aiProxyUrl || undefined });
-	const primary: AiModelConfig = { model: env.aiModel, priceInPerMillion: env.aiPriceIn, priceOutPerMillion: env.aiPriceOut };
-	const fallback: AiModelConfig = { model: env.aiModelFallback, priceInPerMillion: env.aiFallbackPriceIn, priceOutPerMillion: env.aiFallbackPriceOut };
-
-	const result = await buildParagraphsAI({
-		facts,
-		history: aiHistory,
-		client,
-		primary,
-		fallback,
-		timeoutMs: env.aiTimeoutMs,
-		totalBudgetMs: env.aiTotalBudgetMs,
-		maxAttemptsPerModel: env.aiMaxAttempts,
-		promptVersion: env.promptVersion,
-		usageFile: env.usageFile,
-		aiJsonFile: path.join(env.outDir, `${facts.dateKey}.ai.json`),
-	});
-
-	if (result.source === "ai") {
-		const { winnerLine, loserLine } = buildLeaderLines(facts);
-		const paragraphs: PostParagraphs = { picture: result.picture, winnerLine, loserLine, observation: result.observation };
-		const caption = buildCaptionFromParagraphs(facts, paragraphs); // no shortPicture: overflow here is a total AI-path failure, not a reason to graft template text on
-		if (caption.length <= CAPTION_LIMIT) {
-			return {
-				caption,
-				paragraphs,
-				source: "ai",
-				model: result.model,
-				provider: result.provider,
-				promptVersion: result.promptVersion,
-				tokensIn: result.totalTokensIn,
-				tokensOut: result.totalTokensOut,
-				attempts: result.attempts,
-				totalCost: result.totalCost,
-				failureReason: null,
-			};
-		}
-		return {
-			caption: buildCaption(facts),
-			paragraphs: buildParagraphs(facts),
-			source: "template",
-			model: null,
-			provider: null,
-			promptVersion: null,
-			tokensIn: result.totalTokensIn,
-			tokensOut: result.totalTokensOut,
-			attempts: result.attempts,
-			totalCost: result.totalCost,
-			failureReason: "AI paragraphs were valid but the caption still exceeded CAPTION_LIMIT after dropping the observation paragraph",
-		};
-	}
-
-	// buildParagraphsAI() never throws — it already fell back to the template internally.
-	return {
-		caption: buildCaption(facts),
-		paragraphs: buildParagraphs(facts),
-		source: "template",
-		model: null,
-		provider: null,
-		promptVersion: null,
-		tokensIn: result.totalTokensIn,
-		tokensOut: result.totalTokensOut,
-		attempts: result.attempts,
-		totalCost: result.totalCost,
-		failureReason: result.failureReason,
-	};
-}
-
 async function main() {
 	validateStartupConfig();
 
@@ -289,7 +179,7 @@ async function main() {
 	// previewed, and a fixture's dateKey essentially never matches real
 	// prod state.
 	const skipAi = !env.dryRun && Boolean(alreadyPosted) && !env.force;
-	const rendered = await renderPost(facts, history, skipAi);
+	const rendered = await renderPost(facts, history, skipAi, env);
 	console.log(rendered.caption);
 
 	if (env.dryRun) {

@@ -138,6 +138,7 @@ function baseOptions(overrides: Partial<BuildParagraphsAiOptions> = {}): BuildPa
 		promptVersion: 1,
 		usageFile: path.join(tmpDir, "usage.jsonl"),
 		aiJsonFile: path.join(tmpDir, "day.ai.json"),
+		dryRun: false,
 		...overrides,
 	};
 }
@@ -203,6 +204,29 @@ describe("buildParagraphsAI: usage.jsonl is written for rejected attempts too, b
 		expect(line!.tokensTotal).toBeNull();
 		expect(line!.usageReported).toBe(false);
 		expect(line!.costEstimate).toBeNull();
+	});
+});
+
+describe("buildParagraphsAI: dryRun flag on every usage.jsonl line (section 3.4)", () => {
+	it("writes dryRun: true on every line — success and transport-failure alike — when options.dryRun is true", async () => {
+		const { client } = fakeClient("provider.example.com", [failResult("http_error", { httpStatus: 500 }), okResult(fixtureText("good"))]);
+		const options = baseOptions({ client, dryRun: true });
+
+		await buildParagraphsAI(options);
+
+		const lines = readUsageLines(options.usageFile);
+		expect(lines).toHaveLength(2);
+		expect(lines.every((l) => l.dryRun === true)).toBe(true);
+	});
+
+	it("writes dryRun: false on every line when options.dryRun is false", async () => {
+		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("good"))]);
+		const options = baseOptions({ client, dryRun: false });
+
+		await buildParagraphsAI(options);
+
+		const [line] = readUsageLines(options.usageFile);
+		expect(line!.dryRun).toBe(false);
 	});
 });
 

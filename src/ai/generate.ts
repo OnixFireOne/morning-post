@@ -33,6 +33,8 @@ export type BuildParagraphsAiOptions = {
 	promptVersion: number;
 	usageFile: string;
 	aiJsonFile: string;
+	/** Section 3.4: whether this call happened under DRY_RUN=1 (with AI_ALLOW_REAL_IN_DRY=1 — index.ts's dry-run gate never lets this function run otherwise). Written into every usage.jsonl line so a manual obkatka spend can be told apart from a real morning post. */
+	dryRun: boolean;
 };
 
 export type AiGenerationResult = {
@@ -176,6 +178,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 						outcome,
 						finishReason: null,
 						costEstimate: null,
+						dryRun: options.dryRun,
 					});
 					attempts.push({
 						attempt: attemptCounter,
@@ -226,6 +229,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 					outcome,
 					finishReason: result.finishReason,
 					costEstimate: cost,
+					dryRun: options.dryRun,
 				});
 				attempts.push({
 					attempt: attemptCounter,

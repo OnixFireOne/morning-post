@@ -1,0 +1,136 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import type { FetchLike } from "../src/ai/client.js";
+import type { Facts } from "../src/facts.js";
+import { renderPost, type RenderPostConfig } from "../src/renderPost.js";
+import type { StateHistory } from "../src/state.js";
+
+const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "ai-responses");
+function fixtureText(name: string): string {
+	return readFileSync(path.join(FIXTURES_DIR, `${name}.txt`), "utf8");
+}
+
+/** Same worked example as the other ai-*.test.ts files. */
+function specExampleFacts(overrides: Partial<Facts> = {}): Facts {
+	return {
+		dateLabel: "23 августа",
+		dateKey: "2026-08-23",
+		btc: { price: 76_150, change24h: -2.1 },
+		red: 133,
+		green: 14,
+		total: 147,
+		swarmState: "red",
+		streak: 1,
+		prevState: "green",
+		winners: [{ id: "trac", ticker: "TRAC", change24h: 18, price: 1, marketCap: null }],
+		losers: [{ id: "pi", ticker: "PI", change24h: -17, price: 1, marketCap: null }],
+		maxAbsLeaderChange: 18,
+		...overrides,
+	};
+}
+
+const EMPTY_HISTORY: StateHistory = { days: [] };
+
+let tmpDir: string;
+beforeEach(() => {
+	tmpDir = mkdtempSync(path.join(tmpdir(), "morning-post-render-post-"));
+});
+afterEach(() => {
+	rmSync(tmpDir, { recursive: true, force: true });
+});
+
+function baseConfig(overrides: Partial<RenderPostConfig> = {}): RenderPostConfig {
+	return {
+		aiEnabled: true,
+		dryRun: false,
+		aiAllowRealInDry: false,
+		aiBaseUrl: "https://proxy.example.com/v1",
+		aiApiKey: "test-key",
+		aiProxyUrl: "",
+		aiModel: "primary-model",
+		aiModelFallback: "fallback-model",
+		aiPriceIn: null,
+		aiPriceOut: null,
+		aiFallbackPriceIn: null,
+		aiFallbackPriceOut: null,
+		aiTimeoutMs: 25_000,
+		aiTotalBudgetMs: 70_000,
+		aiMaxAttempts: 2,
+		promptVersion: 1,
+		usageFile: path.join(tmpDir, "usage.jsonl"),
+		outDir: tmpDir,
+		...overrides,
+	};
+}
+
+/** A fetchImpl that always succeeds with fixtures/ai-responses/good.txt's content. */
+function okFetch(): FetchLike {
+	return async () => ({
+		ok: true,
+		status: 200,
+		json: async () => ({
+			choices: [{ message: { content: fixtureText("good") }, finish_reason: "stop" }],
+			usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+		}),
+	});
+}
+
+describe("renderPost: section 3.4 dry-run gate", () => {
+	it("never touches the AI transport when DRY_RUN=1 without AI_ALLOW_REAL_IN_DRY=1 — this is the main test: zero fetch calls", async () => {
+		const fetchImpl = vi.fn(okFetch());
+		const config = baseConfig({ dryRun: true, aiAllowRealInDry: false });
+
+		const result = await renderPost(specExampleFacts(), EMPTY_HISTORY, false, config, fetchImpl);
+
+		expect(fetchImpl).not.toHaveBeenCalled();
+		expect(result.source).toBe("template");
+		expect(result.model).toBeNull();
+		expect(result.failureReason).toBeNull(); // a deliberate skip, not a failure — no fallback alert should fire over this
+	});
+
+	it("does call the AI transport when DRY_RUN=1 with AI_ALLOW_REAL_IN_DRY=1", async () => {
+		const fetchImpl = vi.fn(okFetch());
+		const config = baseConfig({ dryRun: true, aiAllowRealInDry: true });
+
+		const result = await renderPost(specExampleFacts(), EMPTY_HISTORY, false, config, fetchImpl);
+
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+		expect(result.source).toBe("ai");
+	});
+
+	it("is a separate check from skipAi — skipAi alone (DRY_RUN=0) also never calls the transport, for its own distinct reason", async () => {
+		// Not the gate under test here, just proving the two checks don't
+		// collapse into one: skipAi already short-circuits before the gate is
+		// even reached, so this must never depend on AI_ALLOW_REAL_IN_DRY at all.
+		const fetchImpl = vi.fn(okFetch());
+		const config = baseConfig({ dryRun: false, aiAllowRealInDry: false });
+
+		const result = await renderPost(specExampleFacts(), EMPTY_HISTORY, true, config, fetchImpl);
+
+		expect(fetchImpl).not.toHaveBeenCalled();
+		expect(result.source).toBe("template");
+	});
+
+	it("calls the transport normally in a real (non-dry) publish", async () => {
+		const fetchImpl = vi.fn(okFetch());
+		const config = baseConfig({ dryRun: false });
+
+		const result = await renderPost(specExampleFacts(), EMPTY_HISTORY, false, config, fetchImpl);
+
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+		expect(result.source).toBe("ai");
+	});
+
+	it("AI_ENABLED=0 skips before the dry-run gate even runs — template regardless of DRY_RUN/AI_ALLOW_REAL_IN_DRY", async () => {
+		const fetchImpl = vi.fn(okFetch());
+		const config = baseConfig({ aiEnabled: false, dryRun: true, aiAllowRealInDry: true });
+
+		const result = await renderPost(specExampleFacts(), EMPTY_HISTORY, false, config, fetchImpl);
+
+		expect(fetchImpl).not.toHaveBeenCalled();
+		expect(result.source).toBe("template");
+	});
+});
