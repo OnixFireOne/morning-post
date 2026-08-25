@@ -4,7 +4,7 @@
 // by index.ts or by any test, and lives outside tsconfig's "include" (src,
 // tests only) so it never becomes part of the production build or its
 // typecheck. Run manually: `npm run ai:compare -- <fixture>|--all [--runs=N]
-// [--chain=N] [--chain-degrade=K[,K...]] [--model=<id>] [--balance=N]`.
+// [--chain=N] [--chain-degrade=K[,K...]] [--retry] [--model=<id>] [--balance=N]`.
 // --chain and --runs are mutually exclusive: --runs=N samples the same
 // single day N independent times, --chain=N runs N sequential days where
 // each day's own output feeds the next day's history — see runChain()
@@ -12,11 +12,20 @@
 // model calls, for testing "day after a degraded day" on demand instead of
 // waiting for a real rejection/timeout.
 //
-// Retries and fallback are turned off on purpose: one request is one attempt,
-// full stop. buildParagraphsAI()'s retry/fallback loop exists to *hide* a
-// content-level failure from the published post — exactly what must NOT
-// happen here, since the whole point of this tool is to see the raw
-// first-attempt failure rate before anything smooths it over.
+// Fallback (a second model) is off on purpose regardless of --retry: this
+// tool compares one model at a time, and simulating a fallback switch would
+// blur which model actually produced which text. Retries are off by
+// default for the same reason buildParagraphsAI()'s retry loop exists to
+// *hide* a content-level failure from the published post in production —
+// exactly what must NOT happen here by default, since the whole point of
+// this tool is to see the raw first-attempt failure rate before anything
+// smooths it over. --retry opts back in explicitly: on a content-level
+// rejection, exactly one more attempt, the same way generate.ts's own retry
+// loop does it (buildRetryObservationPrompt keyed by the rejection reason,
+// the same one-retry limit) — reported as its own separate line, with the
+// fixture's tally following the final outcome and marked when reached by
+// retry, so the raw-vs-retried rate stays visible instead of blending back
+// into "just accepted".
 //
 // Reports land in reports/, not out/ — reports/ is tracked by git (out/
 // isn't) because a report from a real, paid run can't be reproduced without
@@ -38,7 +47,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createAiClient, type AiClient, type AiUsage } from "../src/ai/client.js";
 import { buildAiPayload, stateHistoryToAiHistory, type AiPayload } from "../src/ai/payload.js";
-import { buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
+import { buildRetryObservationPrompt, buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
 import { computeCost } from "../src/ai/usage.js";
 import { validateAiObservation, type ObservationValidationFailureReason } from "../src/ai/validator.js";
 import { computeFacts, shiftDateKey, type Facts, type StateHistory } from "../src/facts.js";
@@ -108,7 +117,7 @@ const VALIDATOR_ITEM_LABELS: Record<ObservationValidationFailureReason, string> 
 	"validator:observation_ratio_mismatch": "новое: словесная кратность не совпадает с реальным соотношением зелёных/красных",
 };
 
-type RunOutcome =
+export type RunOutcome =
 	| {
 			kind: "accepted";
 			picture: string;
@@ -138,10 +147,27 @@ type RunOutcome =
 	// instead of waiting for a real rejection/timeout to happen naturally.
 	| { kind: "forced"; template: PostParagraphs };
 
-type FixtureRun = { fixtureName: string; run: number; outcome: RunOutcome };
+export type FixtureRun = {
+	fixtureName: string;
+	run: number;
+	outcome: RunOutcome;
+	/** --retry only: present exactly when the first attempt was "rejected" (content-level) and a second attempt was made — the second attempt's own outcome, built the same way generate.ts's own retry does (buildRetryObservationPrompt keyed by the rejection reason). Never set for "transport" (matches generate.ts's own retry-vs-fallback split: a transport failure moves to a different model in production, and this tool has no fallback model to move to) or "forced" (--chain-degrade skips the model entirely, nothing to retry). */
+	retryOutcome?: RunOneOutcome;
+};
 
 /** What a real model call can produce — "forced" is never one of runOne()'s own results, it's only ever constructed directly by --chain-degrade's own branch, which skips runOne() entirely. */
-type RunOneOutcome = Extract<RunOutcome, { kind: "accepted" } | { kind: "rejected" } | { kind: "transport" }>;
+export type RunOneOutcome = Extract<RunOutcome, { kind: "accepted" } | { kind: "rejected" } | { kind: "transport" }>;
+
+/** The outcome that actually determines a run's verdict/summary classification — the retry's own outcome when one happened, otherwise the first attempt's. Exported for direct testing alongside runOneWithOptionalRetry/runTotals. */
+export function finalOutcome(fr: FixtureRun): RunOutcome {
+	return fr.retryOutcome ?? fr.outcome;
+}
+
+export function outcomeLabel(outcome: RunOneOutcome): string {
+	if (outcome.kind === "accepted") return "ok";
+	if (outcome.kind === "rejected") return `rejected (${outcome.reason})`;
+	return `transport (${outcome.label})`;
+}
 
 export type CompareOptions = {
 	client: AiClient;
@@ -158,6 +184,8 @@ export type CompareOptions = {
 	outFile: string;
 	/** Same instant the caller used to build outFile's HHMM — the header's "Дата запуска" line must read the exact same time, not a fresh `new Date()` at write time. */
 	startedAt: Date;
+	/** --retry: on a content-level rejection, one more attempt the same way generate.ts's own retry does — see FixtureRun.retryOutcome. */
+	retry: boolean;
 };
 
 function loadSnapshotAndFacts(fixtureName: string, stateHistory: StateHistory): { snapshot: HotCoinsSnapshot; facts: Facts } {
@@ -245,6 +273,36 @@ async function runOne(
 	};
 }
 
+/**
+ * --retry: on a content-level rejection, exactly one more attempt — the
+ * same targeted instruction generate.ts's own retry loop builds
+ * (buildRetryObservationPrompt keyed by the rejection reason), the same
+ * one-retry limit (maxAttemptsPerModel=2's real default). A transport
+ * failure is never retried here, matching generate.ts's own retry-vs-
+ * fallback split exactly: a transport failure moves to a *different* model
+ * in production, and this tool has no fallback model to move to, so a
+ * transport failure on attempt 1 simply stays a transport failure.
+ */
+export async function runOneWithOptionalRetry(
+	client: AiClient,
+	modelId: string,
+	system: string,
+	user: string,
+	timeoutMs: number,
+	payload: AiPayload,
+	priceInPerMillion: number | null,
+	priceOutPerMillion: number | null,
+	facts: Facts,
+	retry: boolean,
+): Promise<{ outcome: RunOneOutcome; retryOutcome?: RunOneOutcome }> {
+	const outcome = await runOne(client, modelId, system, user, timeoutMs, payload, priceInPerMillion, priceOutPerMillion, facts);
+	if (!retry || outcome.kind !== "rejected") return { outcome };
+
+	const retryUser = buildRetryObservationPrompt(payload, outcome.reason);
+	const retryOutcome = await runOne(client, modelId, system, retryUser, timeoutMs, payload, priceInPerMillion, priceOutPerMillion, facts);
+	return { outcome, retryOutcome };
+}
+
 function formatCostLine(costEstimate: number | null): string {
 	return costEstimate !== null ? `- Стоимость (оценка): ${costEstimate.toFixed(4)} кредитов` : `- Стоимость: не посчитана (цена для этой модели не задана в .env)`;
 }
@@ -323,27 +381,20 @@ function formatFixtureHeader(fixtureName: string, facts: Facts, payload: AiPaylo
 	return lines.join("\n");
 }
 
-function formatRunSection(fr: FixtureRun, totalRuns: number, priceInPerMillion: number | null, priceOutPerMillion: number | null): string {
-	const { run, outcome } = fr;
-	const header = `### ИИ — прогон ${run}/${totalRuns}`;
+/**
+ * One attempt's block — verdict, tokens, cost, time, raw usage, text/
+ * response. `label` is null for the (common, non-retried) single-attempt
+ * case, producing exactly the same output this function's predecessor
+ * always did; a real label ("Первая попытка"/"Повторная попытка (--retry)")
+ * is only used once a run actually has two attempts to tell apart.
+ */
+function formatAttemptOutcome(label: string | null, outcome: RunOneOutcome, priceInPerMillion: number | null, priceOutPerMillion: number | null): string {
+	const labelLines = label ? [`**${label}:**`, ""] : [];
 
 	if (outcome.kind === "transport") {
-		return [header, "", `- Вердикт: ⚠️ transport — ${outcome.label}${outcome.errorMessage ? ` (${outcome.errorMessage})` : ""}`, `- Время ответа: ${outcome.durationMs} ms`, `- Токены: н/д`].join("\n");
-	}
-
-	if (outcome.kind === "forced") {
-		return [
-			header,
-			"",
-			"- Вердикт: 🔧 принудительная деградация (--chain-degrade) — запроса к модели не было",
-			"- Токены: н/д",
-			"",
-			"**Абзац 1 (picture, шаблон):**",
-			`> ${outcome.template.picture}`,
-			"",
-			"**Абзац 2 (observation, шаблон):**",
-			`> ${outcome.template.observation}`,
-		].join("\n");
+		return [...labelLines, `- Вердикт: ⚠️ transport — ${outcome.label}${outcome.errorMessage ? ` (${outcome.errorMessage})` : ""}`, `- Время ответа: ${outcome.durationMs} ms`, `- Токены: н/д`].join(
+			"\n",
+		);
 	}
 
 	const tokensLine = `- Токены: in=${outcome.tokensIn ?? "н/д"} out=${outcome.tokensOut ?? "н/д"}`;
@@ -353,8 +404,7 @@ function formatRunSection(fr: FixtureRun, totalRuns: number, priceInPerMillion: 
 
 	if (outcome.kind === "accepted") {
 		return [
-			header,
-			"",
+			...labelLines,
 			"- Вердикт: ✅ принято",
 			tokensLine,
 			costLine,
@@ -374,8 +424,7 @@ function formatRunSection(fr: FixtureRun, totalRuns: number, priceInPerMillion: 
 	}
 
 	return [
-		header,
-		"",
+		...labelLines,
 		`- Вердикт: ❌ отклонено — ${VALIDATOR_ITEM_LABELS[outcome.reason]}: ${outcome.detail}`,
 		tokensLine,
 		costLine,
@@ -391,34 +440,89 @@ function formatRunSection(fr: FixtureRun, totalRuns: number, priceInPerMillion: 
 	].join("\n");
 }
 
+function verdictText(outcome: RunOneOutcome): string {
+	if (outcome.kind === "accepted") return "✅ принято";
+	if (outcome.kind === "transport") return `⚠️ transport — ${outcome.label}`;
+	return `❌ отклонено — ${VALIDATOR_ITEM_LABELS[outcome.reason]}`;
+}
+
+function formatRunSection(fr: FixtureRun, totalRuns: number, priceInPerMillion: number | null, priceOutPerMillion: number | null): string {
+	const { run, outcome, retryOutcome } = fr;
+	const header = `### ИИ — прогон ${run}/${totalRuns}`;
+
+	if (outcome.kind === "forced") {
+		return [
+			header,
+			"",
+			"- Вердикт: 🔧 принудительная деградация (--chain-degrade) — запроса к модели не было",
+			"- Токены: н/д",
+			"",
+			"**Абзац 1 (picture, шаблон):**",
+			`> ${outcome.template.picture}`,
+			"",
+			"**Абзац 2 (observation, шаблон):**",
+			`> ${outcome.template.observation}`,
+		].join("\n");
+	}
+
+	if (!retryOutcome) {
+		return [header, "", formatAttemptOutcome(null, outcome, priceInPerMillion, priceOutPerMillion)].join("\n");
+	}
+
+	return [
+		header,
+		"",
+		formatAttemptOutcome("Первая попытка", outcome, priceInPerMillion, priceOutPerMillion),
+		"",
+		formatAttemptOutcome("Повторная попытка (--retry)", retryOutcome, priceInPerMillion, priceOutPerMillion),
+		"",
+		`**Итог по прогону:** ${verdictText(retryOutcome)} — достигнуто ретраем`,
+	].join("\n");
+}
+
+/** Real spend for one run — both attempts' tokens/cost when a retry happened (a retry is a second real request, priced like the first), not just whichever attempt turned out final. null+null only when nothing is known at all, never invented as 0. */
+export function runTotals(fr: FixtureRun): { tokensIn: number | null; tokensOut: number | null; costEstimate: number | null } {
+	const candidates: (RunOneOutcome | undefined)[] = [fr.outcome.kind === "forced" ? undefined : fr.outcome, fr.retryOutcome];
+	const attempts = candidates.filter((o): o is Extract<RunOneOutcome, { kind: "accepted" | "rejected" }> => o !== undefined && o.kind !== "transport");
+	if (attempts.length === 0) return { tokensIn: null, tokensOut: null, costEstimate: null };
+	const sum = (nums: (number | null)[]) => (nums.every((n) => n === null) ? null : nums.reduce((a: number, b) => a + (b ?? 0), 0));
+	return {
+		tokensIn: sum(attempts.map((a) => a.tokensIn)),
+		tokensOut: sum(attempts.map((a) => a.tokensOut)),
+		costEstimate: sum(attempts.map((a) => a.costEstimate)),
+	};
+}
+
 function formatSummary(runs: FixtureRun[], balance: number): string {
 	const total = runs.length;
-	const accepted = runs.filter((r) => r.outcome.kind === "accepted");
-	const rejected = runs.filter((r): r is FixtureRun & { outcome: Extract<RunOutcome, { kind: "rejected" }> } => r.outcome.kind === "rejected");
-	const transport = runs.filter((r): r is FixtureRun & { outcome: Extract<RunOutcome, { kind: "transport" }> } => r.outcome.kind === "transport");
-	const forced = runs.filter((r): r is FixtureRun & { outcome: Extract<RunOutcome, { kind: "forced" }> } => r.outcome.kind === "forced");
+	const finals = runs.map((r) => finalOutcome(r));
+	const accepted = finals.filter((f) => f.kind === "accepted");
+	const rejected = finals.filter((f): f is Extract<RunOutcome, { kind: "rejected" }> => f.kind === "rejected");
+	const transport = finals.filter((f): f is Extract<RunOutcome, { kind: "transport" }> => f.kind === "transport");
+	const forced = finals.filter((f): f is Extract<RunOutcome, { kind: "forced" }> => f.kind === "forced");
+	const retried = runs.filter((r) => r.retryOutcome !== undefined);
 
 	const byReason = new Map<string, number>();
-	for (const r of rejected) {
-		const label = VALIDATOR_ITEM_LABELS[r.outcome.reason];
+	for (const f of rejected) {
+		const label = VALIDATOR_ITEM_LABELS[f.reason];
 		byReason.set(label, (byReason.get(label) ?? 0) + 1);
 	}
-	for (const r of transport) {
-		const label = `transport: ${r.outcome.label}`;
+	for (const f of transport) {
+		const label = `transport: ${f.label}`;
 		byReason.set(label, (byReason.get(label) ?? 0) + 1);
 	}
 	if (forced.length > 0) {
 		byReason.set("forced (--chain-degrade)", forced.length);
 	}
 
-	const withTokens = runs.filter((r): r is FixtureRun & { outcome: Extract<RunOutcome, { kind: "accepted" | "rejected" }> } => r.outcome.kind === "accepted" || r.outcome.kind === "rejected");
-	const tokensInList = withTokens.map((r) => r.outcome.tokensIn).filter((t): t is number => t !== null);
-	const tokensOutList = withTokens.map((r) => r.outcome.tokensOut).filter((t): t is number => t !== null);
+	const totals = runs.map(runTotals);
+	const tokensInList = totals.map((t) => t.tokensIn).filter((t): t is number => t !== null);
+	const tokensOutList = totals.map((t) => t.tokensOut).filter((t): t is number => t !== null);
 	const avg = (nums: number[]) => (nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null);
 	const avgIn = avg(tokensInList);
 	const avgOut = avg(tokensOutList);
 
-	const costs = withTokens.map((r) => r.outcome.costEstimate).filter((c): c is number => c !== null);
+	const costs = totals.map((t) => t.costEstimate).filter((c): c is number => c !== null);
 	const totalCost = costs.length ? costs.reduce((a, b) => a + b, 0) : null;
 
 	const lines = [
@@ -428,14 +532,22 @@ function formatSummary(runs: FixtureRun[], balance: number): string {
 		`- Принято: ${accepted.length} (${total ? Math.round((accepted.length / total) * 100) : 0}%)`,
 		`- Отклонено/ошибок: ${total - accepted.length}`,
 	];
+	if (retried.length > 0) {
+		const acceptedByRetry = retried.filter((r) => r.retryOutcome?.kind === "accepted").length;
+		lines.push(`- Из них достигнуто ретраем: ${retried.length} (успешно после ретрая: ${acceptedByRetry})`);
+	}
 	if (byReason.size > 0) {
-		lines.push("- Разбивка по причинам:");
+		lines.push("- Разбивка по причинам (по финальному исходу):");
 		for (const [label, count] of byReason) lines.push(`  - ${label}: ${count}`);
 	}
-	lines.push(avgIn !== null && avgOut !== null ? `- Средние токены: in=${avgIn.toFixed(0)} out=${avgOut.toFixed(0)}` : "- Средние токены: н/д (usage не был получен ни разу)");
+	lines.push(
+		avgIn !== null && avgOut !== null
+			? `- Средние токены на прогон (обе попытки суммарно, если был ретрай): in=${avgIn.toFixed(0)} out=${avgOut.toFixed(0)}`
+			: "- Средние токены: н/д (usage не был получен ни разу)",
+	);
 
 	if (totalCost !== null) {
-		lines.push(`- Суммарная стоимость за прогон: ${totalCost.toFixed(4)} кредитов (оценка по цене модели, не счёт от прокси)`);
+		lines.push(`- Суммарная стоимость (все попытки, включая ретраи): ${totalCost.toFixed(4)} кредитов (оценка по цене модели, не счёт от прокси)`);
 		lines.push(`- Остаток от баланса ${balance}: ${(balance - totalCost).toFixed(4)} кредитов (оценка, не запрос к прокси)`);
 	} else {
 		lines.push("- Суммарная стоимость: не посчитана — цена для этой модели не задана в .env");
@@ -469,9 +581,20 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 
 		for (let run = 1; run <= opts.runsPerFixture; run++) {
 			process.stdout.write(`[ai:compare] ${fixtureName} run ${run}/${opts.runsPerFixture}... `);
-			const outcome = await runOne(opts.client, opts.modelId, system, user, opts.timeoutMs, payload, opts.priceInPerMillion, opts.priceOutPerMillion, facts);
-			console.log(outcome.kind === "accepted" ? "ok" : outcome.kind === "rejected" ? `rejected (${outcome.reason})` : `transport (${outcome.label})`);
-			const fr: FixtureRun = { fixtureName, run, outcome };
+			const { outcome, retryOutcome } = await runOneWithOptionalRetry(
+				opts.client,
+				opts.modelId,
+				system,
+				user,
+				opts.timeoutMs,
+				payload,
+				opts.priceInPerMillion,
+				opts.priceOutPerMillion,
+				facts,
+				opts.retry,
+			);
+			console.log(retryOutcome ? `${outcomeLabel(outcome)} -> retry: ${outcomeLabel(retryOutcome)}` : outcomeLabel(outcome));
+			const fr: FixtureRun = { fixtureName, run, outcome, retryOutcome };
 			allRuns.push(fr);
 			sections.push(formatRunSection(fr, opts.runsPerFixture, opts.priceInPerMillion, opts.priceOutPerMillion));
 		}
@@ -484,7 +607,9 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 		`- PROMPT_VERSION: ${opts.promptVersion}`,
 		`- Хост шлюза: ${opts.client.providerHost}`,
 		`- Фикстур: ${opts.fixtureNames.length}, прогонов на фикстуру: ${opts.runsPerFixture}, всего прогонов: ${opts.fixtureNames.length * opts.runsPerFixture}`,
-		"- Ретраи и фолбэк отключены — каждый прогон это ровно одна попытка одной моделью, без ретрая на содержательный отказ.",
+		opts.retry
+			? "- Фолбэк отключён (одна модель за прогон). --retry включён: на содержательный отказ делается ровно одна повторная попытка тем же путём, что generate.ts (buildRetryObservationPrompt, тот же лимит) — показана отдельной строкой в каждом прогоне, итог по прогону считается по финальному исходу."
+			: "- Ретраи и фолбэк отключены — каждый прогон это ровно одна попытка одной моделью, без ретрая на содержательный отказ.",
 		"- Стоимость везде в кредитах прокси (1 кредит = 50 000 токенов), не в $ — см. AI_PRICE_IN/AI_PRICE_OUT в .env.",
 		`- Длина system-сообщения: ${system.length} символов (норма: до ${SYSTEM_PROMPT_NORM_MAX_CHARS}) — ${systemInNorm ? "✅ в норме" : "⚠️ аномально большой"}`,
 		...(systemInNorm
@@ -521,6 +646,8 @@ export type ChainOptions = {
 	startedAt: Date;
 	/** --chain-degrade: 1-based step numbers to force onto the template path with zero model calls, instead of waiting for a natural rejection/timeout. */
 	forcedDegradeSteps: number[];
+	/** --retry: on a content-level rejection, one more attempt the same way generate.ts's own retry does — see FixtureRun.retryOutcome. */
+	retry: boolean;
 };
 
 export type ChainStep = { run: number; dateLabel: string; picture: string; observation: string; source: "ai" | "template" };
@@ -836,6 +963,7 @@ async function runChainForFixture(
 	priceInPerMillion: number | null,
 	priceOutPerMillion: number | null,
 	forcedDegradeSteps: Set<number>,
+	retry: boolean,
 ): Promise<{ sections: string[]; runs: FixtureRun[] }> {
 	const { snapshot, facts: baseFacts } = loadSnapshotAndFacts(fixtureName, { days: [] });
 	const system = buildSystemPrompt();
@@ -897,25 +1025,26 @@ async function runChainForFixture(
 		const user = buildUserPrompt(payload);
 
 		process.stdout.write(`[ai:compare] ${fixtureName} chain ${k}/${chainLength}... `);
-		const outcome = await runOne(client, modelId, system, user, timeoutMs, payload, priceInPerMillion, priceOutPerMillion, facts);
-		console.log(outcome.kind === "accepted" ? "ok" : outcome.kind === "rejected" ? `rejected (${outcome.reason})` : `transport (${outcome.label})`);
+		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, modelId, system, user, timeoutMs, payload, priceInPerMillion, priceOutPerMillion, facts, retry);
+		console.log(retryOutcome ? `${outcomeLabel(outcome)} -> retry: ${outcomeLabel(retryOutcome)}` : outcomeLabel(outcome));
 
-		const fr: FixtureRun = { fixtureName, run: k, outcome };
+		const fr: FixtureRun = { fixtureName, run: k, outcome, retryOutcome };
 		runs.push(fr);
 		const sectionParts = [formatRunSection(fr, chainLength, priceInPerMillion, priceOutPerMillion)];
 
-		if (outcome.kind === "accepted") {
+		const final = finalOutcome(fr);
+		if (final.kind === "accepted") {
 			chainHistory = appendDay(chainHistory, {
 				date: todayKey,
 				swarmState: facts.swarmState,
 				btcChange: facts.btc?.change24h ?? null,
 				postedAt: new Date().toISOString(),
 				messageId: 0,
-				picture: outcome.picture,
-				observation: outcome.observation,
+				picture: final.picture,
+				observation: final.observation,
 				source: "ai",
 			});
-			steps.push({ run: k, dateLabel: facts.dateLabel, picture: outcome.picture, observation: outcome.observation, source: "ai" });
+			steps.push({ run: k, dateLabel: facts.dateLabel, picture: final.picture, observation: final.observation, source: "ai" });
 		} else {
 			const template = recordTemplateStep(k, facts, todayKey);
 			sectionParts.push(formatDegradedTemplateBlock(template));
@@ -946,6 +1075,7 @@ export async function runChain(opts: ChainOptions): Promise<void> {
 			opts.priceInPerMillion,
 			opts.priceOutPerMillion,
 			forcedSet,
+			opts.retry,
 		);
 		allSections.push(...sections);
 		allRuns.push(...runs);
@@ -959,8 +1089,10 @@ export async function runChain(opts: ChainOptions): Promise<void> {
 		`- Хост шлюза: ${opts.client.providerHost}`,
 		`- Фикстур: ${opts.fixtureNames.length}, длина цепочки: ${opts.chainLength}, всего прогонов: ${opts.fixtureNames.length * opts.chainLength}`,
 		"- Режим анти-повтора: вывод каждого прогона уходит в history следующего, тем же способом, что stateHistoryToAiHistory() строит его в бою; дата сдвигается на день вперёд за прогон, факты (числа) зафиксированы — та же фикстура каждый раз.",
-		"- Деградация (отказ, transport-ошибка, или принудительно через --chain-degrade) не пропускает день — записывается шаблонный текст с source: \"template\", как и в бою, и он уходит в history следующего шага.",
-		"- Ретраи и фолбэк отключены, как и в обычном режиме — один запрос это одна попытка.",
+		"- Деградация (отказ, transport-ошибка, или принудительно через --chain-degrade) не пропускает день — записывается шаблонный текст с source: \"template\", как и в бою, и он уходит в history следующего шага. Если включён --retry, деградация означает «отклонено и после ретрая» — успешный ретрай признаётся принятым и уходит в history как обычный ai-текст.",
+		opts.retry
+			? "- Фолбэк отключён (одна модель за прогон). --retry включён: на содержательный отказ делается ровно одна повторная попытка тем же путём, что generate.ts (buildRetryObservationPrompt, тот же лимит) — показана отдельной строкой в каждом прогоне, итог по прогону считается по финальному исходу."
+			: "- Ретраи и фолбэк отключены, как и в обычном режиме — один запрос это одна попытка.",
 		"- Стоимость везде в кредитах прокси (1 кредит = 50 000 токенов), не в $ — см. AI_PRICE_IN/AI_PRICE_OUT в .env.",
 		"- Завязки первых предложений — материал для взгляда человека, не автоматический вердикт: валидатор на повтор формулировок не расширялся, это вопрос стиля, а не фактической ошибки.",
 	].join("\n");
@@ -991,7 +1123,7 @@ function readEnv() {
 	};
 }
 
-type CliArgs = { fixtureNames: string[]; runs: number; chain: number | null; chainDegrade: number[]; model: string | null; balance: number };
+type CliArgs = { fixtureNames: string[]; runs: number; chain: number | null; chainDegrade: number[]; model: string | null; balance: number; retry: boolean };
 
 function normalizeFixtureName(name: string): string {
 	const base = name.endsWith(".json") ? name.slice(0, -".json".length) : name;
@@ -1006,10 +1138,13 @@ function parseCliArgs(argv: string[]): CliArgs {
 	let chainDegrade: number[] = [];
 	let model: string | null = null;
 	let balance = 1000;
+	let retry = false;
 
 	for (const arg of argv) {
 		if (arg === "--all") {
 			fixtureArg = "--all";
+		} else if (arg === "--retry") {
+			retry = true;
 		} else if (arg.startsWith("--runs=")) {
 			runs = Number(arg.slice("--runs=".length));
 			runsExplicit = true;
@@ -1032,7 +1167,7 @@ function parseCliArgs(argv: string[]): CliArgs {
 	}
 
 	if (!fixtureArg) {
-		throw new Error("usage: npm run ai:compare -- <fixture-name>|--all [--runs=N] [--chain=N] [--chain-degrade=K[,K...]] [--model=<id>] [--balance=N]");
+		throw new Error("usage: npm run ai:compare -- <fixture-name>|--all [--runs=N] [--chain=N] [--chain-degrade=K[,K...]] [--retry] [--model=<id>] [--balance=N]");
 	}
 	if (chain !== null && runsExplicit) {
 		throw new Error("--chain and --runs are mutually exclusive — --chain implies one sequential run per step, not N independent samples");
@@ -1057,7 +1192,7 @@ function parseCliArgs(argv: string[]): CliArgs {
 	}
 
 	const fixtureNames = fixtureArg === "--all" ? ALL_FIXTURE_NAMES : [normalizeFixtureName(fixtureArg)];
-	return { fixtureNames, runs, chain, chainDegrade, model, balance };
+	return { fixtureNames, runs, chain, chainDegrade, model, balance, retry };
 }
 
 function sanitizeForFilename(s: string): string {
@@ -1151,6 +1286,7 @@ async function main() {
 			outFile,
 			startedAt,
 			forcedDegradeSteps: args.chainDegrade,
+			retry: args.retry,
 		});
 		return;
 	}
@@ -1168,6 +1304,7 @@ async function main() {
 		balance: args.balance,
 		outFile,
 		startedAt,
+		retry: args.retry,
 	});
 }
 
