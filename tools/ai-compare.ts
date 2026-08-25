@@ -12,6 +12,12 @@
 // happen here, since the whole point of this tool is to see the raw
 // first-attempt failure rate before anything smooths it over.
 //
+// Reports land in reports/, not out/ — reports/ is tracked by git (out/
+// isn't) because a report from a real, paid run can't be reproduced without
+// spending real credits again, and out/'s own cleanup rule (age-based file
+// deletion only, never removing the directory — see README.md) has no way
+// to tell a report worth keeping from a stale daily *.ai.json dump.
+//
 // No prod logic is reimplemented: buildAiPayload, buildSystemPrompt/
 // buildUserPrompt, validateAiParagraphs, computeCost, stateHistoryToAiHistory
 // and buildParagraphs (the template fallback, shown alongside each AI run for
@@ -539,7 +545,12 @@ async function main() {
 	const stateHistory = readState(env.stateFile);
 
 	const today = new Date().toISOString().slice(0, 10);
-	const outFile = path.join(REPO_ROOT, "out", `compare-${today}-${sanitizeForFilename(modelId)}.md`);
+	// reports/ is tracked by git (unlike out/) — a report from a real, paid
+	// run has no other history or way back once out/ gets cleaned up, and
+	// out/'s own cleanup rule (age-based file deletion, never removing the
+	// directory) doesn't distinguish a report worth keeping from a stale
+	// *.ai.json debug dump.
+	const outFile = path.join(REPO_ROOT, "reports", `compare-${today}-${sanitizeForFilename(modelId)}.md`);
 
 	await runCompare({
 		client,
