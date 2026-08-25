@@ -181,3 +181,53 @@ describe("formatRepetitionSection", () => {
 		expect(section).not.toContain("133");
 	});
 });
+
+/** Pulls the comma-separated word list off the "reused rare words" line — word-boundary exact match, not substring containment (so e.g. a hypothetical "xrpusdt" token couldn't false-positive a check for "xrp"). */
+function reusedRareWords(section: string): string[] {
+	const line = section.split("\n").find((l) => l.startsWith("- Повторно использованные редкие слова:"));
+	if (!line) return [];
+	return line
+		.slice(line.indexOf(":") + 1)
+		.split(",")
+		.map((w) => w.trim());
+}
+
+describe("formatRepetitionSection: regression against a real accepted --chain run", () => {
+	// The three observation paragraphs actually accepted by the model — git
+	// history of reports/compare-2026-08-25-claude-sonnet-4-7-chain3.md,
+	// commit 9e0584d (fixture real-day.json, coin ENA; a later real run has
+	// since overwritten that file's *current* content with a different
+	// fixture/coin, so this text is pulled from git log, not the file as it
+	// reads today). picture is left empty so the fixture exercises exactly
+	// the reused-word behavior the observation text alone produces.
+	const observation1 =
+		"Такое единодушие редкость: когда биток прибавляет сразу столько, рой обычно не успевает — сегодня успел. ENA улетел особняком, далеко впереди остальных. Красных монет — единицы, и они скорее исключение, подчёркивающее общий импульс дня.";
+	const observation2 =
+		"Второй день подряд картина не меняется — те же 60 зелёных, те же 6 красных. Это уже не случайный всплеск, а устойчивое состояние: рой закрепился наверху и не спешит отступать. ENA тянет особняком, красные монеты — лишь точечный шум на общем фоне.";
+	const observation3 =
+		"Когда биток прибавляет столько, а расклад в рое при этом остаётся неизменным — 60 против 6 — это уже не инерция, а структура. ENA тянет особняком, M тихо сползает вниз, но красных монет по-прежнему ничтожно мало. Рой не рассыпается и не перегревается — он просто держит курс.";
+
+	const realStep1 = step({ run: 1, dateLabel: "21 августа", observation: observation1 });
+	const realStep2 = step({ run: 2, dateLabel: "22 августа", observation: observation2 });
+	const realStep3 = step({ run: 3, dateLabel: "23 августа", observation: observation3 });
+
+	// "особняком" describes ENA standing apart from the swarm and is reused
+	// verbatim in all three steps' observation ("ENA улетел особняком" /
+	// "ENA тянет особняком" / "ENA тянет особняком"). It never gets swallowed
+	// into a 4+-word chain: "ena тянет особняком" is only 3 words, one short
+	// of the chain threshold, so on both steps it should be named standalone
+	// in the rare-word list rather than folded into a chain entry.
+	it("names особняком standalone as a reused rare word on step 2 (vs step 1)", () => {
+		const section = formatRepetitionSection([realStep1, realStep2]);
+		expect(reusedRareWords(section)).toContain("особняком");
+	});
+
+	it("names особняком standalone as a reused rare word on step 3 (vs steps 1-2)", () => {
+		const section = formatRepetitionSection([realStep1, realStep2, realStep3]);
+		expect(reusedRareWords(section)).toContain("особняком");
+		// "ena тянет особняком" repeats verbatim between steps 2 and 3 but stays
+		// 3 words long (below the 4-word chain threshold), so it must never
+		// appear as a chain entry — only as individual rare words.
+		expect(section).not.toContain("Дословные цепочки");
+	});
+});
