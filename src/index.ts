@@ -6,6 +6,7 @@ import { buildUsageReport } from "./ai/usageReport.js";
 import { captureSnapshotAndScreenshot } from "./capture.js";
 import { RetryExhaustedError } from "./errors.js";
 import { computeFacts, type StateDay } from "./facts.js";
+import { appendFactsLogLine } from "./factsLog.js";
 import { renderPost } from "./renderPost.js";
 import { loadSnapshotFromFile } from "./snapshot.js";
 import { appendDay, findPostedDay, readState, writeStateAtomic } from "./state.js";
@@ -34,6 +35,10 @@ function readEnv() {
 		// outDir by mistake; fixed here since section 3.3's balance tracking
 		// now depends on reading its real, documented location.
 		usageFile: path.join(path.dirname(stateFile), "usage.jsonl"),
+		// Eternal daily log — append-only, never rotated (unlike state.json's
+		// own 60-day cap). Same mounted ./data volume by default, own
+		// independently configurable path.
+		factsLogFile: path.resolve(process.env.FACTS_LOG_FILE || "data/facts.jsonl"),
 		force: args.includes("--force"),
 		telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || "",
 		telegramTargetChatId: process.env.TELEGRAM_TARGET_CHAT_ID || "",
@@ -275,6 +280,35 @@ async function main() {
 	};
 	writeStateAtomic(env.stateFile, appendDay(history, day));
 	console.log(`[state] posted messageId=${message.message_id} for ${facts.dateKey}, saved to ${env.stateFile}`);
+
+	// Eternal daily log (data/facts.jsonl) — right next to the state.json
+	// write, strictly after it: state.json is already durably written by the
+	// time this runs, so a failure here can never take that write back with
+	// it. Non-critical, same as the other post-publish side channels below —
+	// a log line plus a non-blocking alert, never a thrown error, never a
+	// changed exit code.
+	currentStep = "facts-log:write";
+	try {
+		appendFactsLogLine(env.factsLogFile, {
+			date: facts.dateKey,
+			facts,
+			topGainer: facts.winners[0] ? { ticker: facts.winners[0].ticker, change24h: facts.winners[0].change24h } : null,
+			topLoser: facts.losers[0] ? { ticker: facts.losers[0].ticker, change24h: facts.losers[0].change24h } : null,
+			source: rendered.source,
+			model: rendered.model,
+			promptVersion: rendered.promptVersion,
+		});
+	} catch (err) {
+		console.error("[facts-log] failed to append:", err instanceof Error ? err.message : err);
+		const text = formatAlert({
+			step: "facts-log:write",
+			error: err,
+			siteUrl: env.siteUrl || undefined,
+			exitCode: 0,
+		});
+		const delivered = await sendAlert({ botToken: env.telegramBotToken, chatId: env.telegramAdminChatId, text });
+		if (!delivered) console.error(text);
+	}
 
 	// Section 3.3: strictly after the post is out and the day is on record.
 	// Wrapped defensively — a bug in the summary itself (not just sendAlert(),
