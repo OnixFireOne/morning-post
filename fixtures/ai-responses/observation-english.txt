@@ -1,0 +1,1 @@
+{"observation": "Bitcoin is calm today, no panic in the market at all.", "direction": "red"}

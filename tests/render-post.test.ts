@@ -66,13 +66,13 @@ function baseConfig(overrides: Partial<RenderPostConfig> = {}): RenderPostConfig
 	};
 }
 
-/** A fetchImpl that always succeeds with fixtures/ai-responses/good.txt's content. */
+/** A fetchImpl that always succeeds with fixtures/ai-responses/observation-good.txt's content. */
 function okFetch(): FetchLike {
 	return async () => ({
 		ok: true,
 		status: 200,
 		json: async () => ({
-			choices: [{ message: { content: fixtureText("good") }, finish_reason: "stop" }],
+			choices: [{ message: { content: fixtureText("observation-good") }, finish_reason: "stop" }],
 			usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
 		}),
 	});

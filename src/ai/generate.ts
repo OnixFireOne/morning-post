@@ -1,5 +1,7 @@
 // The AI-generated replacement for buildParagraphs(facts) (section 1) — same
-// two paragraphs, wired through a real model instead of templates. Never
+// two paragraphs in the returned shape, but only observation is ever the
+// model's own text now (PROMPT_VERSION 7): picture is pickPicture(facts),
+// code-generated, on every "ai" outcome, same as the template path. Never
 // throws: every exit path, including a genuinely unexpected error, falls
 // back to the untouched template buildParagraphs() and returns something
 // the caller can publish. This is the last line before publish; a throw
@@ -7,12 +9,12 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { Facts } from "../facts.js";
-import { buildParagraphs } from "../render.js";
+import { buildParagraphs, pickPicture } from "../render.js";
 import type { AiClient } from "./client.js";
 import { buildAiPayload, type AiHistoryEntry, type AiPayload } from "./payload.js";
-import { buildRetryUserPrompt, buildSystemPrompt, buildUserPrompt } from "./prompt.js";
+import { buildRetryObservationPrompt, buildSystemPrompt, buildUserPrompt } from "./prompt.js";
 import { appendUsageLine, computeCost, type UsageRecord } from "./usage.js";
-import { validateAiParagraphs, type ValidationFailureReason } from "./validator.js";
+import { validateAiObservation, type ObservationValidationFailureReason } from "./validator.js";
 
 export type AiModelConfig = {
 	model: string;
@@ -143,7 +145,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 
 	try {
 		for (const modelConfig of [options.primary, options.fallback]) {
-			let lastReason: ValidationFailureReason | null = null;
+			let lastReason: ObservationValidationFailureReason | null = null;
 
 			for (let attemptOnModel = 1; attemptOnModel <= options.maxAttemptsPerModel; attemptOnModel++) {
 				// Checked before every request, not after — a request that's
@@ -156,7 +158,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 				}
 
 				attemptCounter++;
-				const user = lastReason ? buildRetryUserPrompt(payload, lastReason) : buildUserPrompt(payload);
+				const user = lastReason ? buildRetryObservationPrompt(payload, lastReason) : buildUserPrompt(payload);
 				const result = await options.client.generate({ model: modelConfig.model, system, user, timeoutMs: options.timeoutMs });
 
 				if (!result.ok) {
@@ -201,7 +203,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 
 				// result.ok === true from here on — safe to read result.content.
 				const rawText = result.content ?? "";
-				const validation = validateAiParagraphs(rawText, payload);
+				const validation = validateAiObservation(rawText, payload);
 				const outcome = validation.ok ? "ok" : validation.reason;
 				const cost = computeCost(result.usage, modelConfig.priceInPerMillion, modelConfig.priceOutPerMillion);
 
@@ -265,8 +267,8 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 					});
 					return {
 						source: "ai",
-						picture: validation.paragraphs.picture,
-						observation: validation.paragraphs.observation,
+						picture: pickPicture(options.facts),
+						observation: validation.result.observation,
 						model: modelConfig.model,
 						provider: options.client.providerHost,
 						promptVersion: options.promptVersion,

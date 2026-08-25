@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AiClient, AiErrorKind, AiGenerateParams, AiGenerateResult } from "../src/ai/client.js";
-import { buildParagraphs } from "../src/render.js";
+import { buildParagraphs, pickPicture } from "../src/render.js";
 import { buildParagraphsAI, type AiJsonOutput, type BuildParagraphsAiOptions, type AiModelConfig } from "../src/ai/generate.js";
 import type { UsageRecord } from "../src/ai/usage.js";
 import type { Facts } from "../src/facts.js";
@@ -145,7 +145,7 @@ function baseOptions(overrides: Partial<BuildParagraphsAiOptions> = {}): BuildPa
 
 describe("buildParagraphsAI: happy path", () => {
 	it("accepts a good first attempt and returns AI-sourced paragraphs", async () => {
-		const { client, calls } = fakeClient("provider.example.com", [okResult(fixtureText("good"))]);
+		const { client, calls } = fakeClient("provider.example.com", [okResult(fixtureText("observation-good"))]);
 		const options = baseOptions({ client, primary: modelConfig("primary-model") });
 
 		const result = await buildParagraphsAI(options);
@@ -155,7 +155,9 @@ describe("buildParagraphsAI: happy path", () => {
 		expect(result.provider).toBe("provider.example.com");
 		expect(result.promptVersion).toBe(1);
 		expect(result.failureReason).toBeNull();
-		expect(result.picture).toContain("133");
+		// picture is never the model's own text (PROMPT_VERSION 7) — it's always
+		// pickPicture(facts), the same code-generated text the template path uses.
+		expect(result.picture).toBe(pickPicture(options.facts));
 		expect(result.attempts).toBe(1);
 		expect(calls).toHaveLength(1);
 	});
@@ -164,8 +166,8 @@ describe("buildParagraphsAI: happy path", () => {
 describe("buildParagraphsAI: usage.jsonl is written for rejected attempts too, before the retry/accept decision", () => {
 	it("logs a usage line for a content-level rejection, with the real tokens spent on that attempt", async () => {
 		const { client } = fakeClient("provider.example.com", [
-			okResult(fixtureText("number-not-in-facts"), { usage: { promptTokens: 200, completionTokens: 80, totalTokens: 280, cachedTokens: null } }),
-			okResult(fixtureText("good")), // the retry succeeds
+			okResult(fixtureText("observation-digit"), { usage: { promptTokens: 200, completionTokens: 80, totalTokens: 280, cachedTokens: null } }),
+			okResult(fixtureText("observation-good")), // the retry succeeds
 		]);
 		const options = baseOptions({ client, maxAttemptsPerModel: 2 });
 
@@ -174,14 +176,14 @@ describe("buildParagraphsAI: usage.jsonl is written for rejected attempts too, b
 
 		const lines = readUsageLines(options.usageFile);
 		expect(lines).toHaveLength(2);
-		expect(lines[0]!.outcome).toBe("validator:numbers");
+		expect(lines[0]!.outcome).toBe("validator:observation_digit");
 		expect(lines[0]!.tokensIn).toBe(200);
 		expect(lines[0]!.tokensOut).toBe(80);
 		expect(lines[1]!.outcome).toBe("ok");
 	});
 
 	it("logs a usage line for a transport failure too — not just successful responses", async () => {
-		const { client } = fakeClient("provider.example.com", [failResult("http_error", { httpStatus: 503 }), okResult(fixtureText("good"))]);
+		const { client } = fakeClient("provider.example.com", [failResult("http_error", { httpStatus: 503 }), okResult(fixtureText("observation-good"))]);
 		const options = baseOptions({ client });
 
 		await buildParagraphsAI(options);
@@ -193,7 +195,7 @@ describe("buildParagraphsAI: usage.jsonl is written for rejected attempts too, b
 	});
 
 	it("usage: null and usageReported: false round-trip through the log without inventing zeros", async () => {
-		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("good"), { usage: null, usageReported: false })]);
+		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("observation-good"), { usage: null, usageReported: false })]);
 		const options = baseOptions({ client });
 
 		await buildParagraphsAI(options);
@@ -209,7 +211,7 @@ describe("buildParagraphsAI: usage.jsonl is written for rejected attempts too, b
 
 describe("buildParagraphsAI: dryRun flag on every usage.jsonl line (section 3.4)", () => {
 	it("writes dryRun: true on every line — success and transport-failure alike — when options.dryRun is true", async () => {
-		const { client } = fakeClient("provider.example.com", [failResult("http_error", { httpStatus: 500 }), okResult(fixtureText("good"))]);
+		const { client } = fakeClient("provider.example.com", [failResult("http_error", { httpStatus: 500 }), okResult(fixtureText("observation-good"))]);
 		const options = baseOptions({ client, dryRun: true });
 
 		await buildParagraphsAI(options);
@@ -220,7 +222,7 @@ describe("buildParagraphsAI: dryRun flag on every usage.jsonl line (section 3.4)
 	});
 
 	it("writes dryRun: false on every line when options.dryRun is false", async () => {
-		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("good"))]);
+		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("observation-good"))]);
 		const options = baseOptions({ client, dryRun: false });
 
 		await buildParagraphsAI(options);
@@ -235,8 +237,8 @@ describe("buildParagraphsAI: budget is checked before every request, not after",
 		// First attempt takes 68s of a 70s budget with a 25s per-request timeout —
 		// remaining (2s) < timeoutMs (25s) before attempt 2 even starts.
 		const { client, calls } = fakeClient("provider.example.com", [
-			okResult(fixtureText("number-not-in-facts"), { durationMs: 68_000 }),
-			okResult(fixtureText("good")), // must never be reached
+			okResult(fixtureText("observation-digit"), { durationMs: 68_000 }),
+			okResult(fixtureText("observation-good")), // must never be reached
 		]);
 		const options = baseOptions({ client, timeoutMs: 25_000, totalBudgetMs: 70_000, maxAttemptsPerModel: 2 });
 
@@ -248,7 +250,7 @@ describe("buildParagraphsAI: budget is checked before every request, not after",
 	});
 
 	it("never even makes the first request when the budget is already too small for one attempt", async () => {
-		const { client, calls } = fakeClient("provider.example.com", [okResult(fixtureText("good"))]);
+		const { client, calls } = fakeClient("provider.example.com", [okResult(fixtureText("observation-good"))]);
 		const options = baseOptions({ client, timeoutMs: 25_000, totalBudgetMs: 10_000 });
 
 		const result = await buildParagraphsAI(options);
@@ -260,7 +262,7 @@ describe("buildParagraphsAI: budget is checked before every request, not after",
 });
 
 describe("buildParagraphsAI: ok:false short-circuits before the validator", () => {
-	it("never runs validateAiParagraphs on a transport failure — outcome is the transport code, not a validator reason", async () => {
+	it("never runs validateAiObservation on a transport failure — outcome is the transport code, not a validator reason", async () => {
 		const { client } = fakeClient("provider.example.com", [failResult("timeout"), failResult("timeout")]);
 		const options = baseOptions({ client, maxAttemptsPerModel: 1 });
 
@@ -276,7 +278,7 @@ describe("buildParagraphsAI: ok:false short-circuits before the validator", () =
 
 describe("buildParagraphsAI: retry vs fallback split by errorKind", () => {
 	it("a content-level failure retries the SAME model, with a retry-shaped prompt", async () => {
-		const { client, calls } = fakeClient("provider.example.com", [okResult(fixtureText("number-not-in-facts")), okResult(fixtureText("good"))]);
+		const { client, calls } = fakeClient("provider.example.com", [okResult(fixtureText("observation-digit")), okResult(fixtureText("observation-good"))]);
 		const options = baseOptions({ client, primary: modelConfig("primary-model"), maxAttemptsPerModel: 2 });
 
 		const result = await buildParagraphsAI(options);
@@ -290,7 +292,7 @@ describe("buildParagraphsAI: retry vs fallback split by errorKind", () => {
 	});
 
 	it("a transport-level failure skips straight to the fallback model — no retry on the same model", async () => {
-		const { client, calls } = fakeClient("provider.example.com", [failResult("http_error", { httpStatus: 500 }), okResult(fixtureText("good"))]);
+		const { client, calls } = fakeClient("provider.example.com", [failResult("http_error", { httpStatus: 500 }), okResult(fixtureText("observation-good"))]);
 		const options = baseOptions({ client, primary: modelConfig("primary-model"), fallback: modelConfig("fallback-model"), maxAttemptsPerModel: 2 });
 
 		const result = await buildParagraphsAI(options);
@@ -307,7 +309,7 @@ describe("buildParagraphsAI: pricing uses the model that actually answered", () 
 	it("costs a fallback attempt at the fallback's own price, not the primary's", async () => {
 		const { client } = fakeClient("provider.example.com", [
 			failResult("http_error", { httpStatus: 500 }),
-			okResult(fixtureText("good"), { usage: { promptTokens: 1_000_000, completionTokens: 1_000_000, totalTokens: 2_000_000, cachedTokens: null } }),
+			okResult(fixtureText("observation-good"), { usage: { promptTokens: 1_000_000, completionTokens: 1_000_000, totalTokens: 2_000_000, cachedTokens: null } }),
 		]);
 		const options = baseOptions({
 			client,
@@ -324,7 +326,7 @@ describe("buildParagraphsAI: pricing uses the model that actually answered", () 
 	});
 
 	it("leaves costEstimate null when either price knob is unset for that model", async () => {
-		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("good"))]);
+		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("observation-good"))]);
 		const options = baseOptions({ client, primary: modelConfig("primary-model", { priceInPerMillion: 5, priceOutPerMillion: null }) });
 
 		await buildParagraphsAI(options);
@@ -338,8 +340,8 @@ describe("buildParagraphsAI: pricing uses the model that actually answered", () 
 		// this has to be the sum of two different attempts priced by two
 		// different models, not one blended tariff applied to the total tokens.
 		const { client } = fakeClient("provider.example.com", [
-			okResult(fixtureText("number-not-in-facts"), { usage: { promptTokens: 100_000, completionTokens: 50_000, totalTokens: 150_000, cachedTokens: null } }),
-			okResult(fixtureText("good"), { usage: { promptTokens: 200_000, completionTokens: 100_000, totalTokens: 300_000, cachedTokens: null } }),
+			okResult(fixtureText("observation-digit"), { usage: { promptTokens: 100_000, completionTokens: 50_000, totalTokens: 150_000, cachedTokens: null } }),
+			okResult(fixtureText("observation-good"), { usage: { promptTokens: 200_000, completionTokens: 100_000, totalTokens: 300_000, cachedTokens: null } }),
 		]);
 		const options = baseOptions({
 			client,
@@ -365,8 +367,8 @@ describe("buildParagraphsAI: totalTokensIn/totalTokensOut", () => {
 		// coincidence, the way promptTokens+completionTokens===totalTokens does
 		// in every other fixture in this file.
 		const { client } = fakeClient("provider.example.com", [
-			okResult(fixtureText("number-not-in-facts"), { usage: { promptTokens: 150, completionTokens: 60, totalTokens: 999, cachedTokens: null } }),
-			okResult(fixtureText("good"), { usage: { promptTokens: 90, completionTokens: 40, totalTokens: 888, cachedTokens: null } }),
+			okResult(fixtureText("observation-digit"), { usage: { promptTokens: 150, completionTokens: 60, totalTokens: 999, cachedTokens: null } }),
+			okResult(fixtureText("observation-good"), { usage: { promptTokens: 90, completionTokens: 40, totalTokens: 888, cachedTokens: null } }),
 		]);
 		const options = baseOptions({ client, maxAttemptsPerModel: 2 });
 
@@ -399,10 +401,10 @@ describe("buildParagraphsAI: never throws", () => {
 
 	it("template fallback returns exactly what buildParagraphs(facts) itself produces", async () => {
 		const { client } = fakeClient("provider.example.com", [
-			okResult(fixtureText("number-not-in-facts")),
-			okResult(fixtureText("number-not-in-facts")),
-			okResult(fixtureText("number-not-in-facts")),
-			okResult(fixtureText("number-not-in-facts")),
+			okResult(fixtureText("observation-digit")),
+			okResult(fixtureText("observation-digit")),
+			okResult(fixtureText("observation-digit")),
+			okResult(fixtureText("observation-digit")),
 		]);
 		const facts = specExampleFacts();
 		const options = baseOptions({ client, facts, maxAttemptsPerModel: 2 });
@@ -420,7 +422,7 @@ describe("buildParagraphsAI: never throws", () => {
 
 describe("buildParagraphsAI: ai.json is written for every outcome, including full AI failure", () => {
 	it("writes ai.json on success, with the accepted result and every attempt", async () => {
-		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("number-not-in-facts")), okResult(fixtureText("good"))]);
+		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("observation-digit")), okResult(fixtureText("observation-good"))]);
 		const options = baseOptions({ client });
 
 		await buildParagraphsAI(options);
@@ -434,10 +436,10 @@ describe("buildParagraphsAI: ai.json is written for every outcome, including ful
 
 	it("writes ai.json even when every model and retry is exhausted", async () => {
 		const { client } = fakeClient("provider.example.com", [
-			okResult(fixtureText("number-not-in-facts")),
-			okResult(fixtureText("number-not-in-facts")),
-			okResult(fixtureText("number-not-in-facts")),
-			okResult(fixtureText("number-not-in-facts")),
+			okResult(fixtureText("observation-digit")),
+			okResult(fixtureText("observation-digit")),
+			okResult(fixtureText("observation-digit")),
+			okResult(fixtureText("observation-digit")),
 		]);
 		const options = baseOptions({ client, maxAttemptsPerModel: 2 });
 
@@ -450,7 +452,7 @@ describe("buildParagraphsAI: ai.json is written for every outcome, including ful
 	});
 
 	it("writes ai.json even when the budget runs out before a single attempt", async () => {
-		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("good"))]);
+		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("observation-good"))]);
 		const options = baseOptions({ client, timeoutMs: 25_000, totalBudgetMs: 1_000 });
 
 		await buildParagraphsAI(options);

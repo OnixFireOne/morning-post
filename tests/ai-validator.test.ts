@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildAiPayload, type AiHistoryEntry } from "../src/ai/payload.js";
-import { extractNumberTokens, MAX_PARAGRAPH_LENGTH, validateAiParagraphs, type ValidationFailureReason } from "../src/ai/validator.js";
+import { extractNumberTokens, MAX_PARAGRAPH_LENGTH, validateAiObservation, validateAiParagraphs, type ValidationFailureReason } from "../src/ai/validator.js";
 import type { Facts } from "../src/facts.js";
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "ai-responses");
@@ -192,8 +192,8 @@ describe("validateAiParagraphs: item 10 — word-form (ordinal) day-streak vs fa
 	// history and writing "third day" from their count, never looking at
 	// facts.streak at all.
 	const twoGreenDaysHistory: AiHistoryEntry[] = [
-		{ dateLabel: "24 августа", swarmState: "green", picture: "Рой вчера был зелёным.", observation: "Всё спокойно, без сюрпризов." },
-		{ dateLabel: "23 августа", swarmState: "green", picture: "Рой позавчера тоже был зелёным.", observation: "Ничего необычного не происходило." },
+		{ dateLabel: "24 августа", swarmState: "green", observation: "Всё спокойно, без сюрпризов." },
+		{ dateLabel: "23 августа", swarmState: "green", observation: "Ничего необычного не происходило." },
 	];
 
 	it("rejects «третий день подряд» when facts.streak is actually 1 (streak reset, model counted history length instead)", () => {
@@ -309,5 +309,108 @@ describe("extractNumberTokens", () => {
 
 	it("finds nothing in text with no digits", () => {
 		expect(extractNumberTokens("рой держится спокойно")).toEqual([]);
+	});
+});
+
+// --- new one-paragraph contract (PROMPT_VERSION 7): picture is entirely
+// code-generated (render.ts's pickPicture), never part of the model's
+// response — the model returns only {observation, direction}. Items 1/7/9/10
+// above (numbers whitelist, digit day-count, derived-number words, word-form
+// streak mismatch) are validateAiParagraphs-only, not called here at all —
+// see validator.ts's own comment on validateAiObservation for why the two
+// checks below are broader supersets of what those four covered. ---
+
+describe("validateAiObservation: happy path", () => {
+	it("accepts a clean one-paragraph response with no picture field at all", () => {
+		const text = '{"observation": "Лидер дня — TRAC, антигерой — PI: разброс между ними растёт быстрее, чем движется биток.", "direction": "red"}';
+		const result = validateAiObservation(text, payload);
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.result.observation).toContain("TRAC");
+			expect(result.result.direction).toBe("red");
+		}
+	});
+
+	it("tolerates (and ignores) an extra picture field if the model sends one anyway", () => {
+		const text = '{"picture": "Рой развернулся в минус: 133 монеты падают.", "observation": "Всё спокойно, биток держится ровно.", "direction": "red"}';
+		const result = validateAiObservation(text, payload);
+		// The picture field contains a digit, but validateAiObservation never
+		// reads it — only observation is checked, so this must still pass.
+		expect(result.ok).toBe(true);
+	});
+});
+
+describe("validateAiObservation: new rejection — any digit at all, no whitelist", () => {
+	it("rejects a digit in observation even though item 1's whitelist would have allowed it", () => {
+		const result = validateAiObservation(response("observation-digit"), payload);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:observation_digit");
+	});
+
+	it("rejects a digit that IS in payload.allowedNumbers — there is no whitelist exception on this path", () => {
+		// "133" is red's own count — legitimately whitelisted for the old
+		// contract (item 1), but the new contract has no exception for it at all.
+		const text = '{"observation": "Сегодня падают 133 монеты.", "direction": "red"}';
+		const result = validateAiObservation(text, payload);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:observation_digit");
+	});
+});
+
+describe("validateAiObservation: new rejection — any day-count mention, word or digit", () => {
+	it("rejects a word-form day-count with no digit anywhere in the text", () => {
+		const result = validateAiObservation(response("observation-day-count"), payload);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:observation_day_count");
+	});
+
+	it("a digit-form day-count is still rejected, but as validator:observation_digit — the any-digit check runs first", () => {
+		const text = '{"observation": "Уже 3 дня подряд рой топчется в минусе.", "direction": "red"}';
+		const result = validateAiObservation(text, payload);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:observation_digit");
+	});
+});
+
+describe("validateAiObservation: items 1/7/9/10 are deliberately NOT applied on this path", () => {
+	it("does not reject a non-digit multiplicity word (кратно/вдвое) — item 9 isn't called here", () => {
+		// Same live-found phrase item 9 exists to catch on the old contract —
+		// confirming the new path really doesn't call it, per the explicit
+		// scope decision (validator.ts's own comment on validateAiObservation).
+		const text = '{"observation": "Зелёных монет кратно больше красных.", "direction": "red"}';
+		const result = validateAiObservation(text, payload);
+		expect(result.ok).toBe(true);
+	});
+});
+
+describe("validateAiObservation: everything else still applies", () => {
+	it("rejects forbidden patterns", () => {
+		const result = validateAiObservation(response("forecast"), payload);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:forbidden_pattern");
+	});
+
+	it("rejects a direction mismatch", () => {
+		const result = validateAiObservation(response("direction-mismatch"), payload);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:direction");
+	});
+
+	it("rejects an empty observation", () => {
+		const result = validateAiObservation(response("observation-empty"), payload);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:empty_or_cutoff");
+	});
+
+	it("rejects non-Russian text", () => {
+		const result = validateAiObservation(response("observation-english"), payload);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:language");
+	});
+
+	it("rejects invalid JSON", () => {
+		const result = validateAiObservation(response("invalid-json"), payload);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("invalid_json");
 	});
 });

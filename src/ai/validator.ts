@@ -284,6 +284,129 @@ function endsLikeASentence(text: string): boolean {
 	return /[.!?…»)]$/.test(text);
 }
 
+// --- v2 section 4 rewrite: the model's only text output is now the
+// observation paragraph — picture (paragraph 1) is entirely code-generated
+// (render.ts's pickPicture), never sent to or returned by the model. Items
+// 1/7/9/10 above (numbers whitelist, digit day-count, derived-number words,
+// word-form streak mismatch) are kept in this file untouched — for
+// validateAiParagraphs below and a possible rollback to the two-paragraph
+// contract — but this new path calls neither them nor validateAiParagraphs:
+// the two checks below are strictly broader supersets of what each of those
+// four covered individually, now that the model has no legitimate reason to
+// write a number or a day-count in any form at all. ---
+
+export type ObservationValidationFailureReason =
+	| "invalid_json"
+	| "validator:length"
+	| "validator:forbidden_pattern"
+	| "validator:direction"
+	| "validator:empty_or_cutoff"
+	| "validator:language"
+	| "validator:observation_digit"
+	| "validator:observation_day_count";
+
+export type AiObservation = {
+	observation: string;
+	direction: AiPayload["today"]["swarmState"];
+};
+
+export type ObservationValidationResult = { ok: true; result: AiObservation } | { ok: false; reason: ObservationValidationFailureReason; detail: string };
+
+function parseAiObservationJson(rawText: string): { observation: string; direction: string } | null {
+	const start = rawText.indexOf("{");
+	const end = rawText.lastIndexOf("}");
+	if (start === -1 || end === -1 || end < start) return null;
+
+	let candidate: unknown;
+	try {
+		candidate = JSON.parse(rawText.slice(start, end + 1));
+	} catch {
+		return null;
+	}
+
+	if (typeof candidate !== "object" || candidate === null) return null;
+	const obj = candidate as Record<string, unknown>;
+	if (typeof obj.observation !== "string" || typeof obj.direction !== "string") return null;
+	return { observation: obj.observation, direction: obj.direction };
+}
+
+// Every number in the post is now either in a code-generated line or in
+// paragraph 1 (also code-generated) — observation can't legitimately need a
+// digit for anything, so unlike item 1 there's no whitelist to check
+// against: any digit at all is a rejection, allowed or not.
+const ANY_DIGIT_RE = /\d/;
+
+function findAnyDigit(text: string): string | null {
+	const match = text.match(ANY_DIGIT_RE);
+	return match ? match[0] : null;
+}
+
+// Day-count mention in ANY form — word or digit — is banned outright now,
+// not just checked for digit-form (item 7) or word-form correctness (item
+// 10): the day count, when there is one, lives in paragraph 1 (code-
+// generated from facts.streak via pickPicture), so observation has no
+// business naming it at all, right or wrong. A digit-form count is already
+// caught by the any-digit check above; this catches the word-form case
+// (e.g. "третий день") that has no digit for that check to see. Reuses item
+// 10's own stem/suffix/gap pieces — not a new generator, a non-global
+// sibling of ORDINAL_DAY_RE for plain presence-detection: a global regex's
+// mutable lastIndex makes it unsafe to .test() directly across repeated
+// calls on the same module-level instance (matchAll, which ORDINAL_DAY_RE
+// is built for, doesn't have that problem — a bare .test()/.match() would).
+const ANY_ORDINAL_DAY_RE = new RegExp(
+	`${NOT_WORD_BEFORE}(?:${ORDINAL_DAY_STEMS.map(({ stem, suffixAlt }) => `${stem}${suffixAlt}`).join("|")})${NOT_WORD_AFTER}${ORDINAL_DAY_GAP}${DAY_WORD_ALT}${NOT_WORD_AFTER}`,
+	"iu",
+);
+
+function findAnyDayCountWord(text: string): string | null {
+	const match = text.match(ANY_ORDINAL_DAY_RE);
+	return match ? match[0] : null;
+}
+
+/**
+ * New one-paragraph contract: parse {observation, direction} -> non-empty/
+ * not cut off -> length -> forbidden content -> direction -> any digit ->
+ * any day-count word -> language.
+ */
+export function validateAiObservation(rawText: string, payload: AiPayload): ObservationValidationResult {
+	const parsed = parseAiObservationJson(rawText);
+	if (!parsed) {
+		return { ok: false, reason: "invalid_json", detail: "no valid {observation, direction} JSON object found in the response" };
+	}
+
+	const observation = parsed.observation.trim();
+
+	if (!observation) return { ok: false, reason: "validator:empty_or_cutoff", detail: "observation is empty" };
+	if (!endsLikeASentence(observation)) {
+		return { ok: false, reason: "validator:empty_or_cutoff", detail: `observation does not end with sentence-ending punctuation: "...${observation.slice(-20)}"` };
+	}
+	if (observation.length > MAX_PARAGRAPH_LENGTH) {
+		return { ok: false, reason: "validator:length", detail: `observation is ${observation.length} chars, limit ${MAX_PARAGRAPH_LENGTH}` };
+	}
+
+	const forbidden = findForbiddenPattern(observation, payload);
+	if (forbidden) return { ok: false, reason: "validator:forbidden_pattern", detail: forbidden };
+
+	if (parsed.direction !== payload.today.swarmState) {
+		return { ok: false, reason: "validator:direction", detail: `direction "${parsed.direction}" !== facts.swarmState "${payload.today.swarmState}"` };
+	}
+	const direction = parsed.direction as AiPayload["today"]["swarmState"];
+
+	const anyDigit = findAnyDigit(observation);
+	if (anyDigit) return { ok: false, reason: "validator:observation_digit", detail: `"${anyDigit}" — observation may not contain any digit; every number already lives elsewhere in the post` };
+
+	const anyDayCountWord = findAnyDayCountWord(observation);
+	if (anyDayCountWord) {
+		return { ok: false, reason: "validator:observation_day_count", detail: `"${anyDayCountWord}" — the day count (word or digit) belongs to paragraph 1 only, generated by code, never in observation` };
+	}
+
+	if (!isRussianEnough(observation, payload)) {
+		return { ok: false, reason: "validator:language", detail: "text does not look like Russian (< 90% Cyrillic letters after stripping tickers/BTC)" };
+	}
+
+	return { ok: true, result: { observation, direction } };
+}
+
 /**
  * Section 5, checks in this order (first failure wins — order doesn't change
  * correctness, each check is independent): parse -> non-empty/not cut off ->

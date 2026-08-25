@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildAiPayload } from "../src/ai/payload.js";
-import { buildRetryUserPrompt, buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
-import { MAX_PARAGRAPH_LENGTH, validateAiParagraphs, type ValidationFailureReason } from "../src/ai/validator.js";
+import { buildRetryObservationPrompt, buildRetryUserPrompt, buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
+import { MAX_PARAGRAPH_LENGTH, validateAiObservation, validateAiParagraphs, type ObservationValidationFailureReason, type ValidationFailureReason } from "../src/ai/validator.js";
 import type { Facts } from "../src/facts.js";
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "ai-responses");
@@ -64,25 +64,20 @@ describe("buildSystemPrompt: length limit comes from the same constant the valid
 	});
 });
 
-describe("buildSystemPrompt: streak rule is phrased contextually, not value-specifically", () => {
-	it("bans a digit next to день/дня/сутки in general — never mentions writing streak's value as forbidden", () => {
+describe("buildSystemPrompt: day-count is entirely paragraph 1's concern (PROMPT_VERSION 7), not something the model phrases", () => {
+	// PROMPT_VERSION 1-6's ДНИ ПОДРЯД rule (still true, no longer relevant
+	// here) governed HOW the model could phrase a day-count — word not digit,
+	// value must match facts.streak. PROMPT_VERSION 7 moves the day-count out
+	// of the model's output entirely: paragraph 1 (picture) is code-generated
+	// via render.ts's pickPicture, which already includes it when streak >= 2.
+	// The model is told not to mention it at all, not told how to phrase it.
+	it("tells the model not to write the day number — it already lives in paragraph 1", () => {
 		const system = buildSystemPrompt();
-		expect(system).toMatch(/день/);
-		expect(system).toMatch(/дня/);
-		expect(system).toMatch(/сутки/);
-		// "320" (the length limit) is a legitimate digit elsewhere in the prompt
-		// — the actual guarantee against "don't write digit N" framing is that
-		// the function has nowhere to receive N from at all (next test), not
-		// "zero digits anywhere in the string". PROMPT_VERSION 5 dropped the
-		// illustrative forbidden-form examples ("2-й день"/"3 дня подряд") to
-		// save budget, relying on the general "не должно быть цифры вообще"
-		// framing plus the validator's own retry instruction on failure.
-		expect(system).toMatch(/не должно быть цифры вообще/);
-		expect(system).toMatch(/«второй день»/);
-		expect(system).toMatch(/«третий день подряд»/);
+		expect(system).toMatch(/О номере дня не писать/);
+		expect(system).toMatch(/это в первом абзаце/);
 	});
 
-	it("does not take facts/streak as a parameter — the rule can't degrade into a per-day number ban even by accident", () => {
+	it("does not take facts/streak as a parameter — nothing here can degrade into a per-day number leak even by accident", () => {
 		expect(buildSystemPrompt.length).toBe(0);
 	});
 });
@@ -104,11 +99,14 @@ describe("buildSystemPrompt: covers the rest of section 4", () => {
 		expect(system).toMatch(/history/);
 	});
 
-	it("asks for Russian and for strict JSON with exactly picture/observation/direction", () => {
+	it("asks for Russian and for strict JSON with exactly observation/direction — no picture field at all", () => {
 		expect(system).toMatch(/русск/i);
-		expect(system).toContain('"picture"');
 		expect(system).toContain('"observation"');
 		expect(system).toContain('"direction"');
+		// Not optional, not omitted-but-tolerated — removed from the contract
+		// entirely (PROMPT_VERSION 7): an optional field a model can still
+		// choose to fill is a field that eventually reappears in the post.
+		expect(system).not.toContain('"picture"');
 	});
 });
 
@@ -141,22 +139,15 @@ describe("buildSystemPrompt: PROMPT_VERSION 3 additions — manual verification 
 		expect(system).toMatch(/биток рванул вверх/i);
 	});
 
-	it("bans multiplicities and fractions spoken as words, even when arithmetically correct for today's numbers", () => {
-		// Found during manual verification: "зелёных монет в десять раз больше,
-		// чем красных" was arithmetically right for that day's split, but it's a
-		// ratio the model computed itself — the same phrase on a different
-		// day's counts would be a silent miscalculation, and ЧИСЛА's plain
-		// allowedNumbers check has no digit to catch it on since it's spelled
-		// out as a word.
-		expect(system).toMatch(/кратности и доли/i);
-		expect(system).toMatch(/вдвое/);
-		expect(system).toMatch(/половина/);
-		expect(system).toMatch(/треть/);
-	});
-
-	it("still allows qualitative comparisons without arithmetic", () => {
-		expect(system).toMatch(/Качественные сравнения без арифметики/);
-	});
+	// The multiplicity/fraction vocabulary this block used to enumerate here
+	// (вдвое/половина/треть/кратно/...) is gone from ЧИСЛА as of PROMPT_VERSION
+	// 7 — ЧИСЛА is now one line ("Цифр в абзаце нет вовсе"), a blanket ban
+	// that makes enumerating digit-adjacent phrasing moot. It does NOT extend
+	// to non-digit ratio words like "вдвое"/"кратно" though — that was item
+	// 9's job, and item 9 is deliberately not called by validateAiObservation
+	// (see validator.ts's own comment on the new one-paragraph contract) — a
+	// known, deliberate gap, not an oversight. See "PROMPT_VERSION 7" below
+	// for what's actually checked now.
 });
 
 describe("buildSystemPrompt: PROMPT_VERSION 4 additions — manual verification findings, 2026-08-25", () => {
@@ -168,7 +159,7 @@ describe("buildSystemPrompt: PROMPT_VERSION 4 additions — manual verification 
 		// in allowedNumbers, so item 1 already rejected it correctly, but
 		// telling the model not to reach for the date at all avoids the wasted
 		// retry instead of just catching it after the fact.
-		expect(system).toMatch(/dateLabel.*не пиши её в абзацах/);
+		expect(system).toMatch(/dateLabel.*не пиши её в абзаце/);
 	});
 
 	it("bans narrating the empty-history state itself, not just inventing a false past", () => {
@@ -185,48 +176,61 @@ describe("buildSystemPrompt: PROMPT_VERSION 4 additions — manual verification 
 describe("buildSystemPrompt: PROMPT_VERSION 5 additions — manual verification findings, 2026-08-25", () => {
 	const system = buildSystemPrompt();
 
-	it("tells the model streak length comes only from facts.streak, never from counting history entries", () => {
-		// Found on a live green --chain=3 run: facts.streak was pinned at 1 every
-		// step (same fixture, only the date advances), but step 2/3 wrote
-		// "второй"/"третий день подряд" by counting entries in history instead
-		// — step 1 alone got it right ("первый зелёный день"). Backed by
-		// validator item 10 (validator:streak_word_mismatch).
-		expect(system).toMatch(/Длина серии дней берётся только из поля streak/);
-		expect(system).toMatch(/считать её по количеству дней в history нельзя/);
-	});
-
-	it("adds кратно to the multiplicity ban, alongside the existing вдвое/в N раз/половина/треть/четверть", () => {
-		// Live response: "зелёных монет кратно больше красных" for 50 vs 16 — a
-		// multiplicity masked as a plain adverb.
-		expect(system).toMatch(/кратно/);
-	});
-
 	it("bans narrating the anti-repeat mechanism itself — not as a repeat, not as \"yesterday's image/scenario\"", () => {
 		// Live response: "рой сохраняет единодушие, хотя вчерашний образ «почти
 		// весь рой» уже использован" — the model narrating its own anti-repeat
 		// process out loud. Same class as the empty-history leak above: history
 		// (empty or not) is an internal technical detail the reader never sees.
+		// Unchanged by PROMPT_VERSION 7 — still verbatim in ПОВТОРЫ.
 		expect(system).toMatch(/не называй что-то повтором/);
 		expect(system).toMatch(/вчерашний образ/);
 		expect(system).toMatch(/вчерашний сценарий/);
 	});
 
-	it("keeps a qualitative-comparison example, now «большинство монет в минусе» instead of «заметно больше»", () => {
-		expect(system).toMatch(/большинство монет в минусе/);
-	});
+	// This block's other two PROMPT_VERSION 5 findings — the "streak comes
+	// from facts.streak, not history length" sentence and the "кратно" ban —
+	// governed HOW the model phrased a day-count/multiplicity in observation.
+	// PROMPT_VERSION 7 made both moot from this side: observation can't
+	// contain a digit or a day-count in any form at all (validator's own
+	// any-digit/any-day-count checks), so there's nothing left to phrase
+	// correctly. See "PROMPT_VERSION 7" below.
 });
 
-describe("buildSystemPrompt: PROMPT_VERSION 6 additions — manual verification findings, 2026-08-25", () => {
+// PROMPT_VERSION 6's only finding (streak: 1 gets no «подряд»/day-number) was
+// itself a refinement of the same two-paragraph contract's ДНИ ПОДРЯД rule —
+// PROMPT_VERSION 7 replaced that whole rule with "the model never mentions a
+// day-count at all, regardless of streak's value" (see below), which already
+// covers streak: 1 as a special case of "never".
+
+describe("buildSystemPrompt: PROMPT_VERSION 7 — one-paragraph contract (picture is code-generated)", () => {
 	const system = buildSystemPrompt();
 
-	it("tells the model not to mention the streak at all when streak is 1 — no «подряд», no day-number", () => {
-		// Wording refinement, not a new validator-backed rule: streak=1 isn't
-		// really a "streak" worth narrating, so the model shouldn't reach for
-		// «первый день» or «подряд» at all on day one — only from streak=2
-		// onward does the series get named.
-		expect(system).toMatch(/При streak: 1 серию не упоминай/);
-		expect(system).toMatch(/ни «подряд», ни номер дня/);
-		expect(system).toMatch(/С streak: 2 и больше/);
+	it("asks for exactly one paragraph (observation) and says picture/numbers are code's job", () => {
+		expect(system).toMatch(/написать один абзац прозы/);
+		expect(system).toMatch(/Картину дня и все цифры поста пишет код, не ты/);
+	});
+
+	it("ЧИСЛА is a blanket ban — no digits at all, not a whitelist to consult", () => {
+		expect(system).toMatch(/Цифр в абзаце нет вовсе/);
+		expect(system).toMatch(/все числа уже в посте выше/);
+	});
+
+	it("ДНИ ПОДРЯД just says the day-number isn't observation's to write", () => {
+		expect(system).toMatch(/О номере дня не писать/);
+		expect(system).toMatch(/это в первом абзаце/);
+	});
+
+	it("refers to history as the model's own past observations, not 'paragraphs'", () => {
+		expect(system).toMatch(/твои наблюдения за последние дни/);
+	});
+
+	it("still bans forecasts/advice/moonshots/hashtags/links/HTML/emoji — unrelated to the contract change", () => {
+		expect(system).toMatch(/прогноз/i);
+		expect(system).toMatch(/купить|продать/i);
+		expect(system).toMatch(/иксов/i);
+		expect(system).toMatch(/хэштег/i);
+		expect(system).toMatch(/html/i);
+		expect(system).toMatch(/эмодзи/i);
 	});
 });
 
@@ -295,5 +299,67 @@ describe("buildRetryUserPrompt: never echoes the rejected text back", () => {
 		const retryPrompt = buildRetryUserPrompt(payload, "validator:numbers");
 		const { retryInstruction } = JSON.parse(retryPrompt) as { retryInstruction: string };
 		expect(retryInstruction).not.toContain("156");
+	});
+});
+
+const ALL_OBSERVATION_REASONS: ObservationValidationFailureReason[] = [
+	"invalid_json",
+	"validator:length",
+	"validator:forbidden_pattern",
+	"validator:direction",
+	"validator:empty_or_cutoff",
+	"validator:language",
+	"validator:observation_digit",
+	"validator:observation_day_count",
+];
+
+describe("buildRetryObservationPrompt: new one-paragraph contract's retry path — never echoes the rejected text back", () => {
+	it.each([
+		["observation-digit", "validator:observation_digit"],
+		["observation-day-count", "validator:observation_day_count"],
+		["forecast", "validator:forbidden_pattern"],
+		["direction-mismatch", "validator:direction"],
+		["observation-empty", "validator:empty_or_cutoff"],
+		["observation-english", "validator:language"],
+	] as const)("retry prompt after rejecting %s (%s) doesn't contain the rejected observation text", (fixtureName, expectedReason) => {
+		const rejected = JSON.parse(response(fixtureName).match(/\{[\s\S]*\}/)![0]) as { observation: string };
+		const result = validateAiObservation(response(fixtureName), payload);
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.reason).toBe(expectedReason);
+
+		const retryPrompt = buildRetryObservationPrompt(payload, result.reason);
+		if (rejected.observation) expect(retryPrompt).not.toContain(rejected.observation);
+	});
+
+	it("is still exactly one JSON object — the correction lives in a field, not as prose around it", () => {
+		const retryPrompt = buildRetryObservationPrompt(payload, "validator:observation_digit");
+		expect(() => JSON.parse(retryPrompt)).not.toThrow();
+		const parsed = JSON.parse(retryPrompt) as Record<string, unknown>;
+		expect(parsed.today).toEqual(payload.today);
+		expect(typeof parsed.retryInstruction).toBe("string");
+	});
+
+	it("has a non-empty instruction for every possible ObservationValidationFailureReason", () => {
+		for (const reason of ALL_OBSERVATION_REASONS) {
+			const retryPrompt = buildRetryObservationPrompt(payload, reason);
+			const parsed = JSON.parse(retryPrompt) as { retryInstruction: string };
+			expect(parsed.retryInstruction.length).toBeGreaterThan(0);
+		}
+	});
+
+	it("the any-digit retry instruction doesn't repeat the specific rejected digit", () => {
+		// observation-digit.txt used "5%" — the correction must describe the
+		// *rule* (no digits at all), not quote the bad number back.
+		const retryPrompt = buildRetryObservationPrompt(payload, "validator:observation_digit");
+		const { retryInstruction } = JSON.parse(retryPrompt) as { retryInstruction: string };
+		expect(retryInstruction).not.toMatch(/\d/);
+	});
+
+	it("the day-count retry instruction is phrased contextually, not naming the specific rejected ordinal", () => {
+		const retryPrompt = buildRetryObservationPrompt(payload, "validator:observation_day_count");
+		const { retryInstruction } = JSON.parse(retryPrompt) as { retryInstruction: string };
+		expect(retryInstruction).toMatch(/номер дня/);
+		expect(retryInstruction).not.toMatch(/третий/i);
 	});
 });

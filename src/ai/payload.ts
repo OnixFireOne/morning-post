@@ -28,11 +28,17 @@ export type AiTodayPayload = {
 	maxAbsLeaderChange: number;
 };
 
-/** One prior day for anti-repeat context. Its own numbers never enter allowedNumbers — section 3.1. */
+/**
+ * One prior day for anti-repeat context. Its own numbers never enter
+ * allowedNumbers — section 3.1. picture deliberately dropped (v2 section 4
+ * rewrite): paragraph 1 is code-generated and formulaic (render.ts's
+ * pickPicture, same phrase-pool rotation every day) — sending it to the
+ * model would be pure noise, roughly 110 input tokens/day for text the model
+ * never writes and has no reason to read.
+ */
 export type AiHistoryEntry = {
 	dateLabel: string;
 	swarmState: SwarmState;
-	picture: string;
 	observation: string;
 };
 
@@ -78,7 +84,6 @@ export function collectAllowedNumbers(today: AiTodayPayload): string[] {
 function redactHistoryNumbers(entry: AiHistoryEntry): AiHistoryEntry {
 	return {
 		...entry,
-		picture: entry.picture.replace(NUMBER_TOKEN_RE, "…"),
 		observation: entry.observation.replace(NUMBER_TOKEN_RE, "…"),
 	};
 }
@@ -131,7 +136,6 @@ export function stateHistoryToAiHistory(history: StateHistory, todayKey: string)
 		.map((day) => ({
 			dateLabel: dateKeyToLabel(day.date),
 			swarmState: day.swarmState,
-			picture: day.picture,
 			observation: day.observation,
 		}));
 }

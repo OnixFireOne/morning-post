@@ -34,7 +34,8 @@ export type PostParagraphs = {
 	observation: string;
 };
 
-function pickPicture(facts: Facts): string {
+/** Exported for the new one-paragraph AI contract (v2 section 4 rewrite): paragraph 1 is always this — code-generated, never sent to or returned by the model. Same function the template path already used. */
+export function pickPicture(facts: Facts): string {
 	if (facts.swarmState === "red") {
 		const variants = facts.streak >= 2 ? RED_STREAK_VARIANTS : RED_FIRST_VARIANTS;
 		return pickVariant(variants, facts.dateKey)(facts);

@@ -25,8 +25,9 @@
 // to tell a report worth keeping from a stale daily *.ai.json dump.
 //
 // No prod logic is reimplemented: buildAiPayload, buildSystemPrompt/
-// buildUserPrompt, validateAiParagraphs, computeCost, stateHistoryToAiHistory
-// and buildParagraphs (the template fallback, shown alongside each AI run for
+// buildUserPrompt, validateAiObservation, computeCost, stateHistoryToAiHistory,
+// pickPicture (paragraph 1, code-generated since PROMPT_VERSION 7) and
+// buildParagraphs (the template fallback, shown alongside each AI run for
 // a pairwise read — section 9's actual ask) are the exact functions the
 // production path calls, imported as-is. This file only adds argument
 // parsing, one bare client.generate() call per run (skipping generate.ts's
@@ -39,9 +40,9 @@ import { createAiClient, type AiClient, type AiUsage } from "../src/ai/client.js
 import { buildAiPayload, stateHistoryToAiHistory, type AiPayload } from "../src/ai/payload.js";
 import { buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
 import { computeCost } from "../src/ai/usage.js";
-import { validateAiParagraphs, type ValidationFailureReason } from "../src/ai/validator.js";
+import { validateAiObservation, type ObservationValidationFailureReason } from "../src/ai/validator.js";
 import { computeFacts, shiftDateKey, type Facts, type StateHistory } from "../src/facts.js";
-import { buildParagraphs, type PostParagraphs } from "../src/render.js";
+import { buildParagraphs, pickPicture, type PostParagraphs } from "../src/render.js";
 import { loadSnapshotFromFile } from "../src/snapshot.js";
 import { appendDay, readState } from "../src/state.js";
 import type { HotCoinsSnapshot } from "../src/types.js";
@@ -72,7 +73,7 @@ const ALL_FIXTURE_NAMES = [
 // data variance — checked once per report, not once per fixture.
 const SYSTEM_PROMPT_NORM_MAX_CHARS = 4000;
 
-const HISTORY_ALLOWED_KEYS = new Set(["dateLabel", "swarmState", "picture", "observation"]);
+const HISTORY_ALLOWED_KEYS = new Set(["dateLabel", "swarmState", "observation"]);
 
 /**
  * Empirical calibration, not documented by the proxy: three consecutive real
@@ -89,18 +90,22 @@ const HISTORY_ALLOWED_KEYS = new Set(["dateLabel", "swarmState", "picture", "obs
  */
 const PROXY_INPUT_TOKEN_OVERHEAD = 2539;
 
-/** Section 5's six checks plus item 7 (streak digit), item 9 (derived numbers in words), item 10 (word-form streak vs facts.streak — all three added after 24.08, see validator.ts's own comments) and the pre-check for invalid JSON. */
-const VALIDATOR_ITEM_LABELS: Record<ValidationFailureReason, string> = {
+/**
+ * validateAiObservation's own checks (PROMPT_VERSION 7's active path — items
+ * 1/7/9/10, the numbers whitelist/digit day-count/derived-number words/
+ * word-form streak mismatch, are validateAiParagraphs-only now, not called
+ * here at all): parse -> non-empty/not cut off -> length -> forbidden
+ * content -> direction -> any digit -> any day-count word -> language.
+ */
+const VALIDATOR_ITEM_LABELS: Record<ObservationValidationFailureReason, string> = {
 	invalid_json: "невалидный JSON (до проверок раздела 5)",
-	"validator:numbers": "п.1 числа",
 	"validator:length": "п.2 длина",
 	"validator:forbidden_pattern": "п.3 запрещённые паттерны",
 	"validator:direction": "п.4 direction",
 	"validator:empty_or_cutoff": "п.5 пустой/оборванный абзац",
-	"validator:streak_digit": "п.7 цифра в счёте дней",
 	"validator:language": "п.6 язык",
-	"validator:derived_numbers": "п.9 кратности/доли словами",
-	"validator:streak_word_mismatch": "п.10 счёт дней словом ≠ streak",
+	"validator:observation_digit": "новое: любая цифра в абзаце",
+	"validator:observation_day_count": "новое: любой счёт дней (словом или цифрой)",
 };
 
 type RunOutcome =
@@ -118,7 +123,7 @@ type RunOutcome =
 	  }
 	| {
 			kind: "rejected";
-			reason: ValidationFailureReason;
+			reason: ObservationValidationFailureReason;
 			detail: string;
 			rawResponse: string;
 			tokensIn: number | null;
@@ -198,6 +203,8 @@ async function runOne(
 	payload: AiPayload,
 	priceInPerMillion: number | null,
 	priceOutPerMillion: number | null,
+	/** Paragraph 1 is code-generated (pickPicture), never part of the model's response — needed here only to attach it to the "accepted" outcome for the report's pairwise display. */
+	facts: Facts,
 ): Promise<RunOneOutcome> {
 	const result = await client.generate({ model: modelId, system, user, timeoutMs });
 
@@ -207,7 +214,7 @@ async function runOne(
 	}
 
 	const rawText = result.content ?? "";
-	const validation = validateAiParagraphs(rawText, payload);
+	const validation = validateAiObservation(rawText, payload);
 	const costEstimate = computeCost(result.usage, priceInPerMillion, priceOutPerMillion);
 	const tokensIn = result.usage?.promptTokens ?? null;
 	const tokensOut = result.usage?.completionTokens ?? null;
@@ -215,9 +222,9 @@ async function runOne(
 	if (validation.ok) {
 		return {
 			kind: "accepted",
-			picture: validation.paragraphs.picture,
-			observation: validation.paragraphs.observation,
-			direction: validation.paragraphs.direction,
+			picture: pickPicture(facts),
+			observation: validation.result.observation,
+			direction: validation.result.direction,
 			tokensIn,
 			tokensOut,
 			durationMs: result.durationMs,
@@ -458,7 +465,7 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 
 		for (let run = 1; run <= opts.runsPerFixture; run++) {
 			process.stdout.write(`[ai:compare] ${fixtureName} run ${run}/${opts.runsPerFixture}... `);
-			const outcome = await runOne(opts.client, opts.modelId, system, user, opts.timeoutMs, payload, opts.priceInPerMillion, opts.priceOutPerMillion);
+			const outcome = await runOne(opts.client, opts.modelId, system, user, opts.timeoutMs, payload, opts.priceInPerMillion, opts.priceOutPerMillion, facts);
 			console.log(outcome.kind === "accepted" ? "ok" : outcome.kind === "rejected" ? `rejected (${outcome.reason})` : `transport (${outcome.label})`);
 			const fr: FixtureRun = { fixtureName, run, outcome };
 			allRuns.push(fr);
@@ -886,7 +893,7 @@ async function runChainForFixture(
 		const user = buildUserPrompt(payload);
 
 		process.stdout.write(`[ai:compare] ${fixtureName} chain ${k}/${chainLength}... `);
-		const outcome = await runOne(client, modelId, system, user, timeoutMs, payload, priceInPerMillion, priceOutPerMillion);
+		const outcome = await runOne(client, modelId, system, user, timeoutMs, payload, priceInPerMillion, priceOutPerMillion, facts);
 		console.log(outcome.kind === "accepted" ? "ok" : outcome.kind === "rejected" ? `rejected (${outcome.reason})` : `transport (${outcome.label})`);
 
 		const fr: FixtureRun = { fixtureName, run: k, outcome };
