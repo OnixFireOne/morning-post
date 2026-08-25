@@ -40,7 +40,7 @@ import { buildAiPayload, stateHistoryToAiHistory, type AiPayload } from "../src/
 import { buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
 import { computeCost } from "../src/ai/usage.js";
 import { validateAiParagraphs, type ValidationFailureReason } from "../src/ai/validator.js";
-import { computeFacts, dateKeyToLabel, shiftDateKey, type Facts, type StateHistory } from "../src/facts.js";
+import { computeFacts, shiftDateKey, type Facts, type StateHistory } from "../src/facts.js";
 import { buildParagraphs, type PostParagraphs } from "../src/render.js";
 import { loadSnapshotFromFile } from "../src/snapshot.js";
 import { appendDay, readState } from "../src/state.js";
@@ -786,15 +786,32 @@ function formatDegradedTemplateBlock(template: PostParagraphs): string {
 }
 
 /**
- * facts stay pinned to the fixture's own numbers for every step — only the
- * date advances, one day per run.
- *
+ * red/green/total/swarmState/btc/winners/losers stay pinned to the fixture's
+ * own snapshot numbers for every step — only the date advances, one day per
+ * run, same market conditions repeating. streak/prevState do NOT stay
+ * pinned: each step re-derives them from `chainHistory` via the real
+ * computeFacts() (same function production calls), the same way a real day
+ * over day would — swarmState matching the previous recorded day increments
+ * streak, prevState is that previous day's swarmState. Getting this from a
+ * one-off computeFacts({ days: [] }) call and reusing its streak/prevState
+ * for every step (the pre-fix behavior) always gave streak=1/prevState=null
+ * on every single step, contradicting production the moment a chain ran
+ * past day 1. Noon Moscow time on todayKey — unambiguously that calendar
+ * day regardless of DST (Moscow has had none since 2014), so
+ * computeFacts's own moscowDateKey(ts) round-trips to exactly todayKey.
+ */
+export function computeChainStepFacts(snapshot: HotCoinsSnapshot, todayKey: string, chainHistory: StateHistory): Facts {
+	return computeFacts({ ...snapshot, ts: `${todayKey}T12:00:00+03:00` }, chainHistory);
+}
+
+/**
  * A step that's rejected, fails in transport, or is force-degraded via
  * --chain-degrade is recorded exactly like a real degraded production day
  * is (see index.ts's state-write and stateHistoryToAiHistory()): template
  * text via buildParagraphs(facts), source: "template", still appended to
- * history — never a hole. A real degraded day still publishes and still
- * gets recorded; the model reading tomorrow's history has no way to tell
+ * history — never a hole, so a degraded day never breaks the streak either
+ * (the swarm was still the same swarm that day, template text or not). The
+ * model reading tomorrow's history has no way to tell
  * that text apart from AI prose (stateHistoryToAiHistory() strips `source`
  * before it ever reaches the payload), so the chain has to carry that
  * forward too, not skip the day, to actually model production.
@@ -809,7 +826,7 @@ async function runChainForFixture(
 	priceOutPerMillion: number | null,
 	forcedDegradeSteps: Set<number>,
 ): Promise<{ sections: string[]; runs: FixtureRun[] }> {
-	const { facts: baseFacts } = loadSnapshotAndFacts(fixtureName, { days: [] });
+	const { snapshot, facts: baseFacts } = loadSnapshotAndFacts(fixtureName, { days: [] });
 	const system = buildSystemPrompt();
 
 	let chainHistory: StateHistory = { days: [] };
@@ -845,7 +862,7 @@ async function runChainForFixture(
 
 	for (let k = 1; k <= chainLength; k++) {
 		const todayKey = shiftDateKey(baseFacts.dateKey, k - 1);
-		const facts: Facts = { ...baseFacts, dateKey: todayKey, dateLabel: dateKeyToLabel(todayKey) };
+		const facts: Facts = computeChainStepFacts(snapshot, todayKey, chainHistory);
 
 		if (forcedDegradeSteps.has(k)) {
 			process.stdout.write(`[ai:compare] ${fixtureName} chain ${k}/${chainLength}... `);
