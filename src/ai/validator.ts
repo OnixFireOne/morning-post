@@ -133,6 +133,14 @@ const HASHTAG_RE = /#[\p{L}\p{N}_]+/u;
 const URL_RE = /https?:\/\/|www\./iu;
 const HTML_TAG_RE = /<\/?[a-z][^>]*>/iu;
 const EMOJI_RE = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
+// Opus 5 wrote "mixed-сигнал говорит о том, что…" — the model's own input
+// field value (facts.swarmState is literally "mixed") leaked straight into
+// prose as an English adjective. Cheaper to catch here than to grow the
+// system prompt over it: it's already at 3960 of a 4000-char norm (see
+// tools/ai-compare.ts's SYSTEM_PROMPT_NORM_MAX_CHARS), and every new prompt
+// rule costs input tokens on every single future request forever, while a
+// validator pattern costs nothing until it actually fires.
+const AI_FIELD_LEAK_RE = new RegExp(`${NOT_WORD_BEFORE}(?:green|red|mixed|swarmState|streak)${NOT_WORD_AFTER}`, "iu");
 
 const FORBIDDEN_PATTERNS: readonly { re: RegExp; label: string; stripTickers?: boolean }[] = [
 	{ re: FORECAST_RE, label: "forecast language" },
@@ -148,6 +156,9 @@ const FORBIDDEN_PATTERNS: readonly { re: RegExp; label: string; stripTickers?: b
 	// pattern itself stays exactly as strict, only what it's tested against
 	// changes.
 	{ re: HTML_TAG_RE, label: "HTML tag", stripTickers: true },
+	// Same reasoning: a ticker that happens to spell "RED"/"GREEN"/etc. must
+	// not sink an otherwise-valid response either.
+	{ re: AI_FIELD_LEAK_RE, label: "English field name/value (green/red/mixed/swarmState/streak) leaked into prose", stripTickers: true },
 	// The template's own paragraphs never use emoji — no established "allowed
 	// set" exists for prose, so any emoji at all is out until one is defined.
 	{ re: EMOJI_RE, label: "emoji" },

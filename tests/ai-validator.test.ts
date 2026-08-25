@@ -106,6 +106,35 @@ describe("validateAiParagraphs: item 3 strips leader tickers before the HTML-tag
 	});
 });
 
+describe("validateAiParagraphs: item 3 rejects leaked English field names/values (green/red/mixed/swarmState/streak)", () => {
+	it("rejects swarmState's own value used as an English adjective in prose", () => expectRejected("english-field-leak", "validator:forbidden_pattern"));
+
+	it("still accepts a ticker that happens to spell one of the banned words, after stripKnownTickers", () => {
+		// Same technique as the HTML-tag ticker test above — a real ticker
+		// could plausibly be "RED" or similar; stripping the day's own tickers
+		// first must keep this from sinking an otherwise-valid response.
+		const tickerPayload = buildAiPayload(specExampleFacts({ winners: [{ id: "red-token", ticker: "RED", change24h: 18, price: 1, marketCap: null }] }), []);
+		const text = JSON.stringify({
+			picture: "Рой красный: RED вырвался в лидеры среди немногих растущих монет.",
+			observation: "Биток держится спокойно, паники на рынке нет совсем.",
+			direction: "red",
+		});
+		const result = validateAiParagraphs(text, tickerPayload);
+		expect(result.ok).toBe(true);
+	});
+
+	it.each(["green", "Red", "MIXED", "swarmState", "Streak"])("rejects the bare word %s regardless of case", (word) => {
+		const text = JSON.stringify({
+			picture: `Рой сегодня в состоянии ${word}, судя по общей картине.`,
+			observation: "Биток держится спокойно, паники на рынке нет совсем.",
+			direction: "red",
+		});
+		const result = validateAiParagraphs(text, payload);
+		expect(result.ok, `expected "${word}" to be rejected`).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:forbidden_pattern");
+	});
+});
+
 describe("validateAiParagraphs: item 9 (derived numbers in words) vs item 7 (day-count digit) don't collide", () => {
 	it("accepts an ordinal day-count word that shares the 'треть-' prefix with the fraction word треть", () => {
 		// "третьи" (agreeing with "сутки", a plural-only noun — "третий сутки"
