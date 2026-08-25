@@ -4,7 +4,10 @@
 // by index.ts or by any test, and lives outside tsconfig's "include" (src,
 // tests only) so it never becomes part of the production build or its
 // typecheck. Run manually: `npm run ai:compare -- <fixture>|--all [--runs=N]
-// [--model=<id>] [--balance=N]`.
+// [--chain=N] [--model=<id>] [--balance=N]`. --chain and --runs are
+// mutually exclusive: --runs=N samples the same single day N independent
+// times, --chain=N runs N sequential days where each day's own output feeds
+// the next day's history — see runChain() below.
 //
 // Retries and fallback are turned off on purpose: one request is one attempt,
 // full stop. buildParagraphsAI()'s retry/fallback loop exists to *hide* a
@@ -34,10 +37,10 @@ import { buildAiPayload, stateHistoryToAiHistory, type AiPayload } from "../src/
 import { buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
 import { computeCost } from "../src/ai/usage.js";
 import { validateAiParagraphs, type ValidationFailureReason } from "../src/ai/validator.js";
-import { computeFacts, type Facts, type StateHistory } from "../src/facts.js";
+import { computeFacts, dateKeyToLabel, shiftDateKey, type Facts, type StateHistory } from "../src/facts.js";
 import { buildParagraphs, type PostParagraphs } from "../src/render.js";
 import { loadSnapshotFromFile } from "../src/snapshot.js";
-import { readState } from "../src/state.js";
+import { appendDay, readState } from "../src/state.js";
 import type { HotCoinsSnapshot } from "../src/types.js";
 
 const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -452,6 +455,146 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 	console.log(`[ai:compare] wrote ${opts.outFile}`);
 }
 
+// --- --chain=N: anti-repeat mode. Same fixture, N runs in a row, each run's
+// own output feeding into the next run's history — exactly the day-over-day
+// situation the anti-repeat prompt rule is supposed to handle, instead of
+// N independent samples of the same single day (what --runs=N gives). No
+// validator change: repeated phrasing is a style problem, not a factual one,
+// so this only ever surfaces it for a human to read, never rejects it. ---
+
+export type ChainOptions = {
+	client: AiClient;
+	modelId: string;
+	priceInPerMillion: number | null;
+	priceOutPerMillion: number | null;
+	fixtureNames: string[];
+	chainLength: number;
+	timeoutMs: number;
+	promptVersion: number;
+	balance: number;
+	outFile: string;
+};
+
+type ChainStep = { run: number; dateLabel: string; picture: string | null; observation: string | null };
+
+/** First few words of a paragraph — enough to spot a repeated opening by eye, not a full sentence. */
+function leadIn(text: string, wordCount = 6): string {
+	const words = text.trim().split(/\s+/);
+	const lead = words.slice(0, wordCount).join(" ");
+	return words.length > wordCount ? `${lead}…` : lead;
+}
+
+/** Grows by one row each chain step — printed after every run but the first, so all prior lead-ins stay visible without scrolling back. */
+function formatLeadInTable(steps: ChainStep[]): string {
+	const lines = ["**Завязки по цепочке (picture / observation) — для сравнения глазами, без автоматического вердикта:**"];
+	for (const step of steps) {
+		if (step.picture === null || step.observation === null) {
+			lines.push(`- прогон ${step.run} (${step.dateLabel}): — (отказ/сбой на этом шаге, текста нет)`);
+		} else {
+			lines.push(`- прогон ${step.run} (${step.dateLabel}): «${leadIn(step.picture)}» / «${leadIn(step.observation)}»`);
+		}
+	}
+	return lines.join("\n");
+}
+
+/**
+ * facts stay pinned to the fixture's own numbers for every step — only the
+ * date advances, one day per run. A run whose response is rejected or fails
+ * in transport contributes nothing to the next step's history (matches
+ * stateHistoryToAiHistory()'s own treatment of a day with no stored text: a
+ * hole, not an empty string) — the chain still continues to the next date.
+ */
+async function runChainForFixture(
+	fixtureName: string,
+	chainLength: number,
+	client: AiClient,
+	modelId: string,
+	timeoutMs: number,
+	priceInPerMillion: number | null,
+	priceOutPerMillion: number | null,
+): Promise<{ sections: string[]; runs: FixtureRun[] }> {
+	const { facts: baseFacts } = loadSnapshotAndFacts(fixtureName, { days: [] });
+	const system = buildSystemPrompt();
+
+	let chainHistory: StateHistory = { days: [] };
+	const steps: ChainStep[] = [];
+	const runs: FixtureRun[] = [];
+	const sections: string[] = [
+		[
+			`## ${fixtureName} — цепочка из ${chainLength}`,
+			"",
+			`- swarmState (зафиксировано по всей цепочке): ${baseFacts.swarmState}`,
+			`- Факты (числа) одни и те же каждый шаг — меняется только дата, как при одинаковом рынке несколько дней подряд.`,
+		].join("\n"),
+	];
+
+	for (let k = 1; k <= chainLength; k++) {
+		const todayKey = shiftDateKey(baseFacts.dateKey, k - 1);
+		const facts: Facts = { ...baseFacts, dateKey: todayKey, dateLabel: dateKeyToLabel(todayKey) };
+		const aiHistory = stateHistoryToAiHistory(chainHistory, todayKey);
+		const payload = buildAiPayload(facts, aiHistory);
+		const user = buildUserPrompt(payload);
+
+		process.stdout.write(`[ai:compare] ${fixtureName} chain ${k}/${chainLength}... `);
+		const outcome = await runOne(client, modelId, system, user, timeoutMs, payload, priceInPerMillion, priceOutPerMillion);
+		console.log(outcome.kind === "accepted" ? "ok" : outcome.kind === "rejected" ? `rejected (${outcome.reason})` : `transport (${outcome.label})`);
+
+		const fr: FixtureRun = { fixtureName, run: k, outcome };
+		runs.push(fr);
+		const sectionParts = [formatRunSection(fr, chainLength, priceInPerMillion, priceOutPerMillion)];
+
+		if (outcome.kind === "accepted") {
+			chainHistory = appendDay(chainHistory, {
+				date: todayKey,
+				swarmState: facts.swarmState,
+				btcChange: facts.btc?.change24h ?? null,
+				postedAt: new Date().toISOString(),
+				messageId: 0,
+				picture: outcome.picture,
+				observation: outcome.observation,
+				source: "ai",
+			});
+			steps.push({ run: k, dateLabel: facts.dateLabel, picture: outcome.picture, observation: outcome.observation });
+		} else {
+			steps.push({ run: k, dateLabel: facts.dateLabel, picture: null, observation: null });
+		}
+
+		if (k > 1) sectionParts.push(formatLeadInTable(steps));
+		sections.push(sectionParts.join("\n\n"));
+	}
+
+	return { sections, runs };
+}
+
+export async function runChain(opts: ChainOptions): Promise<void> {
+	const allSections: string[] = [];
+	const allRuns: FixtureRun[] = [];
+
+	for (const fixtureName of opts.fixtureNames) {
+		const { sections, runs } = await runChainForFixture(fixtureName, opts.chainLength, opts.client, opts.modelId, opts.timeoutMs, opts.priceInPerMillion, opts.priceOutPerMillion);
+		allSections.push(...sections);
+		allRuns.push(...runs);
+	}
+
+	const header = [
+		`# ai:compare --chain=${opts.chainLength} — ${opts.modelId}`,
+		"",
+		`- Дата запуска: ${new Date().toISOString()}`,
+		`- PROMPT_VERSION: ${opts.promptVersion}`,
+		`- Фикстур: ${opts.fixtureNames.length}, длина цепочки: ${opts.chainLength}, всего прогонов: ${opts.fixtureNames.length * opts.chainLength}`,
+		"- Режим анти-повтора: вывод каждого прогона уходит в history следующего, тем же способом, что stateHistoryToAiHistory() строит его в бою; дата сдвигается на день вперёд за прогон, факты (числа) зафиксированы — та же фикстура каждый раз.",
+		"- Ретраи и фолбэк отключены, как и в обычном режиме — один запрос это одна попытка.",
+		"- Стоимость везде в кредитах прокси (1 кредит = 50 000 токенов), не в $ — см. AI_PRICE_IN/AI_PRICE_OUT в .env.",
+		"- Завязки первых предложений — материал для взгляда человека, не автоматический вердикт: валидатор на повтор формулировок не расширялся, это вопрос стиля, а не фактической ошибки.",
+	].join("\n");
+
+	const report = [header, ...allSections, formatSummary(allRuns, opts.balance)].join("\n\n");
+
+	mkdirSync(path.dirname(opts.outFile), { recursive: true });
+	writeFileSync(opts.outFile, report);
+	console.log(`[ai:compare] wrote ${opts.outFile}`);
+}
+
 // --- CLI entry point ---
 
 function readEnv() {
@@ -471,7 +614,7 @@ function readEnv() {
 	};
 }
 
-type CliArgs = { fixtureNames: string[]; runs: number; model: string | null; balance: number };
+type CliArgs = { fixtureNames: string[]; runs: number; chain: number | null; model: string | null; balance: number };
 
 function normalizeFixtureName(name: string): string {
 	const base = name.endsWith(".json") ? name.slice(0, -".json".length) : name;
@@ -481,6 +624,8 @@ function normalizeFixtureName(name: string): string {
 function parseCliArgs(argv: string[]): CliArgs {
 	let fixtureArg: string | null = null;
 	let runs = 1;
+	let runsExplicit = false;
+	let chain: number | null = null;
 	let model: string | null = null;
 	let balance = 1000;
 
@@ -489,6 +634,9 @@ function parseCliArgs(argv: string[]): CliArgs {
 			fixtureArg = "--all";
 		} else if (arg.startsWith("--runs=")) {
 			runs = Number(arg.slice("--runs=".length));
+			runsExplicit = true;
+		} else if (arg.startsWith("--chain=")) {
+			chain = Number(arg.slice("--chain=".length));
 		} else if (arg.startsWith("--model=")) {
 			model = arg.slice("--model=".length);
 		} else if (arg.startsWith("--balance=")) {
@@ -501,17 +649,23 @@ function parseCliArgs(argv: string[]): CliArgs {
 	}
 
 	if (!fixtureArg) {
-		throw new Error("usage: npm run ai:compare -- <fixture-name>|--all [--runs=N] [--model=<id>] [--balance=N]");
+		throw new Error("usage: npm run ai:compare -- <fixture-name>|--all [--runs=N] [--chain=N] [--model=<id>] [--balance=N]");
+	}
+	if (chain !== null && runsExplicit) {
+		throw new Error("--chain and --runs are mutually exclusive — --chain implies one sequential run per step, not N independent samples");
 	}
 	if (!Number.isInteger(runs) || runs < 1) {
 		throw new Error(`--runs must be a positive integer, got: ${runs}`);
+	}
+	if (chain !== null && (!Number.isInteger(chain) || chain < 1)) {
+		throw new Error(`--chain must be a positive integer, got: ${chain}`);
 	}
 	if (!Number.isFinite(balance)) {
 		throw new Error(`--balance must be a number, got: ${balance}`);
 	}
 
 	const fixtureNames = fixtureArg === "--all" ? ALL_FIXTURE_NAMES : [normalizeFixtureName(fixtureArg)];
-	return { fixtureNames, runs, model, balance };
+	return { fixtureNames, runs, chain, model, balance };
 }
 
 function sanitizeForFilename(s: string): string {
@@ -550,7 +704,24 @@ async function main() {
 	// out/'s own cleanup rule (age-based file deletion, never removing the
 	// directory) doesn't distinguish a report worth keeping from a stale
 	// *.ai.json debug dump.
-	const outFile = path.join(REPO_ROOT, "reports", `compare-${today}-${sanitizeForFilename(modelId)}.md`);
+	const chainSuffix = args.chain !== null ? `-chain${args.chain}` : "";
+	const outFile = path.join(REPO_ROOT, "reports", `compare-${today}-${sanitizeForFilename(modelId)}${chainSuffix}.md`);
+
+	if (args.chain !== null) {
+		await runChain({
+			client,
+			modelId,
+			priceInPerMillion,
+			priceOutPerMillion,
+			fixtureNames: args.fixtureNames,
+			chainLength: args.chain,
+			timeoutMs: env.timeoutMs,
+			promptVersion: env.promptVersion,
+			balance: args.balance,
+			outFile,
+		});
+		return;
+	}
 
 	await runCompare({
 		client,
