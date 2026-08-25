@@ -4,6 +4,7 @@
 // post uses, so the model's job is to copy, not to compute or round.
 import { dateKeyToLabel, type Facts, type StateHistory, type SwarmState } from "../facts.js";
 import { formatBtcPercent, formatBtcPrice, formatMagnitude, formatSignedPercent } from "../format.js";
+import { NUMBER_TOKEN_RE } from "./validator.js";
 
 const MAX_HISTORY_DAYS_FOR_AI = 3;
 
@@ -62,6 +63,27 @@ export function collectAllowedNumbers(today: AiTodayPayload): string[] {
 }
 
 /**
+ * history text is shown to the model purely for anti-repeat style/structure
+ * — never for citing (section 3.1: history's own numbers never enter
+ * allowedNumbers, and a model pulling yesterday's count into today's
+ * paragraph is a validator rejection). Redacting the actual digits out of
+ * it removes the temptation to reuse an old day's specific numbers while
+ * still showing the sentence shape to avoid repeating. Doesn't touch
+ * tickers — this only matches digit-based tokens (NUMBER_TOKEN_RE, the same
+ * pattern the validator itself uses), and every real ticker in this
+ * project's data is purely alphabetic (TRAC, BTC, PI, ENA...), so there's
+ * nothing for it to collide with. Only affects the payload built here —
+ * state.json and facts.jsonl keep the original, unredacted text.
+ */
+function redactHistoryNumbers(entry: AiHistoryEntry): AiHistoryEntry {
+	return {
+		...entry,
+		picture: entry.picture.replace(NUMBER_TOKEN_RE, "…"),
+		observation: entry.observation.replace(NUMBER_TOKEN_RE, "…"),
+	};
+}
+
+/**
  * Pure. Same fixtures as the template version can feed this — computeFacts()
  * is untouched by v2, so any snapshot fixture already produces a valid Facts.
  */
@@ -89,7 +111,7 @@ export function buildAiPayload(facts: Facts, history: AiHistoryEntry[]): AiPaylo
 		maxAbsLeaderChange: facts.maxAbsLeaderChange,
 	};
 
-	return { today, history, allowedNumbers: collectAllowedNumbers(today) };
+	return { today, history: history.map(redactHistoryNumbers), allowedNumbers: collectAllowedNumbers(today) };
 }
 
 /**

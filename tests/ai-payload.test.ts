@@ -69,16 +69,60 @@ describe("buildAiPayload: section 3's worked example", () => {
 		expect(payload.allowedNumbers).not.toContain("5");
 	});
 
-	it("passes history through untouched — its numbers never enter allowedNumbers", () => {
+	it("passes history's dateLabel/swarmState through untouched, but redacts its own numbers — they never enter allowedNumbers either", () => {
 		const history: AiHistoryEntry[] = [
 			{ dateLabel: "22 августа", swarmState: "green", picture: "133 монеты выросли вчера.", observation: "Всё зелено." },
 		];
 		const payload = buildAiPayload(specExampleFacts(), history);
-		expect(payload.history).toEqual(history);
+		expect(payload.history).toEqual([{ dateLabel: "22 августа", swarmState: "green", picture: "… монеты выросли вчера.", observation: "Всё зелено." }]);
 		// "133" from yesterday's picture text must not leak in as if it were today's —
 		// it already is today's red count here, so assert on a number that ISN'T:
 		const historyOnlyNumber = "999";
 		expect(payload.allowedNumbers).not.toContain(historyOnlyNumber);
+	});
+});
+
+describe("buildAiPayload: history numbers are redacted before reaching the payload", () => {
+	it("replaces every number token (plain, percent, dollar, signed, comma-grouped) with an ellipsis in both picture and observation", () => {
+		const history: AiHistoryEntry[] = [
+			{
+				dateLabel: "22 августа",
+				swarmState: "green",
+				picture: "Рой вырос: 60 монет из $1,234 капитализации против 6 падающих.",
+				observation: "Биток прибавил +8.40%, а лидер вырос на 43%.",
+			},
+		];
+		const payload = buildAiPayload(specExampleFacts(), history);
+		expect(payload.history[0]!.picture).toBe("Рой вырос: … монет из … капитализации против … падающих.");
+		expect(payload.history[0]!.observation).toBe("Биток прибавил …, а лидер вырос на ….");
+	});
+
+	it("leaves tickers alone — every real ticker in this project is purely alphabetic, so nothing collides", () => {
+		const history: AiHistoryEntry[] = [
+			{ dateLabel: "22 августа", swarmState: "red", picture: "TRAC вырвался в лидеры с ростом 18%.", observation: "PI остаётся антигероем." },
+		];
+		const payload = buildAiPayload(specExampleFacts(), history);
+		expect(payload.history[0]!.picture).toBe("TRAC вырвался в лидеры с ростом ….");
+		expect(payload.history[0]!.observation).toBe("PI остаётся антигероем.");
+	});
+
+	it("doesn't mutate the caller's history array or its entries", () => {
+		const history: AiHistoryEntry[] = [{ dateLabel: "22 августа", swarmState: "green", picture: "133 монеты выросли вчера.", observation: "Всё зелено." }];
+		const original = JSON.parse(JSON.stringify(history)) as AiHistoryEntry[];
+		buildAiPayload(specExampleFacts(), history);
+		expect(history).toEqual(original);
+	});
+
+	it("leaves dateLabel and swarmState untouched — only picture/observation text is redacted", () => {
+		const history: AiHistoryEntry[] = [{ dateLabel: "22 августа", swarmState: "mixed", picture: "133 монеты выросли вчера.", observation: "Всё спокойно." }];
+		const payload = buildAiPayload(specExampleFacts(), history);
+		expect(payload.history[0]!.dateLabel).toBe("22 августа");
+		expect(payload.history[0]!.swarmState).toBe("mixed");
+	});
+
+	it("handles an empty history array without error", () => {
+		const payload = buildAiPayload(specExampleFacts(), []);
+		expect(payload.history).toEqual([]);
 	});
 });
 

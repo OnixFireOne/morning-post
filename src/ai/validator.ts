@@ -32,7 +32,8 @@ export type ValidationResult = { ok: true; paragraphs: AiParagraphs } | { ok: fa
 // it) — `[\d,]*` alone also swallows a trailing sentence comma ("133,"
 // right before "растут"), producing a token that can never match anything
 // in allowedNumbers.
-const NUMBER_TOKEN_RE = /[+−-]?\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?/gu;
+/** Exported for payload.ts's history redaction — same token shape, reused rather than duplicated. validator.ts's own import of AiPayload from payload.js is type-only (erased at compile time), so this doesn't create a real runtime circular dependency. */
+export const NUMBER_TOKEN_RE = /[+−-]?\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?/gu;
 
 /** U+2212 (typographic minus, house style) and ASCII "-" must compare equal — a model has no reason to know about U+2212. */
 function normalizeMinus(s: string): string {
