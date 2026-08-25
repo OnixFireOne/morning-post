@@ -9,6 +9,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "typecheck:tools": "tsc -p tsconfig.tools.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "fixtures:gen": "node tools/gen-fixtures.mjs",
