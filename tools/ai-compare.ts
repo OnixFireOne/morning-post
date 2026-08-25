@@ -89,7 +89,7 @@ const HISTORY_ALLOWED_KEYS = new Set(["dateLabel", "swarmState", "picture", "obs
  */
 const PROXY_INPUT_TOKEN_OVERHEAD = 2539;
 
-/** Section 5's six checks plus item 7 (streak digit) and item 9 (derived numbers in words, both added after 24.08 — see validator.ts's own comments) and the pre-check for invalid JSON. */
+/** Section 5's six checks plus item 7 (streak digit), item 9 (derived numbers in words), item 10 (word-form streak vs facts.streak — all three added after 24.08, see validator.ts's own comments) and the pre-check for invalid JSON. */
 const VALIDATOR_ITEM_LABELS: Record<ValidationFailureReason, string> = {
 	invalid_json: "невалидный JSON (до проверок раздела 5)",
 	"validator:numbers": "п.1 числа",
@@ -100,6 +100,7 @@ const VALIDATOR_ITEM_LABELS: Record<ValidationFailureReason, string> = {
 	"validator:streak_digit": "п.7 цифра в счёте дней",
 	"validator:language": "п.6 язык",
 	"validator:derived_numbers": "п.9 кратности/доли словами",
+	"validator:streak_word_mismatch": "п.10 счёт дней словом ≠ streak",
 };
 
 type RunOutcome =

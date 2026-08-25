@@ -16,7 +16,8 @@ export type ValidationFailureReason =
 	| "validator:empty_or_cutoff"
 	| "validator:streak_digit"
 	| "validator:language"
-	| "validator:derived_numbers";
+	| "validator:derived_numbers"
+	| "validator:streak_word_mismatch";
 
 export type AiParagraphs = {
 	picture: string;
@@ -88,6 +89,72 @@ const DIGIT_DAY_COUNT_RE = new RegExp(`${NOT_WORD_BEFORE}\\d+(?!\\d)\\s*-?\\s*(?
 function findDigitDayCount(text: string): string | null {
 	const match = text.match(DIGIT_DAY_COUNT_RE);
 	return match ? match[0] : null;
+}
+
+// --- item 10: word-form (ordinal) day-streak vs facts.streak. Independent of
+// item 7 above: item 7 bans ANY digit next to a day-word, correct or not, but
+// never looks at word forms at all — a model can satisfy item 7 perfectly
+// while still lying with a word.
+//
+// Found on a live green --chain=3 run: facts.streak was pinned at 1 every
+// step (same fixture, only the date advances), and step 1 correctly wrote
+// "первый зелёный день" — but steps 2 and 3 wrote "второй день подряд" and
+// "Третий зелёный день подряд". The model was counting entries in `history`,
+// not reading facts.streak. In production that's silently wrong the moment a
+// streak actually resets: two green days with one red day between them reset
+// streak to 1, but a model counting history length instead would still call
+// the second green day "третий день подряд" (its third mention of green in
+// the recent history, not its actual streak).
+//
+// "третий" is the one irregular (soft-stem) ordinal among 1st-10th — see item
+// 9's own DERIVED_NUMBER_WORDS_RE comment above on why the fraction word
+// "треть" is matched as a bare word only, never stem-expanded: every
+// inflected form of "третий" (третьего, третьему, третьим, третьем, третья,
+// третьи...) starts with "треть" + a vowel/consonant. This alternation is
+// that same constraint from the other side: it must match every "3rd" form
+// without ever matching bare "треть" — which it can't, because "треть" alone
+// has nothing following the stem, and every suffix below is non-empty.
+const THIRD_ORDINAL_SUFFIX_ALT = "(?:ий|ьего|ьему|ьем|ья|ьей|ье|ьи|ьих|ьим|ьими)";
+const HARD_ORDINAL_SUFFIX_ALT = "(?:ый|ой|ого|ому|ым|ом|ая|ую|ое|ые|ых|ыми)";
+
+const ORDINAL_DAY_STEMS: readonly { stem: string; suffixAlt: string; value: number }[] = [
+	{ stem: "перв", suffixAlt: HARD_ORDINAL_SUFFIX_ALT, value: 1 },
+	{ stem: "втор", suffixAlt: HARD_ORDINAL_SUFFIX_ALT, value: 2 },
+	{ stem: "трет", suffixAlt: THIRD_ORDINAL_SUFFIX_ALT, value: 3 },
+	{ stem: "четвёрт", suffixAlt: HARD_ORDINAL_SUFFIX_ALT, value: 4 },
+	{ stem: "пят", suffixAlt: HARD_ORDINAL_SUFFIX_ALT, value: 5 },
+	{ stem: "шест", suffixAlt: HARD_ORDINAL_SUFFIX_ALT, value: 6 },
+	{ stem: "седьм", suffixAlt: HARD_ORDINAL_SUFFIX_ALT, value: 7 },
+	{ stem: "восьм", suffixAlt: HARD_ORDINAL_SUFFIX_ALT, value: 8 },
+	{ stem: "девят", suffixAlt: HARD_ORDINAL_SUFFIX_ALT, value: 9 },
+	{ stem: "десят", suffixAlt: HARD_ORDINAL_SUFFIX_ALT, value: 10 },
+];
+
+// A short adjective can sit between the ordinal and the day-word ("первый
+// зелёный день") — same tolerance FORECAST_RE already gives "завтра...курс"
+// above; a character window, not a hard word count.
+const ORDINAL_DAY_GAP = ".{0,20}?";
+const DAY_WORD_ALT = "(?:день|дня|сутки)";
+
+const ORDINAL_DAY_RE = new RegExp(
+	`${NOT_WORD_BEFORE}(${ORDINAL_DAY_STEMS.map(({ stem, suffixAlt }) => `${stem}${suffixAlt}`).join("|")})${NOT_WORD_AFTER}${ORDINAL_DAY_GAP}${DAY_WORD_ALT}${NOT_WORD_AFTER}`,
+	"giu",
+);
+
+function ordinalWordValue(word: string): number | null {
+	const lower = word.toLowerCase();
+	for (const { stem, suffixAlt, value } of ORDINAL_DAY_STEMS) {
+		if (new RegExp(`^${stem}${suffixAlt}$`, "u").test(lower)) return value;
+	}
+	return null;
+}
+
+function findStreakWordMismatch(text: string, streak: number): string | null {
+	for (const match of text.matchAll(ORDINAL_DAY_RE)) {
+		const value = ordinalWordValue(match[1]!);
+		if (value !== null && value !== streak) return match[0];
+	}
+	return null;
 }
 
 // --- item 9: derived numbers spoken as words — a ratio or fraction the model
@@ -212,8 +279,9 @@ function endsLikeASentence(text: string): boolean {
 /**
  * Section 5, checks in this order (first failure wins — order doesn't change
  * correctness, each check is independent): parse -> non-empty/not cut off ->
- * length -> forbidden content -> direction -> streak-as-day-count ->
- * derived-number-words -> number whitelist -> language.
+ * length -> forbidden content -> direction -> streak-as-digit ->
+ * streak-as-mismatched-ordinal-word -> derived-number-words -> number
+ * whitelist -> language.
  */
 export function validateAiParagraphs(rawText: string, payload: AiPayload): ValidationResult {
 	const parsed = parseAiJson(rawText);
@@ -245,6 +313,9 @@ export function validateAiParagraphs(rawText: string, payload: AiPayload): Valid
 
 	const digitDayCount = findDigitDayCount(combined);
 	if (digitDayCount) return { ok: false, reason: "validator:streak_digit", detail: `"${digitDayCount}" — day-streak must be spoken as a word, never a digit` };
+
+	const streakWordMismatch = findStreakWordMismatch(combined, payload.today.streak);
+	if (streakWordMismatch) return { ok: false, reason: "validator:streak_word_mismatch", detail: `"${streakWordMismatch}" — ordinal day-count in words doesn't match facts.streak (${payload.today.streak})` };
 
 	const derivedNumberWords = findDerivedNumberWords(combined);
 	if (derivedNumberWords) return { ok: false, reason: "validator:derived_numbers", detail: `"${derivedNumberWords}" — a ratio/fraction in words is a self-computed number, not a copy from allowedNumbers` };
