@@ -4,10 +4,13 @@
 // by index.ts or by any test, and lives outside tsconfig's "include" (src,
 // tests only) so it never becomes part of the production build or its
 // typecheck. Run manually: `npm run ai:compare -- <fixture>|--all [--runs=N]
-// [--chain=N] [--model=<id>] [--balance=N]`. --chain and --runs are
-// mutually exclusive: --runs=N samples the same single day N independent
-// times, --chain=N runs N sequential days where each day's own output feeds
-// the next day's history — see runChain() below.
+// [--chain=N] [--chain-degrade=K[,K...]] [--model=<id>] [--balance=N]`.
+// --chain and --runs are mutually exclusive: --runs=N samples the same
+// single day N independent times, --chain=N runs N sequential days where
+// each day's own output feeds the next day's history — see runChain()
+// below. --chain-degrade=K forces step K onto the template path with zero
+// model calls, for testing "day after a degraded day" on demand instead of
+// waiting for a real rejection/timeout.
 //
 // Retries and fallback are turned off on purpose: one request is one attempt,
 // full stop. buildParagraphsAI()'s retry/fallback loop exists to *hide* a
@@ -123,9 +126,16 @@ type RunOutcome =
 			costEstimate: number | null;
 			rawUsage: unknown;
 	  }
-	| { kind: "transport"; label: string; errorMessage: string | null; durationMs: number };
+	| { kind: "transport"; label: string; errorMessage: string | null; durationMs: number }
+	// --chain-degrade only: this step deliberately skipped the model entirely
+	// (no client.generate() call at all) to force a degraded day on demand,
+	// instead of waiting for a real rejection/timeout to happen naturally.
+	| { kind: "forced"; template: PostParagraphs };
 
 type FixtureRun = { fixtureName: string; run: number; outcome: RunOutcome };
+
+/** What a real model call can produce — "forced" is never one of runOne()'s own results, it's only ever constructed directly by --chain-degrade's own branch, which skips runOne() entirely. */
+type RunOneOutcome = Extract<RunOutcome, { kind: "accepted" } | { kind: "rejected" } | { kind: "transport" }>;
 
 export type CompareOptions = {
 	client: AiClient;
@@ -185,7 +195,7 @@ async function runOne(
 	payload: AiPayload,
 	priceInPerMillion: number | null,
 	priceOutPerMillion: number | null,
-): Promise<RunOutcome> {
+): Promise<RunOneOutcome> {
 	const result = await client.generate({ model: modelId, system, user, timeoutMs });
 
 	if (!result.ok) {
@@ -307,6 +317,21 @@ function formatRunSection(fr: FixtureRun, totalRuns: number, priceInPerMillion: 
 		return [header, "", `- Вердикт: ⚠️ transport — ${outcome.label}${outcome.errorMessage ? ` (${outcome.errorMessage})` : ""}`, `- Время ответа: ${outcome.durationMs} ms`, `- Токены: н/д`].join("\n");
 	}
 
+	if (outcome.kind === "forced") {
+		return [
+			header,
+			"",
+			"- Вердикт: 🔧 принудительная деградация (--chain-degrade) — запроса к модели не было",
+			"- Токены: н/д",
+			"",
+			"**Абзац 1 (picture, шаблон):**",
+			`> ${outcome.template.picture}`,
+			"",
+			"**Абзац 2 (observation, шаблон):**",
+			`> ${outcome.template.observation}`,
+		].join("\n");
+	}
+
 	const tokensLine = `- Токены: in=${outcome.tokensIn ?? "н/д"} out=${outcome.tokensOut ?? "н/д"}`;
 	const timeLine = `- Время ответа: ${outcome.durationMs} ms`;
 	const costLine = formatCostLine(outcome.costEstimate);
@@ -357,6 +382,7 @@ function formatSummary(runs: FixtureRun[], balance: number): string {
 	const accepted = runs.filter((r) => r.outcome.kind === "accepted");
 	const rejected = runs.filter((r): r is FixtureRun & { outcome: Extract<RunOutcome, { kind: "rejected" }> } => r.outcome.kind === "rejected");
 	const transport = runs.filter((r): r is FixtureRun & { outcome: Extract<RunOutcome, { kind: "transport" }> } => r.outcome.kind === "transport");
+	const forced = runs.filter((r): r is FixtureRun & { outcome: Extract<RunOutcome, { kind: "forced" }> } => r.outcome.kind === "forced");
 
 	const byReason = new Map<string, number>();
 	for (const r of rejected) {
@@ -367,8 +393,11 @@ function formatSummary(runs: FixtureRun[], balance: number): string {
 		const label = `transport: ${r.outcome.label}`;
 		byReason.set(label, (byReason.get(label) ?? 0) + 1);
 	}
+	if (forced.length > 0) {
+		byReason.set("forced (--chain-degrade)", forced.length);
+	}
 
-	const withTokens = runs.filter((r): r is FixtureRun & { outcome: Extract<RunOutcome, { kind: "accepted" | "rejected" }> } => r.outcome.kind !== "transport");
+	const withTokens = runs.filter((r): r is FixtureRun & { outcome: Extract<RunOutcome, { kind: "accepted" | "rejected" }> } => r.outcome.kind === "accepted" || r.outcome.kind === "rejected");
 	const tokensInList = withTokens.map((r) => r.outcome.tokensIn).filter((t): t is number => t !== null);
 	const tokensOutList = withTokens.map((r) => r.outcome.tokensOut).filter((t): t is number => t !== null);
 	const avg = (nums: number[]) => (nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null);
@@ -439,6 +468,7 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 		"",
 		`- Дата запуска: ${new Date().toISOString()}`,
 		`- PROMPT_VERSION: ${opts.promptVersion}`,
+		`- Хост шлюза: ${opts.client.providerHost}`,
 		`- Фикстур: ${opts.fixtureNames.length}, прогонов на фикстуру: ${opts.runsPerFixture}, всего прогонов: ${opts.fixtureNames.length * opts.runsPerFixture}`,
 		"- Ретраи и фолбэк отключены — каждый прогон это ровно одна попытка одной моделью, без ретрая на содержательный отказ.",
 		"- Стоимость везде в кредитах прокси (1 кредит = 50 000 токенов), не в $ — см. AI_PRICE_IN/AI_PRICE_OUT в .env.",
@@ -473,9 +503,11 @@ export type ChainOptions = {
 	promptVersion: number;
 	balance: number;
 	outFile: string;
+	/** --chain-degrade: 1-based step numbers to force onto the template path with zero model calls, instead of waiting for a natural rejection/timeout. */
+	forcedDegradeSteps: number[];
 };
 
-type ChainStep = { run: number; dateLabel: string; picture: string | null; observation: string | null };
+type ChainStep = { run: number; dateLabel: string; picture: string; observation: string; source: "ai" | "template" };
 
 /** First few words of a paragraph — enough to spot a repeated opening by eye, not a full sentence. */
 function leadIn(text: string, wordCount = 6): string {
@@ -484,25 +516,42 @@ function leadIn(text: string, wordCount = 6): string {
 	return words.length > wordCount ? `${lead}…` : lead;
 }
 
-/** Grows by one row each chain step — printed after every run but the first, so all prior lead-ins stay visible without scrolling back. */
+/** Grows by one row each chain step — printed after every run but the first, so all prior lead-ins stay visible without scrolling back. Every step has real text now (template or AI — see runChainForFixture), so the [шаблон] tag is what shows where a step's context actually came from. */
 function formatLeadInTable(steps: ChainStep[]): string {
 	const lines = ["**Завязки по цепочке (picture / observation) — для сравнения глазами, без автоматического вердикта:**"];
 	for (const step of steps) {
-		if (step.picture === null || step.observation === null) {
-			lines.push(`- прогон ${step.run} (${step.dateLabel}): — (отказ/сбой на этом шаге, текста нет)`);
-		} else {
-			lines.push(`- прогон ${step.run} (${step.dateLabel}): «${leadIn(step.picture)}» / «${leadIn(step.observation)}»`);
-		}
+		const sourceTag = step.source === "template" ? " [шаблон]" : "";
+		lines.push(`- прогон ${step.run} (${step.dateLabel})${sourceTag}: «${leadIn(step.picture)}» / «${leadIn(step.observation)}»`);
 	}
 	return lines.join("\n");
 }
 
+/** Builds the StateDay-shaped history entry + the two lines appended after a run's own section, shared by every path (natural rejection/transport, or --chain-degrade) that records a step as template. */
+function formatDegradedTemplateBlock(template: PostParagraphs): string {
+	return [
+		"**Записано в историю как шаблон (source: template) — именно это увидит следующий шаг цепочки:**",
+		"",
+		"**Абзац 1 (picture, шаблон):**",
+		`> ${template.picture}`,
+		"",
+		"**Абзац 2 (observation, шаблон):**",
+		`> ${template.observation}`,
+	].join("\n");
+}
+
 /**
  * facts stay pinned to the fixture's own numbers for every step — only the
- * date advances, one day per run. A run whose response is rejected or fails
- * in transport contributes nothing to the next step's history (matches
- * stateHistoryToAiHistory()'s own treatment of a day with no stored text: a
- * hole, not an empty string) — the chain still continues to the next date.
+ * date advances, one day per run.
+ *
+ * A step that's rejected, fails in transport, or is force-degraded via
+ * --chain-degrade is recorded exactly like a real degraded production day
+ * is (see index.ts's state-write and stateHistoryToAiHistory()): template
+ * text via buildParagraphs(facts), source: "template", still appended to
+ * history — never a hole. A real degraded day still publishes and still
+ * gets recorded; the model reading tomorrow's history has no way to tell
+ * that text apart from AI prose (stateHistoryToAiHistory() strips `source`
+ * before it ever reaches the payload), so the chain has to carry that
+ * forward too, not skip the day, to actually model production.
  */
 async function runChainForFixture(
 	fixtureName: string,
@@ -512,6 +561,7 @@ async function runChainForFixture(
 	timeoutMs: number,
 	priceInPerMillion: number | null,
 	priceOutPerMillion: number | null,
+	forcedDegradeSteps: Set<number>,
 ): Promise<{ sections: string[]; runs: FixtureRun[] }> {
 	const { facts: baseFacts } = loadSnapshotAndFacts(fixtureName, { days: [] });
 	const system = buildSystemPrompt();
@@ -524,13 +574,47 @@ async function runChainForFixture(
 			`## ${fixtureName} — цепочка из ${chainLength}`,
 			"",
 			`- swarmState (зафиксировано по всей цепочке): ${baseFacts.swarmState}`,
-			`- Факты (числа) одни и те же каждый шаг — меняется только дата, как при одинаковом рынке несколько дней подряд.`,
+			"- Факты (числа) одни и те же каждый шаг — меняется только дата, как при одинаковом рынке несколько дней подряд.",
+			...(forcedDegradeSteps.size > 0
+				? [`- Принудительная деградация (--chain-degrade) на шаге(ах): ${[...forcedDegradeSteps].sort((a, b) => a - b).join(", ")} — без запроса к модели.`]
+				: []),
 		].join("\n"),
 	];
+
+	function recordTemplateStep(k: number, facts: Facts, todayKey: string): PostParagraphs {
+		const template = buildParagraphs(facts);
+		chainHistory = appendDay(chainHistory, {
+			date: todayKey,
+			swarmState: facts.swarmState,
+			btcChange: facts.btc?.change24h ?? null,
+			postedAt: new Date().toISOString(),
+			messageId: 0,
+			picture: template.picture,
+			observation: template.observation,
+			source: "template",
+		});
+		steps.push({ run: k, dateLabel: facts.dateLabel, picture: template.picture, observation: template.observation, source: "template" });
+		return template;
+	}
 
 	for (let k = 1; k <= chainLength; k++) {
 		const todayKey = shiftDateKey(baseFacts.dateKey, k - 1);
 		const facts: Facts = { ...baseFacts, dateKey: todayKey, dateLabel: dateKeyToLabel(todayKey) };
+
+		if (forcedDegradeSteps.has(k)) {
+			process.stdout.write(`[ai:compare] ${fixtureName} chain ${k}/${chainLength}... `);
+			console.log("forced template (--chain-degrade), no request sent");
+
+			const template = recordTemplateStep(k, facts, todayKey);
+			const fr: FixtureRun = { fixtureName, run: k, outcome: { kind: "forced", template } };
+			runs.push(fr);
+
+			const sectionParts = [formatRunSection(fr, chainLength, priceInPerMillion, priceOutPerMillion)];
+			if (k > 1) sectionParts.push(formatLeadInTable(steps));
+			sections.push(sectionParts.join("\n\n"));
+			continue;
+		}
+
 		const aiHistory = stateHistoryToAiHistory(chainHistory, todayKey);
 		const payload = buildAiPayload(facts, aiHistory);
 		const user = buildUserPrompt(payload);
@@ -554,9 +638,10 @@ async function runChainForFixture(
 				observation: outcome.observation,
 				source: "ai",
 			});
-			steps.push({ run: k, dateLabel: facts.dateLabel, picture: outcome.picture, observation: outcome.observation });
+			steps.push({ run: k, dateLabel: facts.dateLabel, picture: outcome.picture, observation: outcome.observation, source: "ai" });
 		} else {
-			steps.push({ run: k, dateLabel: facts.dateLabel, picture: null, observation: null });
+			const template = recordTemplateStep(k, facts, todayKey);
+			sectionParts.push(formatDegradedTemplateBlock(template));
 		}
 
 		if (k > 1) sectionParts.push(formatLeadInTable(steps));
@@ -567,11 +652,21 @@ async function runChainForFixture(
 }
 
 export async function runChain(opts: ChainOptions): Promise<void> {
+	const forcedSet = new Set(opts.forcedDegradeSteps);
 	const allSections: string[] = [];
 	const allRuns: FixtureRun[] = [];
 
 	for (const fixtureName of opts.fixtureNames) {
-		const { sections, runs } = await runChainForFixture(fixtureName, opts.chainLength, opts.client, opts.modelId, opts.timeoutMs, opts.priceInPerMillion, opts.priceOutPerMillion);
+		const { sections, runs } = await runChainForFixture(
+			fixtureName,
+			opts.chainLength,
+			opts.client,
+			opts.modelId,
+			opts.timeoutMs,
+			opts.priceInPerMillion,
+			opts.priceOutPerMillion,
+			forcedSet,
+		);
 		allSections.push(...sections);
 		allRuns.push(...runs);
 	}
@@ -581,8 +676,10 @@ export async function runChain(opts: ChainOptions): Promise<void> {
 		"",
 		`- Дата запуска: ${new Date().toISOString()}`,
 		`- PROMPT_VERSION: ${opts.promptVersion}`,
+		`- Хост шлюза: ${opts.client.providerHost}`,
 		`- Фикстур: ${opts.fixtureNames.length}, длина цепочки: ${opts.chainLength}, всего прогонов: ${opts.fixtureNames.length * opts.chainLength}`,
 		"- Режим анти-повтора: вывод каждого прогона уходит в history следующего, тем же способом, что stateHistoryToAiHistory() строит его в бою; дата сдвигается на день вперёд за прогон, факты (числа) зафиксированы — та же фикстура каждый раз.",
+		"- Деградация (отказ, transport-ошибка, или принудительно через --chain-degrade) не пропускает день — записывается шаблонный текст с source: \"template\", как и в бою, и он уходит в history следующего шага.",
 		"- Ретраи и фолбэк отключены, как и в обычном режиме — один запрос это одна попытка.",
 		"- Стоимость везде в кредитах прокси (1 кредит = 50 000 токенов), не в $ — см. AI_PRICE_IN/AI_PRICE_OUT в .env.",
 		"- Завязки первых предложений — материал для взгляда человека, не автоматический вердикт: валидатор на повтор формулировок не расширялся, это вопрос стиля, а не фактической ошибки.",
@@ -614,7 +711,7 @@ function readEnv() {
 	};
 }
 
-type CliArgs = { fixtureNames: string[]; runs: number; chain: number | null; model: string | null; balance: number };
+type CliArgs = { fixtureNames: string[]; runs: number; chain: number | null; chainDegrade: number[]; model: string | null; balance: number };
 
 function normalizeFixtureName(name: string): string {
 	const base = name.endsWith(".json") ? name.slice(0, -".json".length) : name;
@@ -626,6 +723,7 @@ function parseCliArgs(argv: string[]): CliArgs {
 	let runs = 1;
 	let runsExplicit = false;
 	let chain: number | null = null;
+	let chainDegrade: number[] = [];
 	let model: string | null = null;
 	let balance = 1000;
 
@@ -637,6 +735,11 @@ function parseCliArgs(argv: string[]): CliArgs {
 			runsExplicit = true;
 		} else if (arg.startsWith("--chain=")) {
 			chain = Number(arg.slice("--chain=".length));
+		} else if (arg.startsWith("--chain-degrade=")) {
+			chainDegrade = arg
+				.slice("--chain-degrade=".length)
+				.split(",")
+				.map((s) => Number(s.trim()));
 		} else if (arg.startsWith("--model=")) {
 			model = arg.slice("--model=".length);
 		} else if (arg.startsWith("--balance=")) {
@@ -649,7 +752,7 @@ function parseCliArgs(argv: string[]): CliArgs {
 	}
 
 	if (!fixtureArg) {
-		throw new Error("usage: npm run ai:compare -- <fixture-name>|--all [--runs=N] [--chain=N] [--model=<id>] [--balance=N]");
+		throw new Error("usage: npm run ai:compare -- <fixture-name>|--all [--runs=N] [--chain=N] [--chain-degrade=K[,K...]] [--model=<id>] [--balance=N]");
 	}
 	if (chain !== null && runsExplicit) {
 		throw new Error("--chain and --runs are mutually exclusive — --chain implies one sequential run per step, not N independent samples");
@@ -660,12 +763,21 @@ function parseCliArgs(argv: string[]): CliArgs {
 	if (chain !== null && (!Number.isInteger(chain) || chain < 1)) {
 		throw new Error(`--chain must be a positive integer, got: ${chain}`);
 	}
+	if (chainDegrade.length > 0 && chain === null) {
+		throw new Error("--chain-degrade requires --chain=N — it names which step(s) of the chain to force onto the template path");
+	}
+	if (chainDegrade.some((n) => !Number.isInteger(n) || n < 1)) {
+		throw new Error(`--chain-degrade must be a comma-separated list of positive integers, got: ${chainDegrade.join(",")}`);
+	}
+	if (chain !== null && chainDegrade.some((n) => n > chain)) {
+		throw new Error(`--chain-degrade step ${Math.max(...chainDegrade)} is beyond --chain=${chain}`);
+	}
 	if (!Number.isFinite(balance)) {
 		throw new Error(`--balance must be a number, got: ${balance}`);
 	}
 
 	const fixtureNames = fixtureArg === "--all" ? ALL_FIXTURE_NAMES : [normalizeFixtureName(fixtureArg)];
-	return { fixtureNames, runs, chain, model, balance };
+	return { fixtureNames, runs, chain, chainDegrade, model, balance };
 }
 
 function sanitizeForFilename(s: string): string {
@@ -719,6 +831,7 @@ async function main() {
 			promptVersion: env.promptVersion,
 			balance: args.balance,
 			outFile,
+			forcedDegradeSteps: args.chainDegrade,
 		});
 		return;
 	}
