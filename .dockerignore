@@ -1,8 +1,10 @@
 node_modules
 .git
 .env
+.env.example
 data
 out
+reports
 dist
 fixtures
 tests
