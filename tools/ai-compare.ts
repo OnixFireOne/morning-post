@@ -507,7 +507,7 @@ export type ChainOptions = {
 	forcedDegradeSteps: number[];
 };
 
-type ChainStep = { run: number; dateLabel: string; picture: string; observation: string; source: "ai" | "template" };
+export type ChainStep = { run: number; dateLabel: string; picture: string; observation: string; source: "ai" | "template" };
 
 /** First few words of a paragraph — enough to spot a repeated opening by eye, not a full sentence. */
 function leadIn(text: string, wordCount = 6): string {
@@ -522,6 +522,247 @@ function formatLeadInTable(steps: ChainStep[]): string {
 	for (const step of steps) {
 		const sourceTag = step.source === "template" ? " [шаблон]" : "";
 		lines.push(`- прогон ${step.run} (${step.dateLabel})${sourceTag}: «${leadIn(step.picture)}» / «${leadIn(step.observation)}»`);
+	}
+	return lines.join("\n");
+}
+
+// --- repetition detection: purely informational, appended after the
+// lead-in table for every step but the first. No verdict, no effect on
+// RunOutcome/formatSummary/whether a step is accepted — the validator is
+// not extended for this (per instruction: repeated phrasing is a style
+// question, not a factual one). Just a list for a human to read. ---
+
+// Heuristic, not exhaustive: generic Russian function words (prepositions,
+// conjunctions, pronouns, common auxiliary verb forms) plus this project's
+// own core domain vocabulary — words expected to recur every single day
+// regardless of phrasing quality, because the post is always about the same
+// subject (рой, монеты, биток, рынок, лидер/антигерой, red/green/mixed day
+// framing). Excluding these keeps the "reused rare words" list meaningful —
+// without them every step would trivially "reuse" рой/монет/биток forever.
+const STOP_WORDS = new Set([
+	// prepositions
+	"в",
+	"во",
+	"на",
+	"с",
+	"со",
+	"по",
+	"за",
+	"из",
+	"от",
+	"до",
+	"для",
+	"при",
+	"без",
+	"над",
+	"под",
+	"о",
+	"об",
+	"у",
+	"через",
+	"между",
+	"среди",
+	"к",
+	"ко",
+	// conjunctions / particles
+	"и",
+	"а",
+	"но",
+	"или",
+	"что",
+	"как",
+	"чтобы",
+	"если",
+	"хотя",
+	"пока",
+	"же",
+	"ли",
+	"бы",
+	"не",
+	"ни",
+	"да",
+	"тоже",
+	"также",
+	// pronouns
+	"он",
+	"она",
+	"оно",
+	"они",
+	"это",
+	"тот",
+	"эта",
+	"этот",
+	"эти",
+	"свой",
+	"своя",
+	"своё",
+	"свои",
+	"весь",
+	"вся",
+	"всё",
+	"все",
+	"каждый",
+	"каждая",
+	"каждое",
+	"который",
+	"которая",
+	"которое",
+	"которые",
+	"кто",
+	"какой",
+	"какая",
+	"какое",
+	"какие",
+	// common verb forms
+	"есть",
+	"был",
+	"была",
+	"было",
+	"были",
+	"будет",
+	"будут",
+	"стал",
+	"стала",
+	"стало",
+	"стали",
+	"остаётся",
+	"остаются",
+	"является",
+	// this project's own core domain vocabulary
+	"рой",
+	"монета",
+	"монеты",
+	"монет",
+	"биток",
+	"btc",
+	"рынок",
+	"рынке",
+	"рынка",
+	"день",
+	"дня",
+	"дней",
+	"сутки",
+	"подряд",
+	"против",
+	"течения",
+	"лидер",
+	"лидера",
+	"лидеров",
+	"герой",
+	"антигерой",
+	"зелёный",
+	"зелёная",
+	"зелёное",
+	"зелёные",
+	"красный",
+	"красная",
+	"красное",
+	"красные",
+	"растёт",
+	"растут",
+	"падает",
+	"падают",
+]);
+
+function isNumericWord(word: string): boolean {
+	return /^\d+$/.test(word);
+}
+
+/** Lowercased letter/digit runs — punctuation, dashes, quotes all become word boundaries. */
+export function normalizeWords(text: string): string[] {
+	return text
+		.toLowerCase()
+		.split(/[^\p{L}\p{N}]+/u)
+		.filter(Boolean);
+}
+
+/** Separator between pooled prior steps' word arrays — never equals a real extracted word, so a chain match can't accidentally span the boundary between two different prior days. */
+const POOL_SEPARATOR = " ";
+
+export function poolPriorWords(priorTexts: string[]): string[] {
+	const pooled: string[] = [];
+	for (const text of priorTexts) {
+		if (pooled.length > 0) pooled.push(POOL_SEPARATOR);
+		pooled.push(...normalizeWords(text));
+	}
+	return pooled;
+}
+
+/**
+ * Verbatim word-chains of at least minLength words shared between `current`
+ * and anywhere in the pooled `prior` corpus. Numeric tokens never extend or
+ * start a match — --chain pins facts (the numbers) fixed for the whole
+ * chain by design, so every step trivially "shares" its numbers with every
+ * other step; that's an artifact of the simulation, not a real phrasing
+ * repeat, and would drown out genuine matches. Matches are maximal and
+ * non-overlapping in `current` (greedy left-to-right), not every possible
+ * sub-window — a shared 6-word run is reported once, not as three
+ * overlapping 4-word windows.
+ */
+export function findWordChainMatches(current: string[], prior: string[], minLength: number): { chains: string[][]; usedPositions: Set<number> } {
+	const chains: string[][] = [];
+	const usedPositions = new Set<number>();
+
+	let i = 0;
+	while (i < current.length) {
+		if (usedPositions.has(i) || isNumericWord(current[i]!)) {
+			i++;
+			continue;
+		}
+		let bestLen = 0;
+		for (let j = 0; j < prior.length; j++) {
+			let len = 0;
+			while (i + len < current.length && j + len < prior.length && prior[j + len] !== POOL_SEPARATOR && current[i + len] === prior[j + len] && !isNumericWord(current[i + len]!)) {
+				len++;
+			}
+			if (len > bestLen) bestLen = len;
+		}
+		if (bestLen >= minLength) {
+			chains.push(current.slice(i, i + bestLen));
+			for (let p = i; p < i + bestLen; p++) usedPositions.add(p);
+			i += bestLen;
+		} else {
+			i++;
+		}
+	}
+
+	return { chains, usedPositions };
+}
+
+/** Words already covered by a reported chain match are excluded here — reporting "красный" separately when "рой сегодня явно красный" is already listed as a chain would just be noise. */
+export function findReusedRareWords(current: string[], prior: string[], excludePositions: Set<number>): string[] {
+	const priorSet = new Set(prior);
+	const found = new Set<string>();
+	current.forEach((word, i) => {
+		if (excludePositions.has(i)) return;
+		if (STOP_WORDS.has(word)) return;
+		if (isNumericWord(word)) return;
+		if (word.length <= 2) return;
+		if (priorSet.has(word)) found.add(word);
+	});
+	return [...found];
+}
+
+/**
+ * The current (last) step's text checked against every earlier step's text,
+ * pooled together. Purely informational — see the section comment above.
+ */
+export function formatRepetitionSection(steps: ChainStep[]): string {
+	const current = steps[steps.length - 1]!;
+	const priors = steps.slice(0, -1);
+
+	const currentWords = normalizeWords(`${current.picture} ${current.observation}`);
+	const priorWords = poolPriorWords(priors.map((p) => `${p.picture} ${p.observation}`));
+
+	const { chains, usedPositions } = findWordChainMatches(currentWords, priorWords, 4);
+	const rareWords = findReusedRareWords(currentWords, priorWords, usedPositions);
+
+	const lines = ["**Повторы относительно предыдущих шагов (только список, без вердикта и без влияния на исход):**"];
+	if (chains.length === 0 && rareWords.length === 0) {
+		lines.push("- Повторов не найдено.");
+	} else {
+		if (chains.length > 0) lines.push(`- Дословные цепочки (4+ слов): ${chains.map((c) => `«${c.join(" ")}»`).join(", ")}`);
+		if (rareWords.length > 0) lines.push(`- Повторно использованные редкие слова: ${rareWords.join(", ")}`);
 	}
 	return lines.join("\n");
 }
@@ -610,7 +851,10 @@ async function runChainForFixture(
 			runs.push(fr);
 
 			const sectionParts = [formatRunSection(fr, chainLength, priceInPerMillion, priceOutPerMillion)];
-			if (k > 1) sectionParts.push(formatLeadInTable(steps));
+			if (k > 1) {
+				sectionParts.push(formatLeadInTable(steps));
+				sectionParts.push(formatRepetitionSection(steps));
+			}
 			sections.push(sectionParts.join("\n\n"));
 			continue;
 		}
@@ -644,7 +888,10 @@ async function runChainForFixture(
 			sectionParts.push(formatDegradedTemplateBlock(template));
 		}
 
-		if (k > 1) sectionParts.push(formatLeadInTable(steps));
+		if (k > 1) {
+			sectionParts.push(formatLeadInTable(steps));
+			sectionParts.push(formatRepetitionSection(steps));
+		}
 		sections.push(sectionParts.join("\n\n"));
 	}
 
