@@ -2,7 +2,7 @@
 // snapshot, no mainSwarm/edgePins, no screenshot — every number here is
 // already a formatted string produced by the same formatters the template
 // post uses, so the model's job is to copy, not to compute or round.
-import { dateKeyToLabel, type Facts, type StateHistory, type SwarmState } from "../facts.js";
+import type { Facts, StateHistory, SwarmState } from "../facts.js";
 import { formatBtcPercent, formatBtcPrice, formatMagnitude, formatSignedPercent } from "../format.js";
 import { NUMBER_TOKEN_RE } from "./validator.js";
 
@@ -16,8 +16,18 @@ export type AiLeader = {
 export type AiTodayPayload = {
 	dateLabel: string;
 	swarmState: SwarmState;
-	/** Number, but never added to allowedNumbers — section 3.1: length-of-streak is spoken as a word, not a digit. */
-	streak: number;
+	/**
+	 * streak itself removed from the payload entirely (not just excluded from
+	 * allowedNumbers) — a model that can read facts.streak can also read
+	 * history's day-by-day trail and count matching-state entries instead,
+	 * which is exactly the failure mode item 10 (validator.ts) exists to
+	 * catch after the fact: two live --chain runs found the model doing
+	 * precisely that. streak was only half of that input; the other half was
+	 * history's dateLabel/swarmState metadata (see AiHistoryEntry below) —
+	 * removing both closes the loophole at the source instead of policing it.
+	 * prevState stays: a single "did the state just change" fact, not a
+	 * countable trail.
+	 */
 	prevState: SwarmState | null;
 	red: number;
 	green: number;
@@ -29,18 +39,16 @@ export type AiTodayPayload = {
 };
 
 /**
- * One prior day for anti-repeat context. Its own numbers never enter
- * allowedNumbers — section 3.1. picture deliberately dropped (v2 section 4
- * rewrite): paragraph 1 is code-generated and formulaic (render.ts's
- * pickPicture, same phrase-pool rotation every day) — sending it to the
- * model would be pure noise, roughly 110 input tokens/day for text the model
- * never writes and has no reason to read.
+ * One prior day's own paragraph-2 text — nothing else. dateLabel/swarmState
+ * dropped alongside streak (AiTodayPayload above): a model that can see
+ * "3 entries, all swarmState: green" can count a streak from that structure
+ * just as easily as from a streak field, which is the exact loophole this
+ * closes. picture was already dropped earlier (v2 section 4 rewrite):
+ * paragraph 1 is code-generated and formulaic (render.ts's pickPicture,
+ * same phrase-pool rotation every day) — sending it to the model was pure
+ * noise, roughly 110 input tokens/day for text the model never writes.
  */
-export type AiHistoryEntry = {
-	dateLabel: string;
-	swarmState: SwarmState;
-	observation: string;
-};
+export type AiHistoryEntry = string;
 
 export type AiPayload = {
 	today: AiTodayPayload;
@@ -82,10 +90,7 @@ export function collectAllowedNumbers(today: AiTodayPayload): string[] {
  * state.json and facts.jsonl keep the original, unredacted text.
  */
 function redactHistoryNumbers(entry: AiHistoryEntry): AiHistoryEntry {
-	return {
-		...entry,
-		observation: entry.observation.replace(NUMBER_TOKEN_RE, "…"),
-	};
+	return entry.replace(NUMBER_TOKEN_RE, "…");
 }
 
 /**
@@ -99,7 +104,6 @@ export function buildAiPayload(facts: Facts, history: AiHistoryEntry[]): AiPaylo
 	const today: AiTodayPayload = {
 		dateLabel: facts.dateLabel,
 		swarmState: facts.swarmState,
-		streak: facts.streak,
 		prevState: facts.prevState,
 		red: facts.red,
 		green: facts.green,
@@ -133,9 +137,5 @@ export function stateHistoryToAiHistory(history: StateHistory, todayKey: string)
 		.filter((day): day is typeof day & { picture: string; observation: string } => day.date < todayKey && Boolean(day.picture) && Boolean(day.observation))
 		.sort((a, b) => b.date.localeCompare(a.date))
 		.slice(0, MAX_HISTORY_DAYS_FOR_AI)
-		.map((day) => ({
-			dateLabel: dateKeyToLabel(day.date),
-			swarmState: day.swarmState,
-			observation: day.observation,
-		}));
+		.map((day) => day.observation);
 }

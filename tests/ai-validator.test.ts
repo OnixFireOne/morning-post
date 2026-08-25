@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildAiPayload, type AiHistoryEntry } from "../src/ai/payload.js";
-import { extractNumberTokens, MAX_PARAGRAPH_LENGTH, validateAiObservation, validateAiParagraphs, type ValidationFailureReason } from "../src/ai/validator.js";
+import { extractNumberTokens, findStreakWordMismatch, MAX_PARAGRAPH_LENGTH, validateAiObservation, validateAiParagraphs, type ValidationFailureReason } from "../src/ai/validator.js";
 import type { Facts } from "../src/facts.js";
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "ai-responses");
@@ -186,17 +186,57 @@ describe("validateAiParagraphs: item 9 (derived numbers in words) vs item 7 (day
 	});
 });
 
-describe("validateAiParagraphs: item 10 — word-form (ordinal) day-streak vs facts.streak", () => {
-	// Two green days of prior context, same shape stateHistoryToAiHistory()
-	// would produce — the real bug: a model reading two green entries in
-	// history and writing "third day" from their count, never looking at
-	// facts.streak at all.
-	const twoGreenDaysHistory: AiHistoryEntry[] = [
-		{ dateLabel: "24 августа", swarmState: "green", observation: "Всё спокойно, без сюрпризов." },
-		{ dateLabel: "23 августа", swarmState: "green", observation: "Ничего необычного не происходило." },
-	];
+describe("findStreakWordMismatch: item 10 — word-form (ordinal) day-streak vs a real streak value", () => {
+	// streak was removed from AiPayload entirely this session (a model that
+	// can read it can also count matching-state entries in history instead —
+	// the exact failure this check exists to catch, from the other side).
+	// validateAiParagraphs no longer calls this at all (payload.today.streak
+	// doesn't exist to call it with), so these test the standalone detection
+	// function directly — still kept in the file for a possible rollback, per
+	// validateAiParagraphs's own comment on why item 10 is unreachable now.
 
-	it("rejects «третий день подряд» when facts.streak is actually 1 (streak reset, model counted history length instead)", () => {
+	it("flags «третий день подряд» when the real streak is actually 1 (streak reset, model counted history length instead)", () => {
+		const mismatch = findStreakWordMismatch("Третий зелёный день подряд: рой уверенно держит курс наверх.", 1);
+		expect(mismatch).not.toBeNull();
+	});
+
+	it("does not flag the exact same wording «третий день подряд» when the real streak actually is 3", () => {
+		const mismatch = findStreakWordMismatch("Третий зелёный день подряд: рой уверенно держит курс наверх.", 3);
+		expect(mismatch).toBeNull();
+	});
+
+	it.each([
+		["второй", 2, 5],
+		["четвёртый", 4, 1],
+		["пятый", 5, 2],
+	])("flags %s day-count when it doesn't match the real streak (word=%i, actual streak=%i)", (word, _wordValue, actualStreak) => {
+		const mismatch = findStreakWordMismatch(`Рой держит зелёную серию: уже ${word} день подряд без единого сбоя.`, actualStreak);
+		expect(mismatch, `expected "${word} день" with streak=${actualStreak} to be flagged`).not.toBeNull();
+	});
+
+	it("does not flag «первый зелёный день» when streak is 1, with an adjective between the ordinal and the day-word", () => {
+		// Matches the real accepted step-1 wording exactly — an adjective
+		// ("зелёный") sits between the ordinal and "день", not directly adjacent.
+		const mismatch = findStreakWordMismatch("Рой пока держит первый зелёный день — посмотрим, наберёт ли он инерцию.", 1);
+		expect(mismatch).toBeNull();
+	});
+
+	// Stem-collision guard (треть/третий) from item 9's own comment, checked
+	// from the other side now that item 10 also matches "трет-" forms.
+	it("does not match the bare fraction word треть (no day-word) as an ordinal", () => {
+		const mismatch = findStreakWordMismatch("Рой красный: красных монет треть от общего числа.", 7);
+		expect(mismatch).toBeNull();
+	});
+
+	it("does not match треть followed by a day-word nearby either — треть never has an ordinal suffix", () => {
+		const mismatch = findStreakWordMismatch("Уже треть дня рой топчется на месте без единого движения.", 7);
+		expect(mismatch).toBeNull();
+	});
+});
+
+describe("validateAiParagraphs: streak-word-mismatch is dormant now, not a live rejection path", () => {
+	it("accepts a streak-mismatched «третий день подряд» — payload no longer carries streak for item 10 to check against", () => {
+		const twoGreenDaysHistory: AiHistoryEntry[] = ["Всё спокойно, без сюрпризов.", "Ничего необычного не происходило."];
 		const mismatchedPayload = buildAiPayload(specExampleFacts({ swarmState: "green", streak: 1 }), twoGreenDaysHistory);
 		const text = JSON.stringify({
 			picture: "Третий зелёный день подряд: рой уверенно держит курс наверх.",
@@ -204,65 +244,7 @@ describe("validateAiParagraphs: item 10 — word-form (ordinal) day-streak vs fa
 			direction: "green",
 		});
 		const result = validateAiParagraphs(text, mismatchedPayload);
-		expect(result.ok).toBe(false);
-		if (!result.ok) expect(result.reason).toBe("validator:streak_word_mismatch");
-	});
-
-	it("accepts the exact same wording «третий день подряд» when facts.streak actually is 3", () => {
-		const matchingPayload = buildAiPayload(specExampleFacts({ swarmState: "green", streak: 3 }), twoGreenDaysHistory);
-		const text = JSON.stringify({
-			picture: "Третий зелёный день подряд: рой уверенно держит курс наверх.",
-			observation: "Биток держится спокойно, паники на рынке нет совсем.",
-			direction: "green",
-		});
-		const result = validateAiParagraphs(text, matchingPayload);
 		expect(result.ok).toBe(true);
-	});
-
-	it.each([
-		["второй", 2, 5],
-		["четвёртый", 4, 1],
-		["пятый", 5, 2],
-	])("rejects %s day-count when facts.streak doesn't match (word=%i, actual streak=%i)", (word, _wordValue, actualStreak) => {
-		const mismatchedPayload = buildAiPayload(specExampleFacts({ swarmState: "green", streak: actualStreak }), []);
-		const text = JSON.stringify({ picture: `Рой держит зелёную серию: уже ${word} день подряд без единого сбоя.`, observation: "Биток держится спокойно, паники на рынке нет совсем.", direction: "green" });
-		const result = validateAiParagraphs(text, mismatchedPayload);
-		expect(result.ok, `expected "${word} день" with streak=${actualStreak} to be rejected`).toBe(false);
-		if (!result.ok) expect(result.reason).toBe("validator:streak_word_mismatch");
-	});
-
-	it("accepts «первый зелёный день» when facts.streak is 1, with an adjective between the ordinal and the day-word", () => {
-		// Matches the real accepted step-1 wording exactly — an adjective
-		// ("зелёный") sits between the ordinal and "день", not directly adjacent.
-		const firstDayPayload = buildAiPayload(specExampleFacts({ swarmState: "green", streak: 1, prevState: null }), []);
-		const text = JSON.stringify({
-			picture: "Рой пока держит первый зелёный день — посмотрим, наберёт ли он инерцию.",
-			observation: "Биток держится спокойно, паники на рынке нет совсем.",
-			direction: "green",
-		});
-		const result = validateAiParagraphs(text, firstDayPayload);
-		expect(result.ok).toBe(true);
-	});
-
-	// Stem-collision guard (треть/третий) from item 9's own comment, checked
-	// from the other side now that item 10 also matches "трет-" forms.
-	it("does not let the bare fraction word треть (no day-word) trip item 10's ordinal check", () => {
-		const anyStreakPayload = buildAiPayload(specExampleFacts({ streak: 7 }), []);
-		const text = JSON.stringify({ picture: "Рой красный: красных монет треть от общего числа.", observation: "Биток держится спокойно, паники на рынке нет совсем.", direction: "red" });
-		const result = validateAiParagraphs(text, anyStreakPayload);
-		// треть is still rejected — by item 9 (it's a bare fraction word), not
-		// by item 10 mistaking it for an ordinal. If item 10 fired first here,
-		// this would report validator:streak_word_mismatch instead.
-		expect(result.ok).toBe(false);
-		if (!result.ok) expect(result.reason).toBe("validator:derived_numbers");
-	});
-
-	it("does not let треть followed by a day-word nearby trip item 10 either (item 9 catches it first, for the right reason)", () => {
-		const anyStreakPayload = buildAiPayload(specExampleFacts({ streak: 7 }), []);
-		const text = JSON.stringify({ picture: "Уже треть дня рой топчется на месте без единого движения.", observation: "Биток держится спокойно, паники на рынке нет совсем.", direction: "red" });
-		const result = validateAiParagraphs(text, anyStreakPayload);
-		expect(result.ok).toBe(false);
-		if (!result.ok) expect(result.reason).toBe("validator:derived_numbers");
 	});
 });
 
@@ -297,8 +279,8 @@ describe("validateAiParagraphs: language check strips known tickers/BTC first", 
 });
 
 describe("MAX_PARAGRAPH_LENGTH", () => {
-	it("is 320, a hardcoded constant shared with the prompt (step 4), not an env knob", () => {
-		expect(MAX_PARAGRAPH_LENGTH).toBe(320);
+	it("is 420, a hardcoded constant shared with the prompt (step 4), not an env knob", () => {
+		expect(MAX_PARAGRAPH_LENGTH).toBe(420);
 	});
 });
 

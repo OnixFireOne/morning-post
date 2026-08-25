@@ -5,8 +5,9 @@ import { fileURLToPath } from "node:url";
 import { loadSnapshotFromFile } from "../src/snapshot.js";
 import { computeFacts, type Facts, type StateHistory } from "../src/facts.js";
 import type { HotCoinsSnapshot } from "../src/types.js";
-import { buildCaption, buildParagraphs, CAPTION_LIMIT } from "../src/render.js";
+import { buildCaption, buildCaptionFromParagraphs, buildLeaderLines, buildParagraphs, CAPTION_LIMIT, type PostParagraphs } from "../src/render.js";
 import { escapeHtml, formatBtcPercent, formatSignedPercent } from "../src/format.js";
+import { MAX_PARAGRAPH_LENGTH } from "../src/ai/validator.js";
 import {
 	BTC_LEADS_VARIANTS,
 	CORRECTION_VARIANTS,
@@ -309,5 +310,63 @@ describe("buildCaption: length degradation (раздел 4.3)", () => {
 		expect(caption).toContain("W".repeat(5000));
 		expect(caption).toContain("L".repeat(5000));
 		expect(caption.endsWith("Вся карта в реальном времени → inp.one")).toBe(true);
+	});
+});
+
+describe("buildCaptionFromParagraphs: the AI path's realistic worst case still fits CAPTION_LIMIT with margin", () => {
+	// Not the pathological factsWithLongTickers case above (that's the
+	// degradation-stages test, deliberately way over budget) — realistic
+	// worst-case digit counts and ticker length, the longest picture text
+	// across every phrase-pool variant regardless of which swarmState would
+	// actually reach it, and an observation at exactly MAX_PARAGRAPH_LENGTH
+	// (420, the limit the validator itself enforces on the model's only
+	// output). buildCaptionFromParagraphs with no shortPicture argument,
+	// same as renderPost.ts's real AI-path call — overflow here is a total
+	// AI-path failure, not a reason to graft template text on, so this has
+	// to fit on its own.
+	function worstCaseFacts(overrides: Partial<Facts> = {}): Facts {
+		return {
+			dateLabel: "31 декабря",
+			dateKey: "2026-12-31",
+			btc: { price: 999_999, change24h: 99.99 },
+			red: 999,
+			green: 999,
+			total: 1998,
+			swarmState: "red",
+			streak: 14, // "Четырнадцатый" — the longest word in ordinalWordRu's table
+			prevState: "green",
+			winners: [{ id: "w", ticker: "WWWWWWWW", change24h: 999, price: 1, marketCap: null }],
+			losers: [{ id: "l", ticker: "LLLLLLLL", change24h: -999, price: 1, marketCap: null }],
+			maxAbsLeaderChange: 999,
+			...overrides,
+		};
+	}
+
+	const ALL_PICTURE_VARIANT_POOLS = [RED_STREAK_VARIANTS, RED_FIRST_VARIANTS, GREEN_STREAK_VARIANTS, GREEN_FIRST_VARIANTS, MIXED_VARIANTS];
+
+	function longestPossiblePicture(facts: Facts): string {
+		let longest = "";
+		for (const pool of ALL_PICTURE_VARIANT_POOLS) {
+			for (const variant of pool) {
+				const text = variant(facts);
+				if (text.length > longest.length) longest = text;
+			}
+		}
+		return longest;
+	}
+
+	it("fits within CAPTION_LIMIT with room to spare", () => {
+		const facts = worstCaseFacts();
+		const picture = longestPossiblePicture(facts);
+		const { winnerLine, loserLine } = buildLeaderLines(facts);
+		const observation = `${"а".repeat(MAX_PARAGRAPH_LENGTH - 1)}.`;
+		expect(observation.length).toBe(MAX_PARAGRAPH_LENGTH); // sanity on the fixture itself
+
+		const paragraphs: PostParagraphs = { picture, winnerLine, loserLine, observation };
+		const caption = buildCaptionFromParagraphs(facts, paragraphs);
+
+		expect(caption.length).toBeLessThanOrEqual(CAPTION_LIMIT);
+		// "с запасом" — not just barely under the wire.
+		expect(CAPTION_LIMIT - caption.length).toBeGreaterThan(100);
 	});
 });

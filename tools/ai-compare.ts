@@ -73,8 +73,6 @@ const ALL_FIXTURE_NAMES = [
 // data variance — checked once per report, not once per fixture.
 const SYSTEM_PROMPT_NORM_MAX_CHARS = 4000;
 
-const HISTORY_ALLOWED_KEYS = new Set(["dateLabel", "swarmState", "observation"]);
-
 /**
  * Empirical calibration, not documented by the proxy: three consecutive real
  * requests (25.08, including one with a changed system prompt) showed
@@ -168,15 +166,18 @@ function loadSnapshotAndFacts(fixtureName: string, stateHistory: StateHistory): 
 type Section31Check = {
 	rawSnapshotFieldsLeaked: string[];
 	unrelatedTickersLeaked: string[];
-	historyEntriesWithExtraKeys: string[];
+	/** streak was removed from AiPayload entirely (see payload.ts's own comment on AiTodayPayload) — a regression that brings it back must fail loudly here, not pass silently the way a plain field-shape check would. */
+	streakLeaked: boolean;
 };
 
 /**
- * Section 3.1's own three concerns, checked against the exact string sent to
- * the model — not a re-derivation, a direct inspection of buildUserPrompt()'s
+ * Section 3.1's own concerns, checked against the exact string sent to the
+ * model — not a re-derivation, a direct inspection of buildUserPrompt()'s
  * output. Same technique tests/ai-payload.test.ts already uses for the first
  * two (no shared src/ function to reuse — that test doesn't call one either,
- * it's a plain substring/field check both times).
+ * it's a plain substring/field check both times). history no longer has a
+ * shape worth checking here — AiHistoryEntry is a bare string now (payload.ts),
+ * so there's no object key to leak; TypeScript itself guarantees that shape.
  */
 function checkSection31(userJson: string, payload: AiPayload, snapshot: HotCoinsSnapshot): Section31Check {
 	const rawSnapshotFieldsLeaked = ["mainSwarm", "edgePins", "marketCap"].filter((field) => userJson.includes(field));
@@ -186,12 +187,9 @@ function checkSection31(userJson: string, payload: AiPayload, snapshot: HotCoins
 	const allCoins = [...snapshot.mainSwarm, ...snapshot.edgePins];
 	const unrelatedTickersLeaked = [...new Set(allCoins.filter((c) => c.ticker !== winnerTicker && c.ticker !== loserTicker).map((c) => c.ticker))].filter((ticker) => userJson.includes(ticker));
 
-	const historyEntriesWithExtraKeys = payload.history
-		.map((entry, i) => ({ i, extra: Object.keys(entry).filter((k) => !HISTORY_ALLOWED_KEYS.has(k)) }))
-		.filter((e) => e.extra.length > 0)
-		.map((e) => `history[${e.i}]: ${e.extra.join(", ")}`);
+	const streakLeaked = /"streak"\s*:/.test(userJson);
 
-	return { rawSnapshotFieldsLeaked, unrelatedTickersLeaked, historyEntriesWithExtraKeys };
+	return { rawSnapshotFieldsLeaked, unrelatedTickersLeaked, streakLeaked };
 }
 
 async function runOne(
@@ -273,20 +271,24 @@ function formatSection31Line(label: string, leaked: string[]): string {
 	return leaked.length === 0 ? `  - ✅ ${label}` : `  - ❌ ${label}: ${leaked.join(", ")}`;
 }
 
+function formatSection31BooleanLine(label: string, failed: boolean): string {
+	return failed ? `  - ❌ ${label}` : `  - ✅ ${label}`;
+}
+
 /**
  * Shown once per fixture, above its AI runs. Two things, both free (no
  * request): the template half of the pairwise comparison (section 9's actual
  * ask: template vs AI, not AI in isolation — buildParagraphs() is a pure
  * local call), and the user message's own length plus, when the system
  * prompt is within norm, its full JSON body and a section-3.1 check (no raw
- * snapshot, no unrelated coin tickers, no extra fields on history entries).
+ * snapshot, no unrelated coin tickers, no leaked streak field).
  */
 function formatFixtureHeader(fixtureName: string, facts: Facts, payload: AiPayload, template: PostParagraphs, userPrompt: string, systemInNorm: boolean, snapshot: HotCoinsSnapshot): string {
 	const lines = [
 		`## ${fixtureName}`,
 		"",
 		`- swarmState: ${facts.swarmState}`,
-		`- streak: ${facts.streak}`,
+		`- streak: ${facts.streak} (не отправляется модели — см. payload.ts)`,
 		`- allowedNumbers: ${payload.allowedNumbers.join(", ")}`,
 		`- Длина user-сообщения: ${userPrompt.length} символов`,
 		"",
@@ -303,7 +305,7 @@ function formatFixtureHeader(fixtureName: string, facts: Facts, payload: AiPaylo
 		const check = checkSection31(userPrompt, payload, snapshot);
 		lines.push(
 			"",
-			"### user-JSON (сверка с п.3.1: сырой снапшот, полный список монет, лишние поля истории)",
+			"### user-JSON (сверка с п.3.1: сырой снапшот, полный список монет, поле streak)",
 			"",
 			"```json",
 			JSON.stringify(payload, null, 2),
@@ -312,7 +314,7 @@ function formatFixtureHeader(fixtureName: string, facts: Facts, payload: AiPaylo
 			"Проверка п.3.1:",
 			formatSection31Line("сырой снапшот отсутствует (mainSwarm/edgePins/marketCap)", check.rawSnapshotFieldsLeaked),
 			formatSection31Line("нет тикеров посторонних монет", check.unrelatedTickersLeaked),
-			formatSection31Line("history без лишних полей", check.historyEntriesWithExtraKeys),
+			formatSection31BooleanLine("поле streak отсутствует в payload", check.streakLeaked),
 		);
 	}
 

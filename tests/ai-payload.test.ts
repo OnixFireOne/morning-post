@@ -51,7 +51,6 @@ describe("buildAiPayload: section 3's worked example", () => {
 		expect(payload.today).toEqual({
 			dateLabel: "23 августа",
 			swarmState: "red",
-			streak: 1,
 			prevState: "green",
 			red: 133,
 			green: 14,
@@ -64,16 +63,20 @@ describe("buildAiPayload: section 3's worked example", () => {
 		expect(payload.allowedNumbers).toEqual(["133", "14", "147", "$76,150", "−2.10%", "2.1%", "+18%", "−17%", "18%"]);
 	});
 
-	it("never includes streak's own digit in allowedNumbers", () => {
+	it("does not include streak anywhere in payload.today — removed from the contract entirely, not just excluded from allowedNumbers", () => {
+		// A model that can read streak can also count matching-state entries in
+		// history instead (the exact failure item 10 used to catch after the
+		// fact) — removing the field closes that at the source.
 		const payload = buildAiPayload(specExampleFacts({ streak: 5 }), []);
-		expect(payload.allowedNumbers).not.toContain("5");
+		expect("streak" in payload.today).toBe(false);
+		expect(JSON.stringify(payload)).not.toContain("streak");
 	});
 
-	it("passes history's dateLabel/swarmState through untouched, but redacts its own numbers — they never enter allowedNumbers either", () => {
-		const history: AiHistoryEntry[] = [{ dateLabel: "22 августа", swarmState: "green", observation: "133 монеты выросли вчера." }];
+	it("redacts history's own numbers before they can enter allowedNumbers", () => {
+		const history: AiHistoryEntry[] = ["133 монеты выросли вчера."];
 		const payload = buildAiPayload(specExampleFacts(), history);
-		expect(payload.history).toEqual([{ dateLabel: "22 августа", swarmState: "green", observation: "… монеты выросли вчера." }]);
-		// "133" from yesterday's observation text must not leak in as if it were today's —
+		expect(payload.history).toEqual(["… монеты выросли вчера."]);
+		// "133" from yesterday's text must not leak in as if it were today's —
 		// it already is today's red count here, so assert on a number that ISN'T:
 		const historyOnlyNumber = "999";
 		expect(payload.allowedNumbers).not.toContain(historyOnlyNumber);
@@ -81,38 +84,23 @@ describe("buildAiPayload: section 3's worked example", () => {
 });
 
 describe("buildAiPayload: history numbers are redacted before reaching the payload", () => {
-	it("replaces every number token (plain, percent, dollar, signed, comma-grouped) with an ellipsis in observation", () => {
-		const history: AiHistoryEntry[] = [
-			{
-				dateLabel: "22 августа",
-				swarmState: "green",
-				observation: "Рой вырос: 60 монет из $1,234 капитализации против 6 падающих. Биток прибавил +8.40%, а лидер вырос на 43%.",
-			},
-		];
+	it("replaces every number token (plain, percent, dollar, signed, comma-grouped) with an ellipsis", () => {
+		const history: AiHistoryEntry[] = ["Рой вырос: 60 монет из $1,234 капитализации против 6 падающих. Биток прибавил +8.40%, а лидер вырос на 43%."];
 		const payload = buildAiPayload(specExampleFacts(), history);
-		expect(payload.history[0]!.observation).toBe("Рой вырос: … монет из … капитализации против … падающих. Биток прибавил …, а лидер вырос на ….");
+		expect(payload.history[0]).toBe("Рой вырос: … монет из … капитализации против … падающих. Биток прибавил …, а лидер вырос на ….");
 	});
 
 	it("leaves tickers alone — every real ticker in this project is purely alphabetic, so nothing collides", () => {
-		const history: AiHistoryEntry[] = [
-			{ dateLabel: "22 августа", swarmState: "red", observation: "TRAC вырвался в лидеры с ростом 18%, а PI остаётся антигероем." },
-		];
+		const history: AiHistoryEntry[] = ["TRAC вырвался в лидеры с ростом 18%, а PI остаётся антигероем."];
 		const payload = buildAiPayload(specExampleFacts(), history);
-		expect(payload.history[0]!.observation).toBe("TRAC вырвался в лидеры с ростом …, а PI остаётся антигероем.");
+		expect(payload.history[0]).toBe("TRAC вырвался в лидеры с ростом …, а PI остаётся антигероем.");
 	});
 
-	it("doesn't mutate the caller's history array or its entries", () => {
-		const history: AiHistoryEntry[] = [{ dateLabel: "22 августа", swarmState: "green", observation: "133 монеты выросли вчера." }];
-		const original = JSON.parse(JSON.stringify(history)) as AiHistoryEntry[];
+	it("doesn't mutate the caller's history array", () => {
+		const history: AiHistoryEntry[] = ["133 монеты выросли вчера."];
+		const original = [...history];
 		buildAiPayload(specExampleFacts(), history);
 		expect(history).toEqual(original);
-	});
-
-	it("leaves dateLabel and swarmState untouched — only observation text is redacted", () => {
-		const history: AiHistoryEntry[] = [{ dateLabel: "22 августа", swarmState: "mixed", observation: "133 монеты выросли вчера." }];
-		const payload = buildAiPayload(specExampleFacts(), history);
-		expect(payload.history[0]!.dateLabel).toBe("22 августа");
-		expect(payload.history[0]!.swarmState).toBe("mixed");
 	});
 
 	it("handles an empty history array without error", () => {
@@ -214,7 +202,7 @@ describe("stateHistoryToAiHistory", () => {
 			],
 		};
 		const result = stateHistoryToAiHistory(history, "2026-08-22");
-		expect(result.map((h) => h.observation)).toEqual(["d", "c", "b"]); // newest first, only 3
+		expect(result).toEqual(["d", "c", "b"]); // newest first, only 3
 	});
 
 	it("excludes today and any day on/after it", () => {
@@ -222,9 +210,9 @@ describe("stateHistoryToAiHistory", () => {
 		expect(stateHistoryToAiHistory(history, "2026-08-22")).toEqual([]);
 	});
 
-	it("formats dateLabel from the date key, not from postedAt", () => {
+	it("returns just the bare observation text — no dateLabel/swarmState wrapper (those let a model count matching-state entries the same way a streak field would)", () => {
 		const history: StateHistory = { days: [stateDay("2026-08-21", { picture: "P", observation: "O" })] };
-		expect(stateHistoryToAiHistory(history, "2026-08-22")).toEqual([{ dateLabel: "21 августа", swarmState: "red", observation: "O" }]);
+		expect(stateHistoryToAiHistory(history, "2026-08-22")).toEqual(["O"]);
 	});
 
 	it("skips days with no stored picture/observation, on the real pre-v2 file — not just a synthetic one", () => {
@@ -249,6 +237,6 @@ describe("stateHistoryToAiHistory", () => {
 		// filtering) is under test.
 		const result = stateHistoryToAiHistory(withOneV2Day, "2026-08-22");
 		expect(result).toHaveLength(1);
-		expect(result[0]!.observation).toBe("Биток спокоен.");
+		expect(result[0]).toBe("Биток спокоен.");
 	});
 });

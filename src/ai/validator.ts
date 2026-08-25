@@ -3,8 +3,17 @@
 // dependency beyond the types payload.ts already re-exports.
 import type { AiPayload } from "./payload.js";
 
-/** Section 4: 320 chars, with room under the 1024 caption limit once header/BTC/leader lines/CTA are added. Hardcoded on purpose — the same number feeds the prompt (step 4), and an env knob here is a way to let a valid-but-oversized response into a broken caption. */
-export const MAX_PARAGRAPH_LENGTH = 320;
+/**
+ * Section 4: 420 chars (raised from 320 once paragraph 1/picture moved
+ * entirely to code — section 3.1 was the two-paragraph contract's own
+ * headroom line; observation is now the only model-written text sharing the
+ * 1024 caption budget with it), with room under the 1024 caption limit once
+ * header/BTC/leader lines/CTA are added — see tests/render.test.ts's
+ * worst-case-caption check for the actual margin. Hardcoded on purpose — the
+ * same number feeds the prompt (step 4), and an env knob here is a way to
+ * let a valid-but-oversized response into a broken caption.
+ */
+export const MAX_PARAGRAPH_LENGTH = 420;
 const RUSSIAN_LETTER_RATIO_THRESHOLD = 0.9;
 
 export type ValidationFailureReason =
@@ -149,7 +158,8 @@ function ordinalWordValue(word: string): number | null {
 	return null;
 }
 
-function findStreakWordMismatch(text: string, streak: number): string | null {
+/** Exported for direct testing — validateAiParagraphs no longer calls this (streak isn't in AiPayload anymore), but the detection logic itself is kept for a possible rollback (see validateAiParagraphs's own comment). */
+export function findStreakWordMismatch(text: string, streak: number): string | null {
 	for (const match of text.matchAll(ORDINAL_DAY_RE)) {
 		const value = ordinalWordValue(match[1]!);
 		if (value !== null && value !== streak) return match[0];
@@ -411,8 +421,17 @@ export function validateAiObservation(rawText: string, payload: AiPayload): Obse
  * Section 5, checks in this order (first failure wins — order doesn't change
  * correctness, each check is independent): parse -> non-empty/not cut off ->
  * length -> forbidden content -> direction -> streak-as-digit ->
- * streak-as-mismatched-ordinal-word -> derived-number-words -> number
- * whitelist -> language.
+ * derived-number-words -> number whitelist -> language.
+ *
+ * Item 10 (word-form streak vs facts.streak) is no longer called here:
+ * facts.streak was removed from AiPayload entirely (a model that can read it
+ * can also count matching-state entries in history instead, the same
+ * loophole from the other side) — there's nothing left in the payload this
+ * function is validating against to compare a word-form ordinal to.
+ * findStreakWordMismatch/ordinalWordValue/ORDINAL_DAY_STEMS/ORDINAL_DAY_RE
+ * above are untouched, just unreachable from here now; a genuine rollback to
+ * this two-paragraph contract would need streak back in AiPayload too
+ * before this check could be wired back in.
  */
 export function validateAiParagraphs(rawText: string, payload: AiPayload): ValidationResult {
 	const parsed = parseAiJson(rawText);
@@ -444,9 +463,6 @@ export function validateAiParagraphs(rawText: string, payload: AiPayload): Valid
 
 	const digitDayCount = findDigitDayCount(combined);
 	if (digitDayCount) return { ok: false, reason: "validator:streak_digit", detail: `"${digitDayCount}" — day-streak must be spoken as a word, never a digit` };
-
-	const streakWordMismatch = findStreakWordMismatch(combined, payload.today.streak);
-	if (streakWordMismatch) return { ok: false, reason: "validator:streak_word_mismatch", detail: `"${streakWordMismatch}" — ordinal day-count in words doesn't match facts.streak (${payload.today.streak})` };
 
 	const derivedNumberWords = findDerivedNumberWords(combined);
 	if (derivedNumberWords) return { ok: false, reason: "validator:derived_numbers", detail: `"${derivedNumberWords}" — a ratio/fraction in words is a self-computed number, not a copy from allowedNumbers` };

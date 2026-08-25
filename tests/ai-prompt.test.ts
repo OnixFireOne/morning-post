@@ -288,8 +288,10 @@ describe("buildRetryUserPrompt: never echoes the rejected text back", () => {
 
 		expect(retryInstruction).toMatch(/день/);
 		// facts.streak is 1 here — the instruction must not single out "1" (or
-		// any other specific digit) as the thing to avoid.
-		expect(retryInstruction).not.toContain(String(payload.today.streak));
+		// any other specific digit) as the thing to avoid. streak itself isn't
+		// even in payload.today anymore (removed from the contract entirely),
+		// so this reads the source Facts value instead.
+		expect(retryInstruction).not.toContain(String(specExampleFacts().streak));
 		expect(retryInstruction).not.toMatch(/\d/);
 	});
 
