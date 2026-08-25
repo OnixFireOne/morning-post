@@ -44,6 +44,7 @@ const ALL_REASONS: ValidationFailureReason[] = [
 	"validator:streak_digit",
 	"validator:language",
 	"validator:derived_numbers",
+	"validator:streak_word_mismatch",
 ];
 
 describe("buildSystemPrompt: length limit comes from the same constant the validator reads", () => {
@@ -64,19 +65,21 @@ describe("buildSystemPrompt: length limit comes from the same constant the valid
 });
 
 describe("buildSystemPrompt: streak rule is phrased contextually, not value-specifically", () => {
-	it("bans a digit next to день/дня/дней/сутки in general — never mentions writing streak's value as forbidden", () => {
+	it("bans a digit next to день/дня/сутки in general — never mentions writing streak's value as forbidden", () => {
 		const system = buildSystemPrompt();
 		expect(system).toMatch(/день/);
 		expect(system).toMatch(/дня/);
-		expect(system).toMatch(/дней/);
 		expect(system).toMatch(/сутки/);
-		// "320" (the length limit) and "2-й"/"3 дня" (illustrative examples of
-		// the *forbidden* form) are legitimate digits here — the actual
-		// guarantee against "don't write digit N" framing is that the function
-		// has nowhere to receive N from at all (next test), not "zero digits
-		// anywhere in the string".
-		expect(system).toMatch(/«2-й день»/);
-		expect(system).toMatch(/«3 дня подряд»/);
+		// "320" (the length limit) is a legitimate digit elsewhere in the prompt
+		// — the actual guarantee against "don't write digit N" framing is that
+		// the function has nowhere to receive N from at all (next test), not
+		// "zero digits anywhere in the string". PROMPT_VERSION 5 dropped the
+		// illustrative forbidden-form examples ("2-й день"/"3 дня подряд") to
+		// save budget, relying on the general "не должно быть цифры вообще"
+		// framing plus the validator's own retry instruction on failure.
+		expect(system).toMatch(/не должно быть цифры вообще/);
+		expect(system).toMatch(/«второй день»/);
+		expect(system).toMatch(/«третий день подряд»/);
 	});
 
 	it("does not take facts/streak as a parameter — the rule can't degrade into a per-day number ban even by accident", () => {
@@ -145,7 +148,7 @@ describe("buildSystemPrompt: PROMPT_VERSION 3 additions — manual verification 
 		// day's counts would be a silent miscalculation, and ЧИСЛА's plain
 		// allowedNumbers check has no digit to catch it on since it's spelled
 		// out as a word.
-		expect(system).toMatch(/кратности и доли/);
+		expect(system).toMatch(/кратности и доли/i);
 		expect(system).toMatch(/вдвое/);
 		expect(system).toMatch(/половина/);
 		expect(system).toMatch(/треть/);
@@ -176,6 +179,40 @@ describe("buildSystemPrompt: PROMPT_VERSION 4 additions — manual verification 
 		// exists at all.
 		expect(system).toMatch(/Пустая history — повод молчать о прошлом, а не тема для абзаца/);
 		expect(system).toMatch(/не должен даже заподозрить/);
+	});
+});
+
+describe("buildSystemPrompt: PROMPT_VERSION 5 additions — manual verification findings, 2026-08-25", () => {
+	const system = buildSystemPrompt();
+
+	it("tells the model streak length comes only from facts.streak, never from counting history entries", () => {
+		// Found on a live green --chain=3 run: facts.streak was pinned at 1 every
+		// step (same fixture, only the date advances), but step 2/3 wrote
+		// "второй"/"третий день подряд" by counting entries in history instead
+		// — step 1 alone got it right ("первый зелёный день"). Backed by
+		// validator item 10 (validator:streak_word_mismatch).
+		expect(system).toMatch(/Длина серии дней берётся только из поля streak/);
+		expect(system).toMatch(/считать её по количеству дней в history нельзя/);
+	});
+
+	it("adds кратно to the multiplicity ban, alongside the existing вдвое/в N раз/половина/треть/четверть", () => {
+		// Live response: "зелёных монет кратно больше красных" for 50 vs 16 — a
+		// multiplicity masked as a plain adverb.
+		expect(system).toMatch(/кратно/);
+	});
+
+	it("bans narrating the anti-repeat mechanism itself — not as a repeat, not as \"yesterday's image/scenario\"", () => {
+		// Live response: "рой сохраняет единодушие, хотя вчерашний образ «почти
+		// весь рой» уже использован" — the model narrating its own anti-repeat
+		// process out loud. Same class as the empty-history leak above: history
+		// (empty or not) is an internal technical detail the reader never sees.
+		expect(system).toMatch(/не называй что-то повтором/);
+		expect(system).toMatch(/вчерашний образ/);
+		expect(system).toMatch(/вчерашний сценарий/);
+	});
+
+	it("keeps a qualitative-comparison example, now «большинство монет в минусе» instead of «заметно больше»", () => {
+		expect(system).toMatch(/большинство монет в минусе/);
 	});
 });
 
