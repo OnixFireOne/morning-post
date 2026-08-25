@@ -354,11 +354,65 @@ describe("validateAiObservation: new rejection — any day-count mention, word o
 	});
 });
 
+describe("validateAiObservation: new rejection — word-form multiplicity vs the real green/red ratio", () => {
+	// green=50, red=16 is the exact live case that originally motivated
+	// banning "кратно" outright (item 9's own commit) — the real ratio
+	// (50/16 ≈ 3.1) genuinely supports both "кратно" and "в три раза", so a
+	// blanket ban would have rejected a true statement. This check verifies
+	// the claim against reality instead of banning the vocabulary.
+	function ratioPayload(overrides: Partial<Facts> = {}) {
+		return buildAiPayload(specExampleFacts({ swarmState: "green", red: 16, green: 50, total: 66, ...overrides }), []);
+	}
+
+	it("accepts «в три раза» at green=50/red=16 — the real ratio (≈3.1) rounds to 3", () => {
+		const text = '{"observation": "Зелёных монет в три раза больше красных, биток держится ровно.", "direction": "green"}';
+		const result = validateAiObservation(text, ratioPayload());
+		expect(result.ok).toBe(true);
+	});
+
+	it("accepts «кратно» at green=50/red=16 — a genuine multiple (верная кратность)", () => {
+		const text = '{"observation": "Зелёных монет кратно больше красных, биток держится ровно.", "direction": "green"}';
+		const result = validateAiObservation(text, ratioPayload());
+		expect(result.ok).toBe(true);
+	});
+
+	it("rejects «в три раза» when the real ratio doesn't round to 3", () => {
+		// green=20/red=18 -> ratio ≈1.11, nowhere near 3.
+		const text = '{"observation": "Зелёных монет в три раза больше красных, биток держится ровно.", "direction": "green"}';
+		const result = validateAiObservation(text, ratioPayload({ red: 18, green: 20, total: 38 }));
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:observation_ratio_mismatch");
+	});
+
+	it("rejects a generic «кратно» when the real ratio isn't genuinely a multiple", () => {
+		// green=15/red=14 -> ratio ≈1.07, not "кратно" by any reasonable reading.
+		const text = '{"observation": "Зелёных монет кратно больше красных, биток держится ровно.", "direction": "green"}';
+		const result = validateAiObservation(text, ratioPayload({ red: 14, green: 15, total: 29 }));
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:observation_ratio_mismatch");
+	});
+
+	it.each(["подавляющее большинство монет зелёные", "почти весь рой зелёный сегодня"])(
+		"never rejects a qualitative claim with no numeric meaning (%s), regardless of the real ratio",
+		(phrase) => {
+			// Same mismatched ratio as the rejection case above — only the
+			// wording changes, from a numeric claim to a qualitative one.
+			const text = JSON.stringify({ observation: `${phrase[0]!.toUpperCase()}${phrase.slice(1)}, биток держится ровно.`, direction: "green" });
+			const result = validateAiObservation(text, ratioPayload({ red: 18, green: 20, total: 38 }));
+			expect(result.ok).toBe(true);
+		},
+	);
+});
+
 describe("validateAiObservation: items 1/7/9/10 are deliberately NOT applied on this path", () => {
-	it("does not reject a non-digit multiplicity word (кратно/вдвое) — item 9 isn't called here", () => {
-		// Same live-found phrase item 9 exists to catch on the old contract —
-		// confirming the new path really doesn't call it, per the explicit
-		// scope decision (validator.ts's own comment on validateAiObservation).
+	it("never rejects a multiplicity word purely for existing — item 9's blanket ban isn't called here", () => {
+		// item 9 (validateAiParagraphs-only) would reject "кратно" outright,
+		// no matter how accurate. This payload's own ratio (133 red vs 14
+		// green ≈ 9.5x) genuinely supports "кратно" too, so this doesn't by
+		// itself prove item 9 is bypassed — see the dedicated ratio-mismatch
+		// describe block below for cases where the *new* check would reject
+		// an inaccurate claim that item 9 would have banned for the wrong
+		// reason (existing at all, not being wrong).
 		const text = '{"observation": "Зелёных монет кратно больше красных.", "direction": "red"}';
 		const result = validateAiObservation(text, payload);
 		expect(result.ok).toBe(true);

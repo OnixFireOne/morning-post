@@ -93,7 +93,8 @@ const PROXY_INPUT_TOKEN_OVERHEAD = 2539;
  * 1/7/9/10, the numbers whitelist/digit day-count/derived-number words/
  * word-form streak mismatch, are validateAiParagraphs-only now, not called
  * here at all): parse -> non-empty/not cut off -> length -> forbidden
- * content -> direction -> any digit -> any day-count word -> language.
+ * content -> direction -> any digit -> any day-count word -> ratio-mismatch
+ * -> language.
  */
 const VALIDATOR_ITEM_LABELS: Record<ObservationValidationFailureReason, string> = {
 	invalid_json: "невалидный JSON (до проверок раздела 5)",
@@ -104,6 +105,7 @@ const VALIDATOR_ITEM_LABELS: Record<ObservationValidationFailureReason, string> 
 	"validator:language": "п.6 язык",
 	"validator:observation_digit": "новое: любая цифра в абзаце",
 	"validator:observation_day_count": "новое: любой счёт дней (словом или цифрой)",
+	"validator:observation_ratio_mismatch": "новое: словесная кратность не совпадает с реальным соотношением зелёных/красных",
 };
 
 type RunOutcome =

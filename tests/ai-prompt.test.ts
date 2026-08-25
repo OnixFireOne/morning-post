@@ -234,6 +234,24 @@ describe("buildSystemPrompt: PROMPT_VERSION 7 — one-paragraph contract (pictur
 	});
 });
 
+describe("buildSystemPrompt: PROMPT_VERSION 9 — closing the history-length loophole, banning reused verb constructions", () => {
+	const system = buildSystemPrompt();
+
+	it("ДНИ ПОДРЯД tells the model history's entry count isn't a day-count either — PROMPT_VERSION 8 dropped streak and history's dateLabel/swarmState, but the array's own length is still visible and still countable", () => {
+		expect(system).toMatch(/в history может лежать несколько текстов/i);
+		expect(system).toMatch(/их количество не означает длину серии/);
+	});
+
+	it("ПОВТОРЫ bans reusing a verb construction from history even with different nouns, with «превращает тикер в …» as the example", () => {
+		expect(system).toMatch(/глагольных конструкций/);
+		expect(system).toMatch(/превращает тикер в/);
+	});
+
+	it("stays comfortably under the 4000-char norm (tools/ai-compare.ts's SYSTEM_PROMPT_NORM_MAX_CHARS)", () => {
+		expect(system.length).toBeLessThan(4000);
+	});
+});
+
 describe("buildUserPrompt", () => {
 	it("is exactly one JSON object, parseable end to end, with no wrapping prose", () => {
 		const user = buildUserPrompt(payload);
@@ -313,12 +331,14 @@ const ALL_OBSERVATION_REASONS: ObservationValidationFailureReason[] = [
 	"validator:language",
 	"validator:observation_digit",
 	"validator:observation_day_count",
+	"validator:observation_ratio_mismatch",
 ];
 
 describe("buildRetryObservationPrompt: new one-paragraph contract's retry path — never echoes the rejected text back", () => {
 	it.each([
 		["observation-digit", "validator:observation_digit"],
 		["observation-day-count", "validator:observation_day_count"],
+		["observation-ratio-mismatch", "validator:observation_ratio_mismatch"],
 		["forecast", "validator:forbidden_pattern"],
 		["direction-mismatch", "validator:direction"],
 		["observation-empty", "validator:empty_or_cutoff"],
@@ -363,5 +383,16 @@ describe("buildRetryObservationPrompt: new one-paragraph contract's retry path �
 		const { retryInstruction } = JSON.parse(retryPrompt) as { retryInstruction: string };
 		expect(retryInstruction).toMatch(/номер дня/);
 		expect(retryInstruction).not.toMatch(/третий/i);
+	});
+
+	it("the ratio-mismatch retry instruction describes the rule (illustrative examples are fine — item 9's own old instruction does the same), never a digit", () => {
+		const retryPrompt = buildRetryObservationPrompt(payload, "validator:observation_ratio_mismatch");
+		const { retryInstruction } = JSON.parse(retryPrompt) as { retryInstruction: string };
+		expect(retryInstruction).toMatch(/зелён/i);
+		expect(retryInstruction).toMatch(/красн/i);
+		// No specific ratio number is ever computable as a plain digit here
+		// (the real red/green counts themselves never appear) — same
+		// no-digit-in-the-correction guarantee as the any-digit instruction.
+		expect(retryInstruction).not.toMatch(/\d/);
 	});
 });
