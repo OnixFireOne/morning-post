@@ -216,6 +216,20 @@ describe("buildSystemPrompt: PROMPT_VERSION 5 additions — manual verification 
 	});
 });
 
+describe("buildSystemPrompt: PROMPT_VERSION 6 additions — manual verification findings, 2026-08-25", () => {
+	const system = buildSystemPrompt();
+
+	it("tells the model not to mention the streak at all when streak is 1 — no «подряд», no day-number", () => {
+		// Wording refinement, not a new validator-backed rule: streak=1 isn't
+		// really a "streak" worth narrating, so the model shouldn't reach for
+		// «первый день» or «подряд» at all on day one — only from streak=2
+		// onward does the series get named.
+		expect(system).toMatch(/При streak: 1 серию не упоминай/);
+		expect(system).toMatch(/ни «подряд», ни номер дня/);
+		expect(system).toMatch(/С streak: 2 и больше/);
+	});
+});
+
 describe("buildUserPrompt", () => {
 	it("is exactly one JSON object, parseable end to end, with no wrapping prose", () => {
 		const user = buildUserPrompt(payload);
