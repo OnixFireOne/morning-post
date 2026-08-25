@@ -175,8 +175,16 @@ function findStreakWordMismatch(text: string, streak: number): string | null {
 // "треть" (nominative/accusative singular of the fraction, e.g. "треть
 // монет") never has anything following it, so NOT_WORD_AFTER already keeps
 // it from matching into "третьи" and friends.
+//
+// "кратно"/"многократно"/"в разы" added after a live response wrote "зелёных
+// монет кратно больше красных" for 50 vs 16 — a multiplicity masked as a
+// plain adverb rather than the "вдвое"/"в N раз" phrasing already covered.
+// Bare words, not stem-expanded, same reasoning as треть above: no observed
+// day-count collision risk for these two, but matching the established
+// narrow-by-default style rather than guessing at other inflections
+// (кратный, кратное...) nothing has actually produced yet.
 const DERIVED_NUMBER_WORDS_RE = new RegExp(
-	`${NOT_WORD_BEFORE}(?:вдвое|втрое|вчетверо|в\\s+(?:два|три|четыре|пять|шесть|семь|восемь|девять|десять)\\s+раз(?:а)?|половин\\p{L}*|четверть\\p{L}*|две\\s+трети|треть)${NOT_WORD_AFTER}`,
+	`${NOT_WORD_BEFORE}(?:вдвое|втрое|вчетверо|в\\s+(?:два|три|четыре|пять|шесть|семь|восемь|девять|десять)\\s+раз(?:а)?|в\\s+разы|половин\\p{L}*|четверть\\p{L}*|две\\s+трети|треть|многократно|кратно)${NOT_WORD_AFTER}`,
 	"iu",
 );
 

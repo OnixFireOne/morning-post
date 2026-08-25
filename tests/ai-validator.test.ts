@@ -153,7 +153,7 @@ describe("validateAiParagraphs: item 9 (derived numbers in words) vs item 7 (day
 		expect(result.ok).toBe(true);
 	});
 
-	it.each(["вдвое", "втрое", "вчетверо", "в два раза", "в десять раз", "половина", "половины", "четверть", "четвертью", "две трети"])(
+	it.each(["вдвое", "втрое", "вчетверо", "в два раза", "в десять раз", "половина", "половины", "четверть", "четвертью", "две трети", "кратно", "многократно", "в разы"])(
 		"rejects %s as a self-computed ratio/fraction",
 		(phrase) => {
 			const text = JSON.stringify({ picture: `Рой красный: красных монет ${phrase} больше, чем зелёных.`, observation: "Биток держится спокойно, паники на рынке нет совсем.", direction: "red" });
@@ -162,6 +162,17 @@ describe("validateAiParagraphs: item 9 (derived numbers in words) vs item 7 (day
 			if (!result.ok) expect(result.reason).toBe("validator:derived_numbers");
 		},
 	);
+
+	it("rejects the exact live-found wording: \"кратно больше\" describing 50-vs-16 as an unwritten multiplicity", () => {
+		const text = JSON.stringify({
+			picture: "Рой встряхнулся и окрасился зелёным: зелёных монет кратно больше красных.",
+			observation: "Биток держится спокойно, паники на рынке нет совсем.",
+			direction: "green",
+		});
+		const result = validateAiParagraphs(text, buildAiPayload(specExampleFacts({ swarmState: "green", green: 50, red: 16, total: 66 }), []));
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("validator:derived_numbers");
+	});
 
 	it("does not reject the bare word треть's non-fraction relatives (третий/третьего/третьему/третьих)", () => {
 		// Extra direct coverage beyond the fixture above — every oblique-case
