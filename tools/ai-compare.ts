@@ -32,7 +32,7 @@
 // parsing, one bare client.generate() call per run (skipping generate.ts's
 // loop), and markdown formatting.
 import "dotenv/config";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createAiClient, type AiClient, type AiUsage } from "../src/ai/client.js";
@@ -150,6 +150,8 @@ export type CompareOptions = {
 	stateHistory: StateHistory;
 	balance: number;
 	outFile: string;
+	/** Same instant the caller used to build outFile's HHMM — the header's "Дата запуска" line must read the exact same time, not a fresh `new Date()` at write time. */
+	startedAt: Date;
 };
 
 function loadSnapshotAndFacts(fixtureName: string, stateHistory: StateHistory): { snapshot: HotCoinsSnapshot; facts: Facts } {
@@ -466,7 +468,7 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 	const header = [
 		`# ai:compare — ${opts.modelId}`,
 		"",
-		`- Дата запуска: ${new Date().toISOString()}`,
+		`- Дата запуска: ${opts.startedAt.toISOString()}`,
 		`- PROMPT_VERSION: ${opts.promptVersion}`,
 		`- Хост шлюза: ${opts.client.providerHost}`,
 		`- Фикстур: ${opts.fixtureNames.length}, прогонов на фикстуру: ${opts.runsPerFixture}, всего прогонов: ${opts.fixtureNames.length * opts.runsPerFixture}`,
@@ -503,6 +505,8 @@ export type ChainOptions = {
 	promptVersion: number;
 	balance: number;
 	outFile: string;
+	/** Same instant the caller used to build outFile's HHMM — the header's "Дата запуска" line must read the exact same time, not a fresh `new Date()` at write time. */
+	startedAt: Date;
 	/** --chain-degrade: 1-based step numbers to force onto the template path with zero model calls, instead of waiting for a natural rejection/timeout. */
 	forcedDegradeSteps: number[];
 };
@@ -921,7 +925,7 @@ export async function runChain(opts: ChainOptions): Promise<void> {
 	const header = [
 		`# ai:compare --chain=${opts.chainLength} — ${opts.modelId}`,
 		"",
-		`- Дата запуска: ${new Date().toISOString()}`,
+		`- Дата запуска: ${opts.startedAt.toISOString()}`,
 		`- PROMPT_VERSION: ${opts.promptVersion}`,
 		`- Хост шлюза: ${opts.client.providerHost}`,
 		`- Фикстур: ${opts.fixtureNames.length}, длина цепочки: ${opts.chainLength}, всего прогонов: ${opts.fixtureNames.length * opts.chainLength}`,
@@ -1031,6 +1035,41 @@ function sanitizeForFilename(s: string): string {
 	return s.replace(/[^a-zA-Z0-9_.-]/g, "_");
 }
 
+/**
+ * reports/compare-<YYYY-MM-DD>-<HHMM>-<model>-<fixture|all>[-chainN].md —
+ * HHMM is sliced from the same `startedAt` instant the caller also passes as
+ * CompareOptions/ChainOptions.startedAt, so the filename and the report
+ * header's own "Дата запуска" line always read the same time, never two
+ * independent `new Date()` calls a few ms apart.
+ */
+export function buildReportBaseName(startedAt: Date, modelId: string, fixtureLabel: string, chainLength: number | null): string {
+	const iso = startedAt.toISOString();
+	const datePart = iso.slice(0, 10);
+	const timePart = iso.slice(11, 16).replace(":", "");
+	const chainSuffix = chainLength !== null ? `-chain${chainLength}` : "";
+	return `compare-${datePart}-${timePart}-${sanitizeForFilename(modelId)}-${sanitizeForFilename(fixtureLabel)}${chainSuffix}.md`;
+}
+
+/**
+ * Never overwrites an existing report — a paid run's own record is
+ * irreplaceable (reports/ has no way to regenerate one without spending
+ * credits again). If `dir/baseName` is already taken, tries `-2`, `-3`, ...
+ * before the extension until a free path turns up. Pure filesystem check,
+ * no write — the caller must resolve this (and thus discover any name
+ * collision) before making the first network request, so a run can never
+ * get all the way to being billed and then lose its own report to another
+ * file of the same name.
+ */
+export function resolveUniqueReportPath(dir: string, baseName: string): string {
+	const ext = path.extname(baseName);
+	const stem = baseName.slice(0, -ext.length);
+	let candidate = path.join(dir, baseName);
+	for (let n = 2; existsSync(candidate); n++) {
+		candidate = path.join(dir, `${stem}-${n}${ext}`);
+	}
+	return candidate;
+}
+
 async function main() {
 	const args = parseCliArgs(process.argv.slice(2));
 	const env = readEnv();
@@ -1057,14 +1096,17 @@ async function main() {
 	const client = createAiClient({ baseUrl: env.baseUrl, apiKey: env.apiKey, proxyUrl: env.proxyUrl || undefined });
 	const stateHistory = readState(env.stateFile);
 
-	const today = new Date().toISOString().slice(0, 10);
 	// reports/ is tracked by git (unlike out/) — a report from a real, paid
 	// run has no other history or way back once out/ gets cleaned up, and
 	// out/'s own cleanup rule (age-based file deletion, never removing the
 	// directory) doesn't distinguish a report worth keeping from a stale
-	// *.ai.json debug dump.
-	const chainSuffix = args.chain !== null ? `-chain${args.chain}` : "";
-	const outFile = path.join(REPO_ROOT, "reports", `compare-${today}-${sanitizeForFilename(modelId)}${chainSuffix}.md`);
+	// *.ai.json debug dump. Name + collision check happen here, before any
+	// network call below — a run can never end up billed with nowhere of its
+	// own to land, and an existing report is never silently overwritten by a
+	// second run the same minute.
+	const startedAt = new Date();
+	const fixtureLabel = args.fixtureNames.length > 1 ? "all" : args.fixtureNames[0]!.replace(/\.json$/, "");
+	const outFile = resolveUniqueReportPath(path.join(REPO_ROOT, "reports"), buildReportBaseName(startedAt, modelId, fixtureLabel, args.chain));
 
 	if (args.chain !== null) {
 		await runChain({
@@ -1078,6 +1120,7 @@ async function main() {
 			promptVersion: env.promptVersion,
 			balance: args.balance,
 			outFile,
+			startedAt,
 			forcedDegradeSteps: args.chainDegrade,
 		});
 		return;
@@ -1095,6 +1138,7 @@ async function main() {
 		stateHistory,
 		balance: args.balance,
 		outFile,
+		startedAt,
 	});
 }
 
