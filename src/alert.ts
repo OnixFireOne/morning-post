@@ -66,9 +66,13 @@ function sleep(ms: number): Promise<void> {
  * так что содержимое ошибки не нужно HTML-экранировать и оно не может
  * сломать разметку). Таймаут 10с на попытку, один ретрай, текст обрезается
  * до 3500 символов. Никогда не бросает — возвращает false при неудаче,
- * вызывающий код (index.ts) сам печатает полный текст в stderr.
+ * вызывающий код (index.ts) сам печатает полный текст в stderr. При успехе
+ * возвращает messageId отправленного сообщения (а не просто true), чтобы
+ * вызывающий код мог залогировать его так же, как основной пост логирует
+ * свой messageId — раньше это было возможно только для sendMessage/sendPhoto
+ * из telegram.ts, не для alert-путей.
  */
-export async function sendAlert(opts: SendAlertOptions): Promise<boolean> {
+export async function sendAlert(opts: SendAlertOptions): Promise<number | false> {
 	const text = opts.text.length > ALERT_MAX_LENGTH ? `${opts.text.slice(0, ALERT_MAX_LENGTH)}\n…(обрезано)` : opts.text;
 	// Токен встречается только здесь, в пути запроса — не логировать `url`.
 	const url = `https://api.telegram.org/bot${opts.botToken}/sendMessage`;
@@ -81,8 +85,8 @@ export async function sendAlert(opts: SendAlertOptions): Promise<boolean> {
 			form.append("chat_id", opts.chatId);
 			form.append("text", text);
 			const response = await fetch(url, { method: "POST", body: form, signal: controller.signal });
-			const data = (await response.json()) as { ok: boolean };
-			if (data.ok) return true;
+			const data = (await response.json()) as { ok: boolean; result?: { message_id: number } };
+			if (data.ok && data.result) return data.result.message_id;
 		} catch {
 			// сеть/таймаут/не-JSON ответ — попробуем ещё раз ниже, если попытки остались
 		} finally {

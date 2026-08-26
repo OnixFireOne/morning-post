@@ -42,6 +42,27 @@ export function computeCost(usage: AiUsage | null, priceInPerMillion: number | n
 	return (usage.promptTokens / 1_000_000) * priceInPerMillion + (usage.completionTokens / 1_000_000) * priceOutPerMillion;
 }
 
+/**
+ * Empirical calibration, not documented by the proxy: three consecutive real
+ * requests (25.08, including one with a changed system prompt) showed
+ * prompt_tokens exceeding the proxy's own billed input by exactly this many
+ * tokens every time — 5620−3081, 5617−3078, 5861−3322, all =2539. Proxy-side
+ * overhead unrelated to our text or to caching (it didn't move when the
+ * system prompt did). Undocumented and may change silently, so it lives in
+ * exactly this one place — display-only, shared by every report that needs
+ * it (ai:compare's report, the daily usage-report alert). It must never
+ * reach usage.jsonl/ai.json/state.json: those record prompt_tokens exactly
+ * as the API returned it, and an append-only log can't be corrected
+ * retroactively — mixing calibrated and raw numbers into it with no marker
+ * of where the line is would make the whole log unusable.
+ */
+export const PROXY_INPUT_TOKEN_OVERHEAD = 2539;
+
+/** tokensIn as actually billed by the proxy, per PROXY_INPUT_TOKEN_OVERHEAD — never negative. */
+export function billedInputTokens(tokensIn: number): number {
+	return Math.max(0, tokensIn - PROXY_INPUT_TOKEN_OVERHEAD);
+}
+
 export function formatUsageLine(record: UsageRecord): string {
 	return JSON.stringify(record);
 }

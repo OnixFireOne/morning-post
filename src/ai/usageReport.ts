@@ -21,8 +21,9 @@
 // `today` entirely and re-aggregates everything straight from usage.jsonl
 // over the trailing 7 days.
 import { readFileSync } from "node:fs";
+import type { AiUsage } from "./client.js";
 import { dateKeyToLabel, moscowDateKey, shiftDateKey } from "../facts.js";
-import type { UsageRecord } from "./usage.js";
+import { billedInputTokens, computeCost, type UsageRecord } from "./usage.js";
 
 export type TodayUsage = {
 	source: "ai" | "template";
@@ -35,6 +36,8 @@ export type TodayUsage = {
 	failureReason: string | null;
 };
 
+export type ModelPrice = { priceInPerMillion: number; priceOutPerMillion: number };
+
 export type UsageReportInput = {
 	aiEnabled: boolean;
 	mode: "daily" | "weekly" | "0";
@@ -45,6 +48,19 @@ export type UsageReportInput = {
 	balanceStart: number | null;
 	balanceAsOf: string | null;
 	balanceWarn: number | null;
+	/**
+	 * Current price knobs, keyed by model id (env's primary + fallback model,
+	 * same source generate.ts prices attempts from) — used only to calibrate
+	 * *historical* usage.jsonl records for the balance/forecast lines below.
+	 * A record whose model isn't a key here (price changed since, or an
+	 * unrecognized model) can't be calibrated — its raw costEstimate is used
+	 * for both the raw and calibrated sums, same as computeCost() already
+	 * does when a price knob is simply unset. Optional/defaults to {} so
+	 * every existing caller (and every test) that doesn't care about
+	 * calibration keeps working unchanged — with no prices supplied, the
+	 * calibrated figures equal the raw ones exactly.
+	 */
+	modelPrices?: Partial<Record<string, ModelPrice>>;
 };
 
 /** Robust read: a truncated or corrupted line (e.g. the process died mid-write) is skipped silently rather than failing the whole summary. Validates just enough of each record's shape to group it by day safely — a syntactically valid JSON object with a garbage `timestamp` is exactly as unusable as a truncated line. */
@@ -77,46 +93,93 @@ function isSundayDateKey(dateKey: string): boolean {
 }
 
 type BalanceWindow = {
-	/** All records regardless of dryRun — "потраченное потрачено", a dry-run obkatka request still spent real proxy credits. */
+	/** All records regardless of dryRun — "потраченное потрачено", a dry-run obkatka request still spent real proxy credits. Raw — exactly what usage.jsonl's own costEstimate says, no correction. */
 	accumulated: number;
+	/** Same window, each record's cost recalculated with its input tokens reduced by PROXY_INPUT_TOKEN_OVERHEAD (src/ai/usage.js) when that record's model has a known current price — falls back to the raw costEstimate per-record otherwise. This is the figure the balance/forecast lines are actually driven by. */
+	calibratedAccumulated: number;
 	daysCount: number;
 	remaining: number;
+	calibratedRemaining: number;
 	/** dryRun:false records only — feeds the average/forecast lines, so a burst of manual obkatka testing on one day doesn't inflate the modeled daily run-rate. */
 	realAccumulated: number;
+	realCalibratedAccumulated: number;
 	realDaysCount: number;
 };
 
+/**
+ * A single record's cost, corrected for the proxy's input-token overhead —
+ * needs that record's own price knobs to redo the arithmetic, so it can only
+ * calibrate a record whose model is a key in `modelPrices` (the app's
+ * *current* prices; there's no historical price log). Unknown model/price or
+ * missing token counts → the record's own costEstimate, unmodified, so an
+ * uncalibratable record still contributes its real spend to the sum instead
+ * of silently dropping out.
+ */
+function calibratedRecordCost(record: UsageRecord, modelPrices: Partial<Record<string, ModelPrice>>): number {
+	const raw = record.costEstimate ?? 0;
+	if (record.tokensIn === null || record.tokensOut === null) return raw;
+	const price = modelPrices[record.model];
+	if (!price) return raw;
+	const calibratedUsage: AiUsage = {
+		promptTokens: billedInputTokens(record.tokensIn),
+		completionTokens: record.tokensOut,
+		totalTokens: 0,
+		cachedTokens: null,
+	};
+	return computeCost(calibratedUsage, price.priceInPerMillion, price.priceOutPerMillion) ?? raw;
+}
+
 /** Sums costEstimate (already priced per-attempt by whichever model answered it — see generate.ts) across every record whose Moscow day is on or after balanceAsOf. Records with costEstimate: null contribute 0, same as an untracked-price attempt already does everywhere else in this system. A record with no `dryRun` key at all (written before section 3.4) is treated as dryRun:false — a real production line — never rewritten to add the field, per the append-only rule. */
-function computeBalanceWindow(records: UsageRecord[], balanceStart: number, balanceAsOf: string): BalanceWindow {
+function computeBalanceWindow(records: UsageRecord[], balanceStart: number, balanceAsOf: string, modelPrices: Partial<Record<string, ModelPrice>>): BalanceWindow {
 	const inWindow = records.filter((r) => moscowDateKey(r.timestamp) >= balanceAsOf);
 	const accumulated = inWindow.reduce((sum, r) => sum + (r.costEstimate ?? 0), 0);
+	const calibratedAccumulated = inWindow.reduce((sum, r) => sum + calibratedRecordCost(r, modelPrices), 0);
 	const daysCount = new Set(inWindow.map((r) => moscowDateKey(r.timestamp))).size;
 
 	const realRecords = inWindow.filter((r) => (r.dryRun ?? false) === false);
 	const realAccumulated = realRecords.reduce((sum, r) => sum + (r.costEstimate ?? 0), 0);
+	const realCalibratedAccumulated = realRecords.reduce((sum, r) => sum + calibratedRecordCost(r, modelPrices), 0);
 	const realDaysCount = new Set(realRecords.map((r) => moscowDateKey(r.timestamp))).size;
 
-	return { accumulated, daysCount, remaining: balanceStart - accumulated, realAccumulated, realDaysCount };
+	return {
+		accumulated,
+		calibratedAccumulated,
+		daysCount,
+		remaining: balanceStart - accumulated,
+		calibratedRemaining: balanceStart - calibratedAccumulated,
+		realAccumulated,
+		realCalibratedAccumulated,
+		realDaysCount,
+	};
 }
 
 function formatCredits(n: number): string {
 	return n.toFixed(4);
 }
 
-/** Shared by both modes — appended after the mode-specific lines. Returns [] when balance tracking isn't configured, so the whole block drops out of the joined message rather than showing zeros. */
+/**
+ * Shared by both modes — appended after the mode-specific lines. Returns []
+ * when balance tracking isn't configured, so the whole block drops out of
+ * the joined message rather than showing zeros. Остаток баланса and the
+ * среднее/прогноз forecast are computed from the calibrated figure (the
+ * honest raw usage.jsonl number is still shown, appended at the end of each
+ * line rather than replacing it) — with no modelPrices supplied at all,
+ * calibratedRemaining/calibratedAccumulated equal the raw ones exactly, so
+ * an existing prefix match on either line still holds unchanged.
+ */
 function formatBalanceLines(balance: BalanceWindow | null, balanceAsOf: string | null): string[] {
 	if (balance === null || balanceAsOf === null) return [];
 	const lines = [
-		`Накопленный расход: ${formatCredits(balance.accumulated)} кредитов за ${balance.daysCount} дн. (с ${dateKeyToLabel(balanceAsOf)})`,
-		`Остаток баланса: ${formatCredits(balance.remaining)} кредитов — оценка снизу: прокси не биллит фиксированный оверхед входных токенов на попытку, реальный остаток немного больше.`,
+		`Накопленный расход: ${formatCredits(balance.accumulated)} кредитов за ${balance.daysCount} дн. (с ${dateKeyToLabel(balanceAsOf)}) — с поправкой на оверхед прокси: ${formatCredits(balance.calibratedAccumulated)} кредитов`,
+		`Остаток баланса: ${formatCredits(balance.calibratedRemaining)} кредитов — с поправкой на оверхед прокси (эмпирическая калибровка под этот прокси, не данные API); по данным usage без поправки: ${formatCredits(balance.remaining)} кредитов`,
 	];
 	// Real-only rate — a dry-run obkatka burst on one day must not inflate the
 	// modeled daily spend, even though that same spend already reduced
-	// `remaining` above (it was real money either way).
-	const avgPerDay = balance.realDaysCount > 0 ? balance.realAccumulated / balance.realDaysCount : 0;
+	// `calibratedRemaining` above (it was real money either way).
+	const avgPerDay = balance.realDaysCount > 0 ? balance.realCalibratedAccumulated / balance.realDaysCount : 0;
 	lines.push(
 		avgPerDay > 0
-			? `Среднее: ${formatCredits(avgPerDay)} кредитов/день, хватит примерно на ${Math.floor(balance.remaining / avgPerDay)} дн. при текущем темпе`
+			? `Среднее: ${formatCredits(avgPerDay)} кредитов/день, хватит примерно на ${Math.floor(balance.calibratedRemaining / avgPerDay)} дн. при текущем темпе (расчёт с поправкой на оверхед прокси)`
 			: "Среднее: недостаточно данных для прогноза",
 	);
 	return lines;
@@ -127,7 +190,7 @@ function buildDailyReport(input: UsageReportInput, balance: BalanceWindow | null
 	const dateLabel = dateKeyToLabel(input.dateKey);
 	const dayTokensTotal = today.tokensIn !== null && today.tokensOut !== null ? today.tokensIn + today.tokensOut : null;
 	const overTokenWarn = input.dailyTokenWarn !== null && dayTokensTotal !== null && dayTokensTotal > input.dailyTokenWarn;
-	const underBalanceWarn = balance !== null && input.balanceWarn !== null && balance.remaining < input.balanceWarn;
+	const underBalanceWarn = balance !== null && input.balanceWarn !== null && balance.calibratedRemaining < input.balanceWarn;
 
 	const lines: string[] = [];
 
@@ -136,7 +199,7 @@ function buildDailyReport(input: UsageReportInput, balance: BalanceWindow | null
 	}
 	const attentionParts: string[] = [];
 	if (overTokenWarn) attentionParts.push(`токены дня выше порога (${dayTokensTotal} > ${input.dailyTokenWarn})`);
-	if (underBalanceWarn) attentionParts.push(`остаток баланса ниже порога (${formatCredits(balance!.remaining)} < ${input.balanceWarn})`);
+	if (underBalanceWarn) attentionParts.push(`остаток баланса ниже порога (${formatCredits(balance!.calibratedRemaining)} < ${input.balanceWarn})`);
 	if (attentionParts.length > 0) lines.push(`⚠️ ${attentionParts.join("; ")}`);
 
 	lines.push(`${dateLabel} — модель ${today.model ?? "—"}, попыток ${today.attempts}, source ${today.source}`);
@@ -169,10 +232,10 @@ function buildWeeklyReport(input: UsageReportInput, balance: BalanceWindow | nul
 	for (const r of weekRecords) modelCounts.set(r.model, (modelCounts.get(r.model) ?? 0) + 1);
 	const modelsLabel = [...modelCounts.entries()].map(([model, count]) => `${model} (${count})`).join(", ") || "—";
 
-	const underBalanceWarn = balance !== null && input.balanceWarn !== null && balance.remaining < input.balanceWarn;
+	const underBalanceWarn = balance !== null && input.balanceWarn !== null && balance.calibratedRemaining < input.balanceWarn;
 
 	const lines: string[] = [];
-	if (underBalanceWarn) lines.push(`⚠️ остаток баланса ниже порога (${formatCredits(balance!.remaining)} < ${input.balanceWarn})`);
+	if (underBalanceWarn) lines.push(`⚠️ остаток баланса ниже порога (${formatCredits(balance!.calibratedRemaining)} < ${input.balanceWarn})`);
 
 	lines.push(`Неделя до ${dateKeyToLabel(input.dateKey)} — модели: ${modelsLabel}, попыток ${attempts}, source: ${aiDays} дн. ai / ${templateDays} дн. template`);
 	lines.push(`Токены за неделю: вход ${tokensIn}, выход ${tokensOut}`);
@@ -189,7 +252,7 @@ export function buildUsageReport(input: UsageReportInput): string | null {
 	if (input.mode === "weekly" && !isSundayDateKey(input.dateKey)) return null;
 
 	const records = readUsageRecords(input.usageFile);
-	const balance = input.balanceStart !== null && input.balanceAsOf !== null ? computeBalanceWindow(records, input.balanceStart, input.balanceAsOf) : null;
+	const balance = input.balanceStart !== null && input.balanceAsOf !== null ? computeBalanceWindow(records, input.balanceStart, input.balanceAsOf, input.modelPrices ?? {}) : null;
 
 	return input.mode === "weekly" ? buildWeeklyReport(input, balance, records) : buildDailyReport(input, balance);
 }

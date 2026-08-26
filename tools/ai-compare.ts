@@ -48,7 +48,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createAiClient, type AiClient, type AiUsage } from "../src/ai/client.js";
 import { buildAiPayload, stateHistoryToAiHistory, type AiPayload } from "../src/ai/payload.js";
 import { buildRetryObservationPrompt, buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
-import { computeCost } from "../src/ai/usage.js";
+import { billedInputTokens, computeCost, PROXY_INPUT_TOKEN_OVERHEAD } from "../src/ai/usage.js";
 import { validateAiObservation, type ObservationValidationFailureReason } from "../src/ai/validator.js";
 import { computeFacts, shiftDateKey, type Facts, type StateHistory } from "../src/facts.js";
 import { buildParagraphs, pickPicture, type PostParagraphs } from "../src/render.js";
@@ -81,21 +81,6 @@ const ALL_FIXTURE_NAMES = [
 // so this check is really about catching *code* regressions, not per-day
 // data variance — checked once per report, not once per fixture.
 const SYSTEM_PROMPT_NORM_MAX_CHARS = 4000;
-
-/**
- * Empirical calibration, not documented by the proxy: three consecutive real
- * requests (25.08, including one with a changed system prompt) showed
- * prompt_tokens exceeding the proxy's own billed input by exactly this many
- * tokens every time — 5620−3081, 5617−3078, 5861−3322, all =2539. Proxy-side
- * overhead unrelated to our text or to caching (it didn't move when the
- * system prompt did). Undocumented and may change silently, so it lives in
- * exactly this one place — report display only. It must never reach
- * usage.jsonl/ai.json/state.json: those record prompt_tokens exactly as the
- * API returned it, and an append-only log can't be corrected retroactively —
- * mixing calibrated and raw numbers into it with no marker of where the
- * line is would make the whole log unusable.
- */
-const PROXY_INPUT_TOKEN_OVERHEAD = 2539;
 
 /**
  * validateAiObservation's own checks (PROMPT_VERSION 7's active path — items
@@ -309,13 +294,14 @@ function formatCostLine(costEstimate: number | null): string {
 
 /**
  * Same formula computeCost() already uses — just called with promptTokens
- * reduced by PROXY_INPUT_TOKEN_OVERHEAD first. Returns null (no line) under
- * the exact same conditions computeCost() itself would: no usage, or either
- * price knob unset for this model.
+ * reduced by billedInputTokens() (src/ai/usage.js — the one shared
+ * definition, also used by src/ai/usageReport.ts's balance calibration).
+ * Returns null (no line) under the exact same conditions computeCost()
+ * itself would: no usage, or either price knob unset for this model.
  */
-function formatCalibratedCostLine(tokensIn: number | null, tokensOut: number | null, priceInPerMillion: number | null, priceOutPerMillion: number | null): string | null {
+export function formatCalibratedCostLine(tokensIn: number | null, tokensOut: number | null, priceInPerMillion: number | null, priceOutPerMillion: number | null): string | null {
 	if (tokensIn === null || tokensOut === null) return null;
-	const calibratedTokensIn = Math.max(0, tokensIn - PROXY_INPUT_TOKEN_OVERHEAD);
+	const calibratedTokensIn = billedInputTokens(tokensIn);
 	const calibratedUsage: AiUsage = { promptTokens: calibratedTokensIn, completionTokens: tokensOut, totalTokens: calibratedTokensIn + tokensOut, cachedTokens: null };
 	const calibratedCost = computeCost(calibratedUsage, priceInPerMillion, priceOutPerMillion);
 	if (calibratedCost === null) return null;

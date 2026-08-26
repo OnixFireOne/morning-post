@@ -338,10 +338,20 @@ async function main() {
 				balanceStart: env.aiBalanceStart,
 				balanceAsOf: env.aiBalanceAsOf,
 				balanceWarn: env.aiBalanceWarn,
+				modelPrices: {
+					...(env.aiModel && env.aiPriceIn !== null && env.aiPriceOut !== null ? { [env.aiModel]: { priceInPerMillion: env.aiPriceIn, priceOutPerMillion: env.aiPriceOut } } : {}),
+					...(env.aiModelFallback && env.aiFallbackPriceIn !== null && env.aiFallbackPriceOut !== null
+						? { [env.aiModelFallback]: { priceInPerMillion: env.aiFallbackPriceIn, priceOutPerMillion: env.aiFallbackPriceOut } }
+						: {}),
+				},
 			});
 			if (report) {
 				const delivered = await sendAlert({ botToken: env.telegramBotToken, chatId: env.telegramAdminChatId, text: report });
-				if (!delivered) console.error(report);
+				if (delivered) {
+					console.log(`[usage-report] sent messageId=${delivered} to ${env.telegramAdminChatId}`);
+				} else {
+					console.error(report);
+				}
 			}
 		} catch (err) {
 			console.error("[usage-report] failed to build or send:", err instanceof Error ? err.message : err);
