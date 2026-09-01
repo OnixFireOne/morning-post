@@ -210,3 +210,79 @@ describe("createAiClient: providerHost", () => {
 		expect(c.providerHost).toBe("proxy.example.com");
 	});
 });
+
+describe("createAiClient: authStyle (26.08 provider migration — src/ai/providers.ts's AiProviderProfile.authStyle)", () => {
+	it("defaults to Bearer when authStyle is unset, unchanged from before this option existed", async () => {
+		const fetchImpl: FetchLike = async (_url, init) => {
+			expect(init.headers.Authorization).toBe("Bearer test-key");
+			expect(init.headers["x-api-key"]).toBeUndefined();
+			return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "x" }, finish_reason: "stop" }] }) };
+		};
+		await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+	});
+
+	it("sends x-api-key instead of Authorization: Bearer when authStyle is x-api-key", async () => {
+		const fetchImpl: FetchLike = async (_url, init) => {
+			expect(init.headers["x-api-key"]).toBe("test-key");
+			expect(init.headers.Authorization).toBeUndefined();
+			return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "x" }, finish_reason: "stop" }] }) };
+		};
+		await client(fetchImpl, { authStyle: "x-api-key" }).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+	});
+
+	it("merges extraHeaders on top of Content-Type/auth, without dropping either", async () => {
+		const fetchImpl: FetchLike = async (_url, init) => {
+			expect(init.headers["Content-Type"]).toBe("application/json");
+			expect(init.headers.Authorization).toBe("Bearer test-key");
+			expect(init.headers["HTTP-Referer"]).toBe("https://example.com");
+			expect(init.headers["X-Title"]).toBe("morning-post");
+			return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "x" }, finish_reason: "stop" }] }) };
+		};
+		await client(fetchImpl, { extraHeaders: { "HTTP-Referer": "https://example.com", "X-Title": "morning-post" } }).generate({
+			model: "m",
+			system: "s",
+			user: "u",
+			timeoutMs: 1000,
+		});
+	});
+});
+
+describe("createAiClient: responseProvider/responseModel/responseId (26.08 — OpenRouter-specific top-level response fields)", () => {
+	it("reads provider/model/id straight from the response body on success", async () => {
+		const fetchImpl: FetchLike = async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({
+				id: "gen-abc123",
+				provider: "Anthropic",
+				model: "anthropic/claude-sonnet-5",
+				choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
+				usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+			}),
+		});
+		const result = await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+		expect(result.responseProvider).toBe("Anthropic");
+		expect(result.responseModel).toBe("anthropic/claude-sonnet-5");
+		expect(result.responseId).toBe("gen-abc123");
+	});
+
+	it("are all null when the response doesn't carry them (a provider without OpenRouter's extensions)", async () => {
+		const fetchImpl: FetchLike = async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({ choices: [{ message: { content: "hi" }, finish_reason: "stop" }] }),
+		});
+		const result = await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+		expect(result.responseProvider).toBeNull();
+		expect(result.responseModel).toBeNull();
+		expect(result.responseId).toBeNull();
+	});
+
+	it("are all null on any transport-level failure — nothing was ever parsed", async () => {
+		const fetchImpl: FetchLike = async () => ({ ok: false, status: 500, json: async () => ({}) });
+		const result = await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+		expect(result.responseProvider).toBeNull();
+		expect(result.responseModel).toBeNull();
+		expect(result.responseId).toBeNull();
+	});
+});

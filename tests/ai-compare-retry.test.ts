@@ -1,8 +1,26 @@
 import { describe, expect, it } from "vitest";
 import type { AiClient, AiGenerateParams, AiGenerateResult } from "../src/ai/client.js";
 import { buildAiPayload } from "../src/ai/payload.js";
+import type { AiProviderProfile } from "../src/ai/providers.js";
 import type { Facts } from "../src/facts.js";
 import { finalOutcome, outcomeLabel, runOneWithOptionalRetry, runTotals, type FixtureRun, type RunOneOutcome } from "../tools/ai-compare.js";
+
+function testProvider(overrides: Partial<AiProviderProfile> = {}): AiProviderProfile {
+	return {
+		name: "test-provider",
+		baseUrl: "https://provider.example.com",
+		authStyle: "bearer",
+		extraHeaders: {},
+		primaryModel: "m",
+		fallbackModel: "m",
+		costSource: "table",
+		priceTable: {},
+		inputOverhead: 0,
+		balanceSource: "manual",
+		unitRate: 1,
+		...overrides,
+	};
+}
 
 /** Same worked example as the other ai-*.test.ts files. */
 function specExampleFacts(overrides: Partial<Facts> = {}): Facts {
@@ -38,6 +56,9 @@ function okResult(content: string, overrides: Partial<AiGenerateResult> = {}): A
 		errorKind: null,
 		errorMessage: null,
 		rawUsage: null,
+		responseProvider: null,
+		responseModel: null,
+		responseId: null,
 		...overrides,
 	};
 }
@@ -54,6 +75,9 @@ function failResult(overrides: Partial<AiGenerateResult> = {}): AiGenerateResult
 		errorKind: "http_error",
 		errorMessage: "boom",
 		rawUsage: null,
+		responseProvider: null,
+		responseModel: null,
+		responseId: null,
 		...overrides,
 	};
 }
@@ -83,7 +107,7 @@ function fakeClient(responses: AiGenerateResult[]): { client: AiClient; calls: A
 describe("runOneWithOptionalRetry", () => {
 	it("makes only one call when retry is false, even on a content-level rejection", async () => {
 		const { client, calls } = fakeClient([okResult(digitObservation)]);
-		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, null, null, facts, false);
+		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, testProvider(), facts, false);
 		expect(calls).toHaveLength(1);
 		expect(outcome.kind).toBe("rejected");
 		expect(retryOutcome).toBeUndefined();
@@ -91,7 +115,7 @@ describe("runOneWithOptionalRetry", () => {
 
 	it("retries once on a content-level rejection when retry is true, using buildRetryObservationPrompt's own instruction", async () => {
 		const { client, calls } = fakeClient([okResult(digitObservation), okResult(cleanObservation)]);
-		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, null, null, facts, true);
+		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, testProvider(), facts, true);
 
 		expect(calls).toHaveLength(2);
 		expect(outcome.kind).toBe("rejected");
@@ -108,7 +132,7 @@ describe("runOneWithOptionalRetry", () => {
 
 	it("does not retry when the first attempt is already accepted", async () => {
 		const { client, calls } = fakeClient([okResult(cleanObservation)]);
-		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, null, null, facts, true);
+		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, testProvider(), facts, true);
 		expect(calls).toHaveLength(1);
 		expect(outcome.kind).toBe("accepted");
 		expect(retryOutcome).toBeUndefined();
@@ -116,7 +140,7 @@ describe("runOneWithOptionalRetry", () => {
 
 	it("does not retry a transport failure — matches generate.ts's own retry-vs-fallback split (transport moves to a different model in production; this tool has none to move to)", async () => {
 		const { client, calls } = fakeClient([failResult()]);
-		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, null, null, facts, true);
+		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, testProvider(), facts, true);
 		expect(calls).toHaveLength(1);
 		expect(outcome.kind).toBe("transport");
 		expect(retryOutcome).toBeUndefined();
@@ -124,7 +148,7 @@ describe("runOneWithOptionalRetry", () => {
 
 	it("the retry attempt can itself be rejected again — finalOutcome then reads as the second rejection, not the first", async () => {
 		const { client, calls } = fakeClient([okResult(digitObservation), okResult(digitObservation)]);
-		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, null, null, facts, true);
+		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, testProvider(), facts, true);
 		expect(calls).toHaveLength(2);
 		expect(outcome.kind).toBe("rejected");
 		expect(retryOutcome?.kind).toBe("rejected");
@@ -133,7 +157,7 @@ describe("runOneWithOptionalRetry", () => {
 
 describe("finalOutcome", () => {
 	it("returns the first attempt's outcome when no retry happened", () => {
-		const fr: FixtureRun = { fixtureName: "f", run: 1, outcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null } };
+		const fr: FixtureRun = { fixtureName: "f", run: 1, outcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, responseId: null } };
 		expect(finalOutcome(fr).kind).toBe("accepted");
 	});
 
@@ -141,8 +165,8 @@ describe("finalOutcome", () => {
 		const fr: FixtureRun = {
 			fixtureName: "f",
 			run: 1,
-			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null },
-			retryOutcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null },
+			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, responseId: null },
+			retryOutcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, responseId: null },
 		};
 		expect(finalOutcome(fr).kind).toBe("accepted");
 	});
@@ -150,7 +174,7 @@ describe("finalOutcome", () => {
 
 describe("outcomeLabel", () => {
 	it("formats each outcome kind for the console progress line", () => {
-		const accepted: RunOneOutcome = { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null };
+		const accepted: RunOneOutcome = { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, responseId: null };
 		const rejected: RunOneOutcome = {
 			kind: "rejected",
 			reason: "validator:observation_digit",
@@ -161,6 +185,7 @@ describe("outcomeLabel", () => {
 			durationMs: 1,
 			costEstimate: null,
 			rawUsage: null,
+			responseId: null,
 		};
 		const transport: RunOneOutcome = { kind: "transport", label: "таймаут", errorMessage: null, durationMs: 1 };
 
@@ -175,14 +200,14 @@ describe("runTotals: real spend per run, both attempts summed when a retry happe
 		const fr: FixtureRun = {
 			fixtureName: "f",
 			run: 1,
-			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null },
-			retryOutcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 80, tokensOut: 30, durationMs: 1, costEstimate: 0.8, rawUsage: null },
+			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null, responseId: null },
+			retryOutcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 80, tokensOut: 30, durationMs: 1, costEstimate: 0.8, rawUsage: null, responseId: null },
 		};
 		expect(runTotals(fr)).toEqual({ tokensIn: 180, tokensOut: 70, costEstimate: 1.8 });
 	});
 
 	it("returns just the single attempt's own totals when there was no retry", () => {
-		const fr: FixtureRun = { fixtureName: "f", run: 1, outcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null } };
+		const fr: FixtureRun = { fixtureName: "f", run: 1, outcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null, responseId: null } };
 		expect(runTotals(fr)).toEqual({ tokensIn: 100, tokensOut: 40, costEstimate: 1 });
 	});
 
@@ -190,7 +215,7 @@ describe("runTotals: real spend per run, both attempts summed when a retry happe
 		const fr: FixtureRun = {
 			fixtureName: "f",
 			run: 1,
-			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null },
+			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null, responseId: null },
 			retryOutcome: { kind: "transport", label: "таймаут", errorMessage: null, durationMs: 1 },
 		};
 		expect(runTotals(fr)).toEqual({ tokensIn: 100, tokensOut: 40, costEstimate: 1 });

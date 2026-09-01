@@ -13,14 +13,12 @@ import { buildParagraphs, pickPicture } from "../render.js";
 import type { AiClient } from "./client.js";
 import { buildAiPayload, type AiHistoryEntry, type AiPayload } from "./payload.js";
 import { buildRetryObservationPrompt, buildSystemPrompt, buildUserPrompt } from "./prompt.js";
-import { appendUsageLine, computeCost, type UsageRecord } from "./usage.js";
-import { attemptDayCountTrim, validateAiObservation, type ObservationValidationFailureReason } from "./validator.js";
+import { computeAttemptCost, type AiCostSource, type AiProviderProfile } from "./providers.js";
+import { appendUsageLine, type UsageRecord } from "./usage.js";
+import { attemptObservationTrim, isTrimmableReason, validateAiObservation, type ObservationValidationFailureReason } from "./validator.js";
 
 export type AiModelConfig = {
 	model: string;
-	/** This model's own price per 1M tokens — the fallback's, not the primary's, when it's the fallback answering. */
-	priceInPerMillion: number | null;
-	priceOutPerMillion: number | null;
 };
 
 export type BuildParagraphsAiOptions = {
@@ -29,23 +27,27 @@ export type BuildParagraphsAiOptions = {
 	client: AiClient;
 	primary: AiModelConfig;
 	fallback: AiModelConfig;
+	/** Drives cost computation (costSource/priceTable/inputOverhead — see providers.ts's computeAttemptCost) and is recorded verbatim (providerName) on every usage.jsonl line. */
+	provider: AiProviderProfile;
 	timeoutMs: number;
 	totalBudgetMs: number;
 	maxAttemptsPerModel: number;
 	promptVersion: number;
 	usageFile: string;
 	aiJsonFile: string;
-	/** Section 3.4: whether this call happened under DRY_RUN=1 (with AI_ALLOW_REAL_IN_DRY=1 — index.ts's dry-run gate never lets this function run otherwise). Written into every usage.jsonl line so a manual obkatka spend can be told apart from a real morning post. */
+	/** Section 3.4: whether this call happened under --dry (with --ai — renderPost.ts's dry-run gate never lets this function run otherwise). Written into every usage.jsonl line so a manual obkatka spend can be told apart from a real morning post. */
 	dryRun: boolean;
 };
 
 export type AiGenerationResult = {
-	/** "ai_trimmed": the model's response would otherwise have been rejected for validator:observation_day_count — one sentence was cut and the remainder passed validateAiObservation whole (see validator.ts's attemptDayCountTrim). */
+	/** "ai_trimmed": the model's response would otherwise have been rejected for a trimmable reason (validator:observation_day_count or validator:length) — one sentence was cut and the remainder passed validateAiObservation whole (see validator.ts's attemptObservationTrim). */
 	source: "ai" | "ai_trimmed" | "template";
 	picture: string;
 	observation: string;
 	model: string | null;
 	provider: string | null;
+	/** The upstream inference backend that actually answered (straight from the winning attempt's response) — distinct from `provider` above (the host we called). null on "template" (nothing answered) or when the provider doesn't report one. Recorded in facts.jsonl (see factsLog.ts's FactsLogEntry.provider) — section 5 of the 26.08 provider migration. */
+	responseProvider: string | null;
 	promptVersion: number | null;
 	/** Human-readable summary for the "AI fell back to template" alert. null only when source is "ai"/"ai_trimmed". */
 	failureReason: string | null;
@@ -73,6 +75,10 @@ export type AiJsonAttempt = {
 	outcome: string;
 	finishReason: string | null;
 	costEstimate: number | null;
+	costSource: AiCostSource;
+	/** Straight from the response (client.ts's AiGenerateResult.responseProvider/responseModel) — null on any transport failure. */
+	responseProvider: string | null;
+	responseModel: string | null;
 };
 
 export type AiJsonOutput = {
@@ -138,6 +144,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 			observation: template.observation,
 			model: null,
 			provider: null,
+			responseProvider: null,
 			promptVersion: null,
 			failureReason,
 			trimmedSentence: null,
@@ -175,6 +182,9 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 						timestamp: new Date().toISOString(),
 						attempt: attemptCounter,
 						provider: options.client.providerHost,
+						providerName: options.provider.name,
+						responseProvider: null,
+						responseModel: null,
 						model: modelConfig.model,
 						promptVersion: options.promptVersion,
 						tokensIn: null,
@@ -186,6 +196,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 						outcome,
 						finishReason: null,
 						costEstimate: null,
+						costSource: options.provider.costSource,
 						dryRun: options.dryRun,
 					});
 					attempts.push({
@@ -201,6 +212,9 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 						outcome,
 						finishReason: null,
 						costEstimate: null,
+						costSource: options.provider.costSource,
+						responseProvider: null,
+						responseModel: null,
 					});
 					failureSummary.push(`${modelConfig.model} attempt ${attemptOnModel}: ${outcome}${result.errorMessage ? ` (${result.errorMessage})` : ""}`);
 					// Transport-level failure: no retry on this model, straight to the next one.
@@ -211,7 +225,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 				const rawText = result.content ?? "";
 				const validation = validateAiObservation(rawText, payload);
 				const outcome = validation.ok ? "ok" : validation.reason;
-				const cost = computeCost(result.usage, modelConfig.priceInPerMillion, modelConfig.priceOutPerMillion);
+				const cost = computeAttemptCost(options.provider, modelConfig.model, result.usage, result.rawUsage);
 
 				// Written immediately after classifying the outcome — before the
 				// retry/accept decision, before anything else touches this result.
@@ -226,6 +240,9 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 					timestamp: new Date().toISOString(),
 					attempt: attemptCounter,
 					provider: options.client.providerHost,
+					providerName: options.provider.name,
+					responseProvider: result.responseProvider,
+					responseModel: result.responseModel,
 					model: modelConfig.model,
 					promptVersion: options.promptVersion,
 					tokensIn: result.usage?.promptTokens ?? null,
@@ -237,6 +254,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 					outcome,
 					finishReason: result.finishReason,
 					costEstimate: cost,
+					costSource: options.provider.costSource,
 					dryRun: options.dryRun,
 				});
 				attempts.push({
@@ -252,6 +270,9 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 					outcome,
 					finishReason: result.finishReason,
 					costEstimate: cost,
+					costSource: options.provider.costSource,
+					responseProvider: result.responseProvider,
+					responseModel: result.responseModel,
 				});
 
 				if (result.usage) {
@@ -277,6 +298,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 						observation: validation.result.observation,
 						model: modelConfig.model,
 						provider: options.client.providerHost,
+						responseProvider: result.responseProvider,
 						promptVersion: options.promptVersion,
 						failureReason: null,
 						trimmedSentence: null,
@@ -288,22 +310,23 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 					};
 				}
 
-				// Third outcome: a validator:observation_day_count rejection, and
-				// only that reason, gets one narrow chance to be fixed by cutting the
-				// single sentence that caused it — see validator.ts's
-				// attemptDayCountTrim for the full eligibility/re-validation rules.
-				// Neither failure branch of attemptDayCountTrim retries the model:
-				// "not_eligible" (can't safely cut — too few sentences, or the day
-				// count spans more than one) and "trim_failed" (cut attempted, the
-				// remainder didn't hold up) both go straight to the template. A
-				// same-model retry on this exact reason has no realistic upside —
-				// buildRetryObservationPrompt's day-count instruction is already
-				// what produced the very sentence attemptDayCountTrim just failed to
-				// salvage — so it's not worth a second paid request. Every *other*
-				// rejection reason is untouched below: AI_MAX_ATTEMPTS still governs
-				// its own retry exactly as before this outcome existed.
-				if (validation.reason === "validator:observation_day_count") {
-					const trim = attemptDayCountTrim(rawText, payload);
+				// Third outcome: a trimmable rejection (validator:observation_day_count
+				// or validator:length — see validator.ts's TRIMMABLE_REASONS) gets one
+				// narrow chance to be fixed by cutting a single sentence — see
+				// validator.ts's attemptObservationTrim for the full eligibility/
+				// re-validation rules. Neither failure branch of attemptObservationTrim
+				// retries the model: "not_eligible" (can't safely cut — too few
+				// sentences, or day-count wording spans more than one) and
+				// "trim_failed" (cut attempted, the remainder didn't hold up) both go
+				// straight to the template. A same-model retry on either of these
+				// exact reasons has no realistic upside — buildRetryObservationPrompt's
+				// own instruction for the reason is already what produced the text
+				// attemptObservationTrim just failed to salvage — so it's not worth a
+				// second paid request. Every *other* rejection reason is untouched
+				// below: AI_MAX_ATTEMPTS still governs its own retry exactly as before
+				// this outcome existed.
+				if (isTrimmableReason(validation.reason)) {
+					const trim = attemptObservationTrim(rawText, payload, validation.reason);
 					if (trim.ok) {
 						safeWriteAiJson(options.aiJsonFile, {
 							dateKey: options.facts.dateKey,
@@ -318,6 +341,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 							observation: trim.observation,
 							model: modelConfig.model,
 							provider: options.client.providerHost,
+							responseProvider: result.responseProvider,
 							promptVersion: options.promptVersion,
 							failureReason: null,
 							trimmedSentence: trim.removedSentence,

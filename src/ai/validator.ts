@@ -4,16 +4,19 @@
 import type { AiPayload } from "./payload.js";
 
 /**
- * Section 4: 420 chars (raised from 320 once paragraph 1/picture moved
- * entirely to code — section 3.1 was the two-paragraph contract's own
- * headroom line; observation is now the only model-written text sharing the
- * 1024 caption budget with it), with room under the 1024 caption limit once
- * header/BTC/leader lines/CTA are added — see tests/render.test.ts's
- * worst-case-caption check for the actual margin. Hardcoded on purpose — the
+ * Section 4: derived from the 1024-char Telegram caption limit, not chosen
+ * to fit any particular model's output. tests/render.test.ts's worst-case-
+ * caption test builds the longest possible header (longest Russian genitive
+ * month name), BTC line, picture paragraph, and leader lines the code can
+ * produce, and measures what's left for the observation paragraph: that
+ * fixed overhead is 329 chars, so at MAX_PARAGRAPH_LENGTH=545 the worst-case
+ * caption is 874/1024 chars — a 150-char margin. 545 is the largest value
+ * that still clears a 150-char margin (546 would leave 149); the render
+ * test asserts both the margin and that boundary. Hardcoded on purpose — the
  * same number feeds the prompt (step 4), and an env knob here is a way to
  * let a valid-but-oversized response into a broken caption.
  */
-export const MAX_PARAGRAPH_LENGTH = 420;
+export const MAX_PARAGRAPH_LENGTH = 545;
 const RUSSIAN_LETTER_RATIO_THRESHOLD = 0.9;
 
 export type ValidationFailureReason =
@@ -488,21 +491,45 @@ export function validateAiObservation(rawText: string, payload: AiPayload): Obse
 	return { ok: true, result: { observation, direction } };
 }
 
-// --- third outcome (2026-08-26): trim one sentence instead of an outright
-// rejection, but *only* for the narrowest, safest case — a day-count word
-// ("второй день подряд", "третий день кряду"...) sitting in exactly one
-// sentence of an observation that has at least three, so removing it still
-// leaves a real paragraph behind. Found on six live rejections (25.08,
-// reports/compare-2026-08-25-{1805,1844,1913,1943}-*.md): a model that
-// avoided naming the day count in its opening sentence would sometimes still
-// slip it into a later sentence about the day's leader ticker ("XRP
-// удерживает лидерство уже второй день подряд...") — in every one of those
-// six cases the other two sentences stood on their own as a complete,
-// valid paragraph once that one sentence was gone. Every other rejection
-// reason (digit, forbidden pattern, wrong direction, ratio mismatch,
-// language, day count spread across more than one sentence, too few
-// sentences to safely cut one) is left exactly as it was: an outright
-// rejection, handled by the caller's existing retry/fallback machinery.
+// --- third outcome (2026-08-26), generalized to any trimmable reason
+// (2026-09-01): trim one sentence instead of an outright rejection, but
+// *only* for the narrowest, safest cases — never a second model call.
+// Shared boundary for every reason: at least three sentences before the cut
+// (removing one of one or two leaves a fragment, not a paragraph); the
+// remainder is re-validated whole by validateAiObservation, not just
+// re-checked for the reason that triggered the trim; a remainder shorter
+// than MIN_TRIMMED_OBSERVATION_LENGTH or with fewer than
+// MIN_REMAINING_SENTENCES sentences is rejected (stage "trim_failed"), same
+// as a remainder that fails revalidation for any other reason. Neither
+// failure branch ("not_eligible" — never attempted; "trim_failed" —
+// attempted and rejected) retries the model; the caller falls back to the
+// template. Every rejection reason this mechanism doesn't cover (forbidden
+// pattern, wrong direction, ratio mismatch, language...) is untouched: an
+// outright rejection, handled by the caller's existing retry/fallback
+// machinery.
+//
+// validator:observation_day_count (original case, found on six live
+// rejections — 25.08, reports/compare-2026-08-25-{1805,1844,1913,1943}-*.md):
+// a model that avoided naming the day count in its opening sentence would
+// sometimes still slip it into a later sentence about the day's leader
+// ticker ("XRP удерживает лидерство уже второй день подряд..."). Eligible
+// only when the day-count wording appears in exactly one sentence — with
+// more than one, there's no single safe cut; with none, this reason
+// couldn't have fired in the first place.
+//
+// validator:length (added 2026-09-01, live --all rerun on the primary model
+// (env.aiModel — see providers.ts), reports/compare-2026-09-01-1751-*-all.md:
+// 7/10 rejections, all "п.2 длина", lengths 421-608 against the old 420-char
+// limit, two of them over by just 1-2 chars): unlike day-count, an overflow
+// has no single "offending sentence" to pin it on — every sentence
+// contributes to the total. Cuts the *last* sentence unconditionally (see
+// selectSentenceToTrim) and leans entirely on the mandatory whole-paragraph
+// revalidation to reject the trim when one cut wasn't enough: a 1-2 char
+// overflow is very likely fixed by dropping even a short last sentence, but
+// a gross overflow (600+ chars against any limit) generally isn't —
+// revalidation's own length re-check (nothing special-cased here) catches
+// that and falls through to trim_failed exactly the same way a too-short
+// remainder does.
 
 /** Boundary is ".", "!", "?" only — never ":" or "—", both of which sit *inside* a sentence in this app's observations (colons introduce a clause, em-dashes join two clauses) — see the six cases above for real examples of both. Punctuation stays attached to its own sentence so a rejoined remainder still "ends like a sentence" (endsLikeASentence) without extra glue. Observation text never contains digits (rejected upstream by findAnyDigit before this ever runs), so there's no decimal-point/abbreviation ambiguity to worry about. */
 const SENTENCE_RE = /[^.!?]+[.!?]+/g;
@@ -533,14 +560,40 @@ export type ObservationTrimResult =
 	// no second cut, no extra model call.
 	| { ok: false; stage: "trim_failed"; detail: string };
 
+/** The rejection reasons attemptObservationTrim knows how to trim for — the single source of truth callers check against before calling it. Extending trim to a new reason means adding it here and to selectSentenceToTrim's switch, nowhere else. */
+export const TRIMMABLE_REASONS = ["validator:observation_day_count", "validator:length"] as const;
+export type TrimmableFailureReason = (typeof TRIMMABLE_REASONS)[number];
+
+export function isTrimmableReason(reason: ObservationValidationFailureReason): reason is TrimmableFailureReason {
+	return (TRIMMABLE_REASONS as readonly ObservationValidationFailureReason[]).includes(reason);
+}
+
+/** Which sentence to cut for a given trimmable reason, checked after the shared >= 3-sentences gate in attemptObservationTrim. A reason-specific "not eligible" (day-count spread across more than one sentence) is distinct from the shared one (too few sentences) so the detail message names the actual cause. */
+function selectSentenceToTrim(sentences: string[], reason: TrimmableFailureReason): { index: number } | { notEligible: string } {
+	if (reason === "validator:observation_day_count") {
+		const violatingIndices: number[] = [];
+		sentences.forEach((sentence, i) => {
+			if (findAnyDayCountWord(sentence)) violatingIndices.push(i);
+		});
+		if (violatingIndices.length !== 1) {
+			return { notEligible: `day-count wording appears in ${violatingIndices.length} sentence(s), can only cut exactly one` };
+		}
+		return { index: violatingIndices[0]! };
+	}
+	// validator:length — see this section's own top comment for why the last
+	// sentence is always the cut candidate, and why an insufficient cut is
+	// left to revalidation below rather than decided here.
+	return { index: sentences.length - 1 };
+}
+
 /**
  * Only ever worth calling after validateAiObservation has already returned
- * reason "validator:observation_day_count" for this exact rawText — this
+ * a reason isTrimmableReason accepts, for this exact rawText — this
  * function re-parses and re-derives everything itself rather than trusting
  * the caller's own parse, so it can never disagree with validateAiObservation
  * about what the text actually says.
  */
-export function attemptDayCountTrim(rawText: string, payload: AiPayload): ObservationTrimResult {
+export function attemptObservationTrim(rawText: string, payload: AiPayload, reason: TrimmableFailureReason): ObservationTrimResult {
 	const parsed = parseAiObservationJson(rawText);
 	if (!parsed) return { ok: false, stage: "not_eligible", detail: "no valid {observation, direction} JSON to trim" };
 
@@ -550,16 +603,13 @@ export function attemptDayCountTrim(rawText: string, payload: AiPayload): Observ
 		return { ok: false, stage: "not_eligible", detail: `only ${sentences.length} sentence(s), need >= ${MIN_TOTAL_SENTENCES_FOR_TRIM} to safely cut one` };
 	}
 
-	const violatingIndices: number[] = [];
-	sentences.forEach((sentence, i) => {
-		if (findAnyDayCountWord(sentence)) violatingIndices.push(i);
-	});
-	if (violatingIndices.length !== 1) {
-		return { ok: false, stage: "not_eligible", detail: `day-count wording appears in ${violatingIndices.length} sentence(s), can only cut exactly one` };
+	const selection = selectSentenceToTrim(sentences, reason);
+	if ("notEligible" in selection) {
+		return { ok: false, stage: "not_eligible", detail: selection.notEligible };
 	}
 
-	const removedSentence = sentences[violatingIndices[0]!]!;
-	const remainingSentences = sentences.filter((_, i) => i !== violatingIndices[0]);
+	const removedSentence = sentences[selection.index]!;
+	const remainingSentences = sentences.filter((_, i) => i !== selection.index);
 	const trimmedObservation = remainingSentences.join(" ");
 
 	if (trimmedObservation.length < MIN_TRIMMED_OBSERVATION_LENGTH) {
@@ -570,11 +620,9 @@ export function attemptDayCountTrim(rawText: string, payload: AiPayload): Observ
 	}
 
 	// The cut changes the Cyrillic ratio and can silently invalidate the
-	// green/red ratio check (removing a sentence never removes a digit — none
-	// are allowed here at all — but it can remove the only sentence that made
-	// a multiplicity claim, or leave one that no longer reads naturally) — so
-	// the remainder is re-validated whole, not just re-checked for day-count
-	// wording.
+	// green/red ratio check or (for the length reason) still not clear the
+	// limit — so the remainder is re-validated whole, not just re-checked for
+	// the reason that triggered the trim.
 	const revalidated = validateAiObservation(JSON.stringify({ observation: trimmedObservation, direction: parsed.direction }), payload);
 	if (!revalidated.ok) {
 		return { ok: false, stage: "trim_failed", detail: `remainder fails validateAiObservation: ${revalidated.reason} — ${revalidated.detail}` };

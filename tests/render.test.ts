@@ -319,15 +319,26 @@ describe("buildCaptionFromParagraphs: the AI path's realistic worst case still f
 	// worst-case digit counts and ticker length, the longest picture text
 	// across every phrase-pool variant regardless of which swarmState would
 	// actually reach it, and an observation at exactly MAX_PARAGRAPH_LENGTH
-	// (420, the limit the validator itself enforces on the model's only
-	// output). buildCaptionFromParagraphs with no shortPicture argument,
-	// same as renderPost.ts's real AI-path call — overflow here is a total
-	// AI-path failure, not a reason to graft template text on, so this has
-	// to fit on its own.
+	// (the limit the validator itself enforces on the model's only output —
+	// see validator.ts's own comment on exactly how this test derives it).
+	// buildCaptionFromParagraphs with no shortPicture argument, same as
+	// renderPost.ts's real AI-path call — overflow here is a total AI-path
+	// failure, not a reason to graft template text on, so this has to fit on
+	// its own.
+	//
+	// dateLabel/dateKey: "22 сентября" (11 chars), not just any date — this is
+	// genuinely the longest of the 12 Russian genitive month names at any
+	// 2-digit day (checked programmatically: января 9, февраля 10, марта 8,
+	// апреля 9, мая 6, июня 7, июля 7, августа 10, сентября 11, октября 10,
+	// ноября 9, декабря 10 — "31 декабря", this fixture's value until
+	// 2026-08-27, was 1 char short of the true worst case). Every other field
+	// below (red/green=999, streak=14, 8-char tickers) was checked the same
+	// way — empirically maximized over the actual phrase-variant functions,
+	// not assumed — before relying on it to derive MAX_PARAGRAPH_LENGTH.
 	function worstCaseFacts(overrides: Partial<Facts> = {}): Facts {
 		return {
-			dateLabel: "31 декабря",
-			dateKey: "2026-12-31",
+			dateLabel: "22 сентября",
+			dateKey: "2026-09-22",
 			btc: { price: 999_999, change24h: 99.99 },
 			red: 999,
 			green: 999,
@@ -355,7 +366,21 @@ describe("buildCaptionFromParagraphs: the AI path's realistic worst case still f
 		return longest;
 	}
 
-	it("fits within CAPTION_LIMIT with room to spare", () => {
+	/** The exact worst-case caption length for a given paragraph-2 length — the one thing MAX_PARAGRAPH_LENGTH's own value is derived from (see validator.ts). Exported via closure, not the module, so this stays the single source of truth for both "does 420/545/whatever fit" and "what's the real ceiling". */
+	function worstCaseCaptionLength(paragraphLength: number): number {
+		const facts = worstCaseFacts();
+		const picture = longestPossiblePicture(facts);
+		const { winnerLine, loserLine } = buildLeaderLines(facts);
+		const observation = `${"а".repeat(paragraphLength - 1)}.`;
+		const paragraphs: PostParagraphs = { picture, winnerLine, loserLine, observation };
+		return buildCaptionFromParagraphs(facts, paragraphs).length;
+	}
+
+	// 150 chars is the same floor MAX_PARAGRAPH_LENGTH was raised under — see
+	// validator.ts's comment on the constant itself.
+	const MIN_CAPTION_MARGIN = 150;
+
+	it("fits within CAPTION_LIMIT with at least MIN_CAPTION_MARGIN chars to spare", () => {
 		const facts = worstCaseFacts();
 		const picture = longestPossiblePicture(facts);
 		const { winnerLine, loserLine } = buildLeaderLines(facts);
@@ -366,7 +391,13 @@ describe("buildCaptionFromParagraphs: the AI path's realistic worst case still f
 		const caption = buildCaptionFromParagraphs(facts, paragraphs);
 
 		expect(caption.length).toBeLessThanOrEqual(CAPTION_LIMIT);
-		// "с запасом" — not just barely under the wire.
-		expect(CAPTION_LIMIT - caption.length).toBeGreaterThan(100);
+		expect(CAPTION_LIMIT - caption.length).toBeGreaterThanOrEqual(MIN_CAPTION_MARGIN);
+	});
+
+	it("MAX_PARAGRAPH_LENGTH is the true maximum under this rule — one char longer would drop the margin below MIN_CAPTION_MARGIN", () => {
+		const marginAtCurrent = CAPTION_LIMIT - worstCaseCaptionLength(MAX_PARAGRAPH_LENGTH);
+		const marginOneMore = CAPTION_LIMIT - worstCaseCaptionLength(MAX_PARAGRAPH_LENGTH + 1);
+		expect(marginAtCurrent).toBeGreaterThanOrEqual(MIN_CAPTION_MARGIN);
+		expect(marginOneMore).toBeLessThan(MIN_CAPTION_MARGIN);
 	});
 });

@@ -31,7 +31,8 @@ function entry(overrides: Partial<FactsLogEntry> = {}): FactsLogEntry {
 		topGainer: { ticker: "TRAC", change24h: 18 },
 		topLoser: { ticker: "PI", change24h: -17 },
 		source: "ai",
-		model: "claude-sonnet-4-7",
+		model: "anthropic/claude-sonnet-5",
+		provider: "Anthropic",
 		promptVersion: 4,
 		...overrides,
 	};

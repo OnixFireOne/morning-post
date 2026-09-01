@@ -16,6 +16,8 @@ export type FactsLogEntry = {
 	topLoser: { ticker: string; change24h: number } | null;
 	source: "ai" | "ai_trimmed" | "template";
 	model: string | null;
+	/** The upstream inference backend that actually answered (RenderedPost.responseProvider) — null on "template", or when the provider doesn't report one. Section 5 of the 26.08 provider migration: "provider и model из ответа" recorded here alongside model, not just model as before. */
+	provider: string | null;
 	promptVersion: number | null;
 };
 

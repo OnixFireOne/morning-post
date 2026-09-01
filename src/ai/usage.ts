@@ -1,17 +1,24 @@
 // Append-only accounting for every AI attempt (section 3.2) — one line per
-// attempt, successful or not, never rewritten. Kept separate from generate.ts
-// so the pricing rule (tariff by the model that actually answered *this*
-// attempt, not the primary) is a small, independently testable pure function
-// rather than buried in the orchestration loop.
+// attempt, successful or not, never rewritten. Pricing itself lives in
+// providers.ts's computeAttemptCost (the one function that reads costSource/
+// priceTable/inputOverhead) — this file only shapes and writes the resulting
+// record, it doesn't compute anything.
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import type { AiUsage } from "./client.js";
+import type { AiCostSource } from "./providers.js";
 
 export type UsageRecord = {
 	timestamp: string;
 	attempt: number;
+	/** Host actually called (client.ts's providerHost) — "openrouter.ai" today, not the AI_PROVIDER profile name (see providerName below) or the upstream backend OpenRouter itself routed to (see responseProvider). */
 	provider: string;
 	model: string;
+	/** The AI_PROVIDER profile's own name field (see providers.ts) that produced this attempt — written so a day's line is self-describing without cross-referencing .env history. */
+	providerName: string;
+	/** Which upstream inference backend actually answered, straight from the response body (OpenRouter-specific; null for a provider that doesn't report it, or on any transport failure). Distinct from `provider` (the host we called) and `providerName` (which profile we're configured for). */
+	responseProvider: string | null;
+	/** The model id the response itself echoes back, which can differ from the requested `model` under routing/aliasing — null when the response doesn't carry one (e.g. any transport failure). */
+	responseModel: string | null;
 	promptVersion: number;
 	tokensIn: number | null;
 	tokensOut: number | null;
@@ -24,44 +31,13 @@ export type UsageRecord = {
 	/** "ok" | "invalid_json" | "validator:<reason>" | "timeout" | "http_<code>" | "network_error". */
 	outcome: string;
 	finishReason: string | null;
-	/** null unless both AI_PRICE_IN/AI_PRICE_OUT (for whichever model answered) are set AND usage was reported. */
+	/** null unless costEstimate was actually computable for this attempt — see providers.ts's computeAttemptCost for exactly when that is. Always USD now, for both costSource values. */
 	costEstimate: number | null;
-	/** true only when DRY_RUN=1 and the request was explicitly allowed via AI_ALLOW_REAL_IN_DRY=1 (section 3.4) — a manual obkatka spend, not a real morning post. Records from before this field existed have no key at all; readers must treat a missing value as false (production), never rewrite the line to add it. */
+	/** Which pricing path produced costEstimate — "provider" (the response's own usage.cost, verbatim — exact) or "table" (computeAttemptCost's priceTable arithmetic — our own estimate). Describes accuracy, not a unit: both are already USD (see providers.ts's unitRate). A balance report may sum across mixed costSource values, but must say so when it does — see usageReport.ts's own mixedCostSource handling. */
+	costSource: AiCostSource;
+	/** true only when --dry was passed with --ai (section 3.4) — a manual obkatka spend, not a real morning post. Records from before this field existed have no key at all; readers must treat a missing value as false (production), never rewrite the line to add it. */
 	dryRun: boolean;
 };
-
-/**
- * Priced by the model that actually produced *this* attempt — call with that
- * model's own price knobs (AI_PRICE_IN/OUT for the primary, AI_FALLBACK_PRICE_IN/OUT
- * for the fallback), never the primary's unconditionally. A fallback attempt
- * costed at the primary's (usually cheaper) rate would understate exactly the
- * days that actually cost the most — the ones where the fallback had to run.
- */
-export function computeCost(usage: AiUsage | null, priceInPerMillion: number | null, priceOutPerMillion: number | null): number | null {
-	if (!usage || priceInPerMillion === null || priceOutPerMillion === null) return null;
-	return (usage.promptTokens / 1_000_000) * priceInPerMillion + (usage.completionTokens / 1_000_000) * priceOutPerMillion;
-}
-
-/**
- * Empirical calibration, not documented by the proxy: three consecutive real
- * requests (25.08, including one with a changed system prompt) showed
- * prompt_tokens exceeding the proxy's own billed input by exactly this many
- * tokens every time — 5620−3081, 5617−3078, 5861−3322, all =2539. Proxy-side
- * overhead unrelated to our text or to caching (it didn't move when the
- * system prompt did). Undocumented and may change silently, so it lives in
- * exactly this one place — display-only, shared by every report that needs
- * it (ai:compare's report, the daily usage-report alert). It must never
- * reach usage.jsonl/ai.json/state.json: those record prompt_tokens exactly
- * as the API returned it, and an append-only log can't be corrected
- * retroactively — mixing calibrated and raw numbers into it with no marker
- * of where the line is would make the whole log unusable.
- */
-export const PROXY_INPUT_TOKEN_OVERHEAD = 2539;
-
-/** tokensIn as actually billed by the proxy, per PROXY_INPUT_TOKEN_OVERHEAD — never negative. */
-export function billedInputTokens(tokensIn: number): number {
-	return Math.max(0, tokensIn - PROXY_INPUT_TOKEN_OVERHEAD);
-}
 
 export function formatUsageLine(record: UsageRecord): string {
 	return JSON.stringify(record);

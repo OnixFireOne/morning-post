@@ -1,8 +1,26 @@
 import { describe, expect, it } from "vitest";
 import type { AiClient, AiGenerateParams, AiGenerateResult } from "../src/ai/client.js";
 import { buildAiPayload } from "../src/ai/payload.js";
+import type { AiProviderProfile } from "../src/ai/providers.js";
 import type { Facts } from "../src/facts.js";
 import { formatSummary, outcomeLabel, runOneWithOptionalRetry, runTotals, verdictText, type FixtureRun, type RunOneOutcome } from "../tools/ai-compare.js";
+
+function testProvider(overrides: Partial<AiProviderProfile> = {}): AiProviderProfile {
+	return {
+		name: "test-provider",
+		baseUrl: "https://provider.example.com",
+		authStyle: "bearer",
+		extraHeaders: {},
+		primaryModel: "m",
+		fallbackModel: "m",
+		costSource: "table",
+		priceTable: {},
+		inputOverhead: 0,
+		balanceSource: "manual",
+		unitRate: 1,
+		...overrides,
+	};
+}
 
 /** Same worked example as the other ai-*.test.ts files. */
 function specExampleFacts(overrides: Partial<Facts> = {}): Facts {
@@ -38,6 +56,9 @@ function okResult(content: string, overrides: Partial<AiGenerateResult> = {}): A
 		errorKind: null,
 		errorMessage: null,
 		rawUsage: null,
+		responseProvider: null,
+		responseModel: null,
+		responseId: null,
 		...overrides,
 	};
 }
@@ -66,7 +87,7 @@ const threeSentenceDayCount =
 describe("runOneWithOptionalRetry: third outcome — trimmed", () => {
 	it("returns kind: trimmed, with the cut observation, the original, and the removed sentence — no retry call even with retry: true", async () => {
 		const { client, calls } = fakeClient([okResult(threeSentenceDayCount)]);
-		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, null, null, facts, true);
+		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, testProvider(), facts, true);
 
 		expect(calls).toHaveLength(1); // trimming replaces the retry entirely
 		expect(outcome.kind).toBe("trimmed");
@@ -82,7 +103,7 @@ describe("runOneWithOptionalRetry: third outcome — trimmed", () => {
 	it("a retry attempt can itself land on trimmed — same handling either way", async () => {
 		const digitObservation = '{"observation": "Всё спокойно, биток держится ровно, но альты штормит на 5%.", "direction": "red"}';
 		const { client } = fakeClient([okResult(digitObservation), okResult(threeSentenceDayCount)]);
-		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, null, null, facts, true);
+		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, "m", "sys", "user", 1000, payload, testProvider(), facts, true);
 
 		expect(outcome.kind).toBe("rejected");
 		expect(retryOutcome?.kind).toBe("trimmed");
@@ -102,6 +123,7 @@ describe("outcomeLabel/verdictText: trimmed reads as its own grade, not folded i
 		durationMs: 1,
 		costEstimate: null,
 		rawUsage: null,
+		responseId: null,
 	};
 
 	it("outcomeLabel", () => {
@@ -118,7 +140,7 @@ describe("runTotals: a trimmed attempt's tokens/cost count toward real spend, sa
 		const fr: FixtureRun = {
 			fixtureName: "f",
 			run: 1,
-			outcome: { kind: "trimmed", picture: "p", observation: "o", direction: "red", originalObservation: "orig", removedSentence: "cut.", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null },
+			outcome: { kind: "trimmed", picture: "p", observation: "o", direction: "red", originalObservation: "orig", removedSentence: "cut.", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null, responseId: null },
 		};
 		expect(runTotals(fr)).toEqual({ tokensIn: 100, tokensOut: 40, costEstimate: 1 });
 	});
@@ -126,20 +148,20 @@ describe("runTotals: a trimmed attempt's tokens/cost count toward real spend, sa
 
 describe("formatSummary: trimmed gets its own line, separate from Принято and Отклонено/ошибок", () => {
 	function acceptedRun(run: number): FixtureRun {
-		return { fixtureName: "f", run, outcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null } };
+		return { fixtureName: "f", run, outcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, responseId: null } };
 	}
 	function trimmedRun(run: number): FixtureRun {
 		return {
 			fixtureName: "f",
 			run,
-			outcome: { kind: "trimmed", picture: "p", observation: "o", direction: "red", originalObservation: "orig", removedSentence: "cut.", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null },
+			outcome: { kind: "trimmed", picture: "p", observation: "o", direction: "red", originalObservation: "orig", removedSentence: "cut.", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, responseId: null },
 		};
 	}
 	function rejectedRun(run: number): FixtureRun {
 		return {
 			fixtureName: "f",
 			run,
-			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null },
+			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, responseId: null },
 		};
 	}
 

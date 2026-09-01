@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { AiClient, AiErrorKind, AiGenerateParams, AiGenerateResult } from "../src/ai/client.js";
 import { buildParagraphs, pickPicture } from "../src/render.js";
 import { buildParagraphsAI, type AiJsonOutput, type BuildParagraphsAiOptions, type AiModelConfig } from "../src/ai/generate.js";
+import type { AiProviderProfile } from "../src/ai/providers.js";
 import type { UsageRecord } from "../src/ai/usage.js";
 import type { Facts } from "../src/facts.js";
 
@@ -57,6 +58,9 @@ function okResult(content: string, overrides: Partial<AiGenerateResult> = {}): A
 		errorKind: null,
 		errorMessage: null,
 		rawUsage: null,
+		responseProvider: null,
+		responseModel: null,
+		responseId: null,
 		...overrides,
 	};
 }
@@ -73,6 +77,9 @@ function failResult(errorKind: NonNullable<AiErrorKind>, overrides: Partial<AiGe
 		errorKind,
 		errorMessage: "boom",
 		rawUsage: null,
+		responseProvider: null,
+		responseModel: null,
+		responseId: null,
 		...overrides,
 	};
 }
@@ -101,7 +108,28 @@ function fakeClient(providerHost: string, responses: CannedResponse[]): { client
 }
 
 function modelConfig(model: string, overrides: Partial<AiModelConfig> = {}): AiModelConfig {
-	return { model, priceInPerMillion: null, priceOutPerMillion: null, ...overrides };
+	return { model, ...overrides };
+}
+
+/** A "table" costSource profile with known prices for the two models these tests use, so cost-related assertions stay meaningful without needing a real provider. */
+function testProvider(overrides: Partial<AiProviderProfile> = {}): AiProviderProfile {
+	return {
+		name: "test-provider",
+		baseUrl: "https://provider.example.com",
+		authStyle: "bearer",
+		extraHeaders: {},
+		primaryModel: "primary-model",
+		fallbackModel: "fallback-model",
+		costSource: "table",
+		priceTable: {
+			"primary-model": { priceInPerMillion: 10, priceOutPerMillion: 20 },
+			"fallback-model": { priceInPerMillion: 30, priceOutPerMillion: 60 },
+		},
+		inputOverhead: 0,
+		balanceSource: "manual",
+		unitRate: 1,
+		...overrides,
+	};
 }
 
 let tmpDir: string;
@@ -132,6 +160,7 @@ function baseOptions(overrides: Partial<BuildParagraphsAiOptions> = {}): BuildPa
 		client: fakeClient("provider.example.com", []).client,
 		primary: modelConfig("primary-model"),
 		fallback: modelConfig("fallback-model"),
+		provider: testProvider(),
 		timeoutMs: 25_000,
 		totalBudgetMs: 70_000,
 		maxAttemptsPerModel: 2,
@@ -160,6 +189,44 @@ describe("buildParagraphsAI: happy path", () => {
 		expect(result.picture).toBe(pickPicture(options.facts));
 		expect(result.attempts).toBe(1);
 		expect(calls).toHaveLength(1);
+	});
+});
+
+describe("buildParagraphsAI: provider/model recorded from the response, not just the requested config (26.08 provider migration, section 5)", () => {
+	it("records responseProvider on the successful result, and providerName/responseProvider/responseModel/costSource on the usage.jsonl line", async () => {
+		const { client } = fakeClient("provider.example.com", [
+			okResult(fixtureText("observation-good"), { responseProvider: "Anthropic", responseModel: "anthropic/claude-sonnet-5" }),
+		]);
+		const options = baseOptions({ client, provider: testProvider({ name: "openrouter", costSource: "table" }) });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(result.responseProvider).toBe("Anthropic");
+
+		const [line] = readUsageLines(options.usageFile);
+		expect(line!.providerName).toBe("openrouter");
+		expect(line!.responseProvider).toBe("Anthropic");
+		expect(line!.responseModel).toBe("anthropic/claude-sonnet-5");
+		expect(line!.costSource).toBe("table");
+	});
+
+	it("responseProvider is null on the result and on the usage.jsonl line when the AI path falls back to the template", async () => {
+		const { client } = fakeClient("provider.example.com", [
+			okResult(fixtureText("observation-digit"), { responseProvider: "Anthropic" }),
+			okResult(fixtureText("observation-digit"), { responseProvider: "Anthropic" }),
+			okResult(fixtureText("observation-digit"), { responseProvider: "Anthropic" }),
+			okResult(fixtureText("observation-digit"), { responseProvider: "Anthropic" }),
+		]);
+		const options = baseOptions({ client, maxAttemptsPerModel: 2 });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(result.source).toBe("template");
+		expect(result.responseProvider).toBeNull();
+		const lines = readUsageLines(options.usageFile);
+		expect(lines.every((l) => l.providerName === "test-provider")).toBe(true);
+		// each individual rejected attempt still recorded its own real responseProvider — only the overall *result* collapses to null on a template day
+		expect(lines.every((l) => l.responseProvider === "Anthropic")).toBe(true);
 	});
 });
 
@@ -313,8 +380,12 @@ describe("buildParagraphsAI: pricing uses the model that actually answered", () 
 		]);
 		const options = baseOptions({
 			client,
-			primary: modelConfig("primary-model", { priceInPerMillion: 1, priceOutPerMillion: 2 }), // would give cost 3 if wrongly applied
-			fallback: modelConfig("fallback-model", { priceInPerMillion: 10, priceOutPerMillion: 20 }), // correct: cost 30
+			provider: testProvider({
+				priceTable: {
+					"primary-model": { priceInPerMillion: 1, priceOutPerMillion: 2 }, // would give cost 3 if wrongly applied
+					"fallback-model": { priceInPerMillion: 10, priceOutPerMillion: 20 }, // correct: cost 30
+				},
+			}),
 		});
 
 		await buildParagraphsAI(options);
@@ -325,9 +396,9 @@ describe("buildParagraphsAI: pricing uses the model that actually answered", () 
 		expect(successLine.costEstimate).toBe(30); // 1M/1M tokens * (10 + 20) per million
 	});
 
-	it("leaves costEstimate null when either price knob is unset for that model", async () => {
+	it("leaves costEstimate null when the answering model has no entry in the provider's price table", async () => {
 		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("observation-good"))]);
-		const options = baseOptions({ client, primary: modelConfig("primary-model", { priceInPerMillion: 5, priceOutPerMillion: null }) });
+		const options = baseOptions({ client, provider: testProvider({ priceTable: {} }) });
 
 		await buildParagraphsAI(options);
 
@@ -346,8 +417,7 @@ describe("buildParagraphsAI: pricing uses the model that actually answered", () 
 		const options = baseOptions({
 			client,
 			maxAttemptsPerModel: 1, // one content rejection exhausts the primary's own attempts and moves straight to fallback
-			primary: modelConfig("primary-model", { priceInPerMillion: 10, priceOutPerMillion: 20 }), // (100k/1M)*10 + (50k/1M)*20 = 2
-			fallback: modelConfig("fallback-model", { priceInPerMillion: 30, priceOutPerMillion: 60 }), // (200k/1M)*30 + (100k/1M)*60 = 12
+			// (100k/1M)*10 + (50k/1M)*20 = 2 for the primary, (200k/1M)*30 + (100k/1M)*60 = 12 for the fallback — testProvider()'s own default price table already prices exactly these two models this way.
 		});
 
 		const result = await buildParagraphsAI(options);
@@ -355,6 +425,39 @@ describe("buildParagraphsAI: pricing uses the model that actually answered", () 
 		expect(result.source).toBe("ai"); // sanity: the fallback did succeed
 		expect(result.attempts).toBe(2);
 		expect(result.totalCost).toBe(14); // 2 + 12, not a single blended price on 300k/150k total tokens
+	});
+});
+
+describe("buildParagraphsAI: costSource 'provider' reads usage.cost from the response verbatim, not the price table (26.08 provider migration)", () => {
+	it("uses the response's own usage.cost, ignoring priceTable entirely, and records costSource: provider on the usage.jsonl line", async () => {
+		const { client } = fakeClient("provider.example.com", [
+			okResult(fixtureText("observation-good"), {
+				usage: { promptTokens: 6158, completionTokens: 226, totalTokens: 6384, cachedTokens: null },
+				rawUsage: { prompt_tokens: 6158, completion_tokens: 226, cost: 0.09570400000000001 },
+			}),
+		]);
+		const options = baseOptions({
+			client,
+			provider: testProvider({ costSource: "provider", priceTable: { "primary-model": { priceInPerMillion: 999, priceOutPerMillion: 999 } } }), // a price table entry that, if wrongly consulted, would give a very different number
+		});
+
+		const result = await buildParagraphsAI(options);
+
+		expect(result.totalCost).toBe(0.09570400000000001);
+		const [line] = readUsageLines(options.usageFile);
+		expect(line!.costEstimate).toBe(0.09570400000000001);
+		expect(line!.costSource).toBe("provider");
+	});
+
+	it("costEstimate is null when the response has no cost field, even though usage was reported", async () => {
+		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("observation-good"), { rawUsage: { prompt_tokens: 100, completion_tokens: 50 } })]);
+		const options = baseOptions({ client, provider: testProvider({ costSource: "provider" }) });
+
+		await buildParagraphsAI(options);
+
+		const [line] = readUsageLines(options.usageFile);
+		expect(line!.costEstimate).toBeNull();
+		expect(line!.costSource).toBe("provider");
 	});
 });
 
@@ -532,13 +635,13 @@ describe("buildParagraphsAI: third outcome — validator:observation_day_count f
 
 	// Replaces the earlier version of this test, which asserted calls.length
 	// === 2 (a same-model retry) for exactly this fixture: a day-count
-	// rejection that attemptDayCountTrim can't safely fix (only one sentence
-	// total here, need >= 3) used to fall through to the pre-existing
-	// retry-same-model behavior. That's no longer true — a same-model retry
-	// on validator:observation_day_count has no realistic upside once
-	// buildRetryObservationPrompt's own day-count instruction is the thing
-	// that already produced the sentence trimming couldn't salvage, so
-	// "not_eligible" now goes straight to the template too, same as
+	// rejection that attemptObservationTrim can't safely fix (only one
+	// sentence total here, need >= 3) used to fall through to the
+	// pre-existing retry-same-model behavior. That's no longer true — a
+	// same-model retry on validator:observation_day_count has no realistic
+	// upside once buildRetryObservationPrompt's own day-count instruction is
+	// the thing that already produced the sentence trimming couldn't salvage,
+	// so "not_eligible" now goes straight to the template too, same as
 	// "trim_failed" — no second paid request either way.
 	it("not_eligible for trimming (day count confined to a single-sentence response) goes straight to the template — no retry, exactly one call", async () => {
 		const { client, calls } = fakeClient("provider.example.com", [okResult(fixtureText("observation-day-count")), okResult(fixtureText("observation-good"))]);

@@ -31,9 +31,8 @@ jobs:
           TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
           TZ: Europe/Moscow
           STATE_FILE: ./data/state.json
-          DRY_RUN: "1"
           MIN_SWARM_SIZE: "20"
-        run: npx tsx src/index.ts
+        run: npx tsx src/index.ts --dry
 
       - uses: actions/upload-artifact@v4
         if: always()

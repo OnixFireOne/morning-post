@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { FetchLike } from "../src/ai/client.js";
+import type { AiProviderProfile } from "../src/ai/providers.js";
 import type { Facts } from "../src/facts.js";
 import { renderPost, type RenderPostConfig } from "../src/renderPost.js";
 import type { StateHistory } from "../src/state.js";
@@ -42,20 +43,34 @@ afterEach(() => {
 	rmSync(tmpDir, { recursive: true, force: true });
 });
 
+function testProvider(overrides: Partial<AiProviderProfile> = {}): AiProviderProfile {
+	return {
+		name: "test-provider",
+		baseUrl: "https://provider.example.com",
+		authStyle: "bearer",
+		extraHeaders: {},
+		primaryModel: "primary-model",
+		fallbackModel: "fallback-model",
+		costSource: "table",
+		priceTable: {},
+		inputOverhead: 0,
+		balanceSource: "manual",
+		unitRate: 1,
+		...overrides,
+	};
+}
+
 function baseConfig(overrides: Partial<RenderPostConfig> = {}): RenderPostConfig {
 	return {
 		aiEnabled: true,
 		dryRun: false,
-		aiAllowRealInDry: false,
+		aiFlag: false,
 		aiBaseUrl: "https://proxy.example.com/v1",
 		aiApiKey: "test-key",
 		aiProxyUrl: "",
 		aiModel: "primary-model",
 		aiModelFallback: "fallback-model",
-		aiPriceIn: null,
-		aiPriceOut: null,
-		aiFallbackPriceIn: null,
-		aiFallbackPriceOut: null,
+		aiProvider: testProvider(),
 		aiTimeoutMs: 25_000,
 		aiTotalBudgetMs: 70_000,
 		aiMaxAttempts: 2,
@@ -79,9 +94,9 @@ function okFetch(): FetchLike {
 }
 
 describe("renderPost: section 3.4 dry-run gate", () => {
-	it("never touches the AI transport when DRY_RUN=1 without AI_ALLOW_REAL_IN_DRY=1 — this is the main test: zero fetch calls", async () => {
+	it("never touches the AI transport with --dry and no --ai — this is the main test: zero fetch calls", async () => {
 		const fetchImpl = vi.fn(okFetch());
-		const config = baseConfig({ dryRun: true, aiAllowRealInDry: false });
+		const config = baseConfig({ dryRun: true, aiFlag: false });
 
 		const result = await renderPost(specExampleFacts(), EMPTY_HISTORY, false, config, fetchImpl);
 
@@ -91,9 +106,9 @@ describe("renderPost: section 3.4 dry-run gate", () => {
 		expect(result.failureReason).toBeNull(); // a deliberate skip, not a failure — no fallback alert should fire over this
 	});
 
-	it("does call the AI transport when DRY_RUN=1 with AI_ALLOW_REAL_IN_DRY=1", async () => {
+	it("does call the AI transport with --dry --ai", async () => {
 		const fetchImpl = vi.fn(okFetch());
-		const config = baseConfig({ dryRun: true, aiAllowRealInDry: true });
+		const config = baseConfig({ dryRun: true, aiFlag: true });
 
 		const result = await renderPost(specExampleFacts(), EMPTY_HISTORY, false, config, fetchImpl);
 
@@ -101,12 +116,12 @@ describe("renderPost: section 3.4 dry-run gate", () => {
 		expect(result.source).toBe("ai");
 	});
 
-	it("is a separate check from skipAi — skipAi alone (DRY_RUN=0) also never calls the transport, for its own distinct reason", async () => {
+	it("is a separate check from skipAi — skipAi alone (dryRun false) also never calls the transport, for its own distinct reason", async () => {
 		// Not the gate under test here, just proving the two checks don't
 		// collapse into one: skipAi already short-circuits before the gate is
-		// even reached, so this must never depend on AI_ALLOW_REAL_IN_DRY at all.
+		// even reached, so this must never depend on aiFlag/--ai at all.
 		const fetchImpl = vi.fn(okFetch());
-		const config = baseConfig({ dryRun: false, aiAllowRealInDry: false });
+		const config = baseConfig({ dryRun: false, aiFlag: false });
 
 		const result = await renderPost(specExampleFacts(), EMPTY_HISTORY, true, config, fetchImpl);
 
@@ -124,9 +139,9 @@ describe("renderPost: section 3.4 dry-run gate", () => {
 		expect(result.source).toBe("ai");
 	});
 
-	it("AI_ENABLED=0 skips before the dry-run gate even runs — template regardless of DRY_RUN/AI_ALLOW_REAL_IN_DRY", async () => {
+	it("AI_ENABLED=0 skips before the dry-run gate even runs — template regardless of --dry/--ai", async () => {
 		const fetchImpl = vi.fn(okFetch());
-		const config = baseConfig({ aiEnabled: false, dryRun: true, aiAllowRealInDry: true });
+		const config = baseConfig({ aiEnabled: false, dryRun: true, aiFlag: true });
 
 		const result = await renderPost(specExampleFacts(), EMPTY_HISTORY, false, config, fetchImpl);
 

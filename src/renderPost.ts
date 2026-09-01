@@ -9,6 +9,7 @@ import path from "node:path";
 import { createAiClient, type FetchLike } from "./ai/client.js";
 import { buildParagraphsAI, type AiModelConfig } from "./ai/generate.js";
 import { stateHistoryToAiHistory } from "./ai/payload.js";
+import type { AiProviderProfile } from "./ai/providers.js";
 import type { Facts } from "./facts.js";
 import { buildCaption, buildCaptionFromParagraphs, buildLeaderLines, buildParagraphs, CAPTION_LIMIT, type PostParagraphs } from "./render.js";
 import type { StateHistory } from "./state.js";
@@ -19,6 +20,8 @@ export type RenderedPost = {
 	source: "ai" | "ai_trimmed" | "template";
 	model: string | null;
 	provider: string | null;
+	/** The upstream inference backend that actually answered — see AiGenerationResult.responseProvider. null on "template". Written into facts.jsonl (factsLog.ts's FactsLogEntry.provider). */
+	responseProvider: string | null;
 	promptVersion: number | null;
 	/** null when AI was never attempted at all (AI_ENABLED=0) — omitted from StateDay rather than written as 0. */
 	tokensIn: number | null;
@@ -36,16 +39,15 @@ export type RenderedPost = {
 export type RenderPostConfig = {
 	aiEnabled: boolean;
 	dryRun: boolean;
-	aiAllowRealInDry: boolean;
+	/** --ai — the only way to spend real money outside a real (non-dry) publish. Meaningless when dryRun is false: a real publish already asks the model whenever aiEnabled is true, this field or not. */
+	aiFlag: boolean;
 	aiBaseUrl: string;
 	aiApiKey: string;
 	aiProxyUrl: string;
 	aiModel: string;
 	aiModelFallback: string;
-	aiPriceIn: number | null;
-	aiPriceOut: number | null;
-	aiFallbackPriceIn: number | null;
-	aiFallbackPriceOut: number | null;
+	/** Selected by AI_PROVIDER (src/ai/providers.ts) — supplies auth style, extra headers, costSource/priceTable/inputOverhead, and the two model defaults aiModel/aiModelFallback fall back to when unset in .env. */
+	aiProvider: AiProviderProfile;
 	aiTimeoutMs: number;
 	aiTotalBudgetMs: number;
 	aiMaxAttempts: number;
@@ -61,6 +63,7 @@ function templateResult(facts: Facts): RenderedPost {
 		source: "template",
 		model: null,
 		provider: null,
+		responseProvider: null,
 		promptVersion: null,
 		tokensIn: null,
 		tokensOut: null,
@@ -88,25 +91,32 @@ export async function renderPost(facts: Facts, history: StateHistory, skipAi: bo
 		return templateResult(facts);
 	}
 
-	// Section 3.4: DRY_RUN=1 never spends a real request on its own — this is
-	// a separate check from skipAi above, not an extension of it. skipAi is
+	// Section 3.4: --dry never spends a real request on its own — this is a
+	// separate check from skipAi above, not an extension of it. skipAi is
 	// about idempotency (don't re-spend on an already-published day); this is
 	// about environment (don't spend during local/dry testing at all), and
 	// the two have to stay distinguishable in the log rather than collapsing
 	// into one silent "skipped" case — a forgotten AI_ENABLED=1 during dry
 	// testing must cost nothing, not cost something quietly. Checked before
 	// any network call and before buildAiPayload() ever runs, so it covers
-	// dry:fixture, dry, and every other DRY_RUN=1 path uniformly — exactly
-	// what the skipAi guard's `!dryRun` exemption missed on 24-25.08.
-	if (config.dryRun && !config.aiAllowRealInDry) {
-		console.log("[ai] skipped: DRY_RUN=1 without AI_ALLOW_REAL_IN_DRY=1 — using template path, no request sent");
+	// --dry --fixture, plain --dry, and every other dry-mode path uniformly —
+	// exactly what the skipAi guard's `!dryRun` exemption missed on 24-25.08.
+	if (config.dryRun && !config.aiFlag) {
+		console.log("[ai] skipped: --dry without --ai — using template path, no request sent");
 		return templateResult(facts);
 	}
 
 	const aiHistory = stateHistoryToAiHistory(history, facts.dateKey);
-	const client = createAiClient({ baseUrl: config.aiBaseUrl, apiKey: config.aiApiKey, proxyUrl: config.aiProxyUrl || undefined, fetchImpl });
-	const primary: AiModelConfig = { model: config.aiModel, priceInPerMillion: config.aiPriceIn, priceOutPerMillion: config.aiPriceOut };
-	const fallback: AiModelConfig = { model: config.aiModelFallback, priceInPerMillion: config.aiFallbackPriceIn, priceOutPerMillion: config.aiFallbackPriceOut };
+	const client = createAiClient({
+		baseUrl: config.aiBaseUrl,
+		apiKey: config.aiApiKey,
+		proxyUrl: config.aiProxyUrl || undefined,
+		authStyle: config.aiProvider.authStyle,
+		extraHeaders: config.aiProvider.extraHeaders,
+		fetchImpl,
+	});
+	const primary: AiModelConfig = { model: config.aiModel };
+	const fallback: AiModelConfig = { model: config.aiModelFallback };
 
 	const result = await buildParagraphsAI({
 		facts,
@@ -114,6 +124,7 @@ export async function renderPost(facts: Facts, history: StateHistory, skipAi: bo
 		client,
 		primary,
 		fallback,
+		provider: config.aiProvider,
 		timeoutMs: config.aiTimeoutMs,
 		totalBudgetMs: config.aiTotalBudgetMs,
 		maxAttemptsPerModel: config.aiMaxAttempts,
@@ -134,6 +145,7 @@ export async function renderPost(facts: Facts, history: StateHistory, skipAi: bo
 				source: result.source,
 				model: result.model,
 				provider: result.provider,
+				responseProvider: result.responseProvider,
 				promptVersion: result.promptVersion,
 				tokensIn: result.totalTokensIn,
 				tokensOut: result.totalTokensOut,
@@ -149,6 +161,7 @@ export async function renderPost(facts: Facts, history: StateHistory, skipAi: bo
 			source: "template",
 			model: null,
 			provider: null,
+			responseProvider: null,
 			promptVersion: null,
 			tokensIn: result.totalTokensIn,
 			tokensOut: result.totalTokensOut,
@@ -166,6 +179,7 @@ export async function renderPost(facts: Facts, history: StateHistory, skipAi: bo
 		source: "template",
 		model: null,
 		provider: null,
+		responseProvider: null,
 		promptVersion: null,
 		tokensIn: result.totalTokensIn,
 		tokensOut: result.totalTokensOut,

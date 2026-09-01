@@ -16,9 +16,12 @@ function usageLine(overrides: Partial<UsageRecord> = {}): string {
 	const record: UsageRecord = {
 		timestamp: "2026-08-25T06:01:00.000Z",
 		attempt: 1,
-		provider: "proxy.example.com",
-		model: "claude-sonnet-4-7",
-		promptVersion: 4,
+		provider: "openrouter.ai",
+		providerName: "openrouter",
+		responseProvider: "Anthropic",
+		responseModel: "anthropic/claude-sonnet-5",
+		model: "anthropic/claude-sonnet-5",
+		promptVersion: 9,
 		tokensIn: 3081,
 		tokensOut: 287,
 		tokensTotal: 3368,
@@ -28,6 +31,7 @@ function usageLine(overrides: Partial<UsageRecord> = {}): string {
 		outcome: "ok",
 		finishReason: "stop",
 		costEstimate: 0.0552,
+		costSource: "provider",
 		dryRun: false,
 		...overrides,
 	};
@@ -37,7 +41,7 @@ function usageLine(overrides: Partial<UsageRecord> = {}): string {
 function today(overrides: Partial<TodayUsage> = {}): TodayUsage {
 	return {
 		source: "ai",
-		model: "claude-sonnet-4-7",
+		model: "anthropic/claude-sonnet-5",
 		attempts: 1,
 		tokensIn: 3081,
 		tokensOut: 287,
@@ -54,7 +58,6 @@ function baseInput(overrides: Partial<UsageReportInput> = {}): UsageReportInput 
 		dateKey: "2026-08-25",
 		today: today(),
 		usageFile: path.join(tmpdir(), "does-not-exist-morning-post-usage.jsonl"),
-		dailyTokenWarn: null,
 		balanceStart: null,
 		balanceAsOf: null,
 		balanceWarn: null,
@@ -105,26 +108,135 @@ describe("buildUsageReport: degradation to template", () => {
 	});
 });
 
-describe("buildUsageReport: the day's cost is priced per-attempt, not blended", () => {
+describe("buildUsageReport: the day's cost is priced per-attempt, not blended, and reported in the provider's unit", () => {
 	it("uses today.totalCost as-is (already summed by generate.ts across a primary content-rejection and a fallback success, each at its own model's price)", () => {
 		// today.totalCost=14 here stands in for generate.ts's own accumulation
 		// (proven separately in tests/ai-generate.test.ts: 2 + 12 = 14 across two
 		// differently-priced models) — this module just has to report it
 		// faithfully, not recompute it.
 		const report = buildUsageReport(baseInput({ today: today({ attempts: 2, model: "fallback-model", totalCost: 14 }) }));
-		expect(report).toContain("Стоимость дня: 14.0000 кредитов");
+		expect(report).toContain("Стоимость дня: 14.0000$");
 		expect(report).toContain("попыток 2");
 	});
 
-	it("balance-window accumulation sums each usage.jsonl row's own costEstimate, from two different models' rows", () => {
+	it("balance-window accumulation sums each usage.jsonl row's own costEstimate, from two different models' rows — an exact figure now, no calibration", () => {
 		const { file, dir } = tmpUsageFile([
-			usageLine({ timestamp: "2026-08-24T06:00:00.000Z", model: "claude-sonnet-4-7", costEstimate: 0.05 }),
-			usageLine({ timestamp: "2026-08-25T06:00:00.000Z", model: "claude-opus-5", costEstimate: 0.08 }),
+			usageLine({ timestamp: "2026-08-24T06:00:00.000Z", model: "anthropic/claude-sonnet-5", costEstimate: 0.05 }),
+			usageLine({ timestamp: "2026-08-25T06:00:00.000Z", model: "anthropic/claude-opus-5", costEstimate: 0.08 }),
 		]);
 		try {
 			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-24" }));
-			expect(report).toContain("Накопленный расход: 0.1300 кредитов за 2 дн.");
-			expect(report).toContain("Остаток баланса: 999.8700 кредитов");
+			expect(report).toContain("Накопленный расход: 0.1300$ за 2 дн.");
+			expect(report).toContain("Остаток баланса: 999.8700$");
+			// no calibration language survives the migration
+			expect(report).not.toContain("оценка снизу");
+			expect(report).not.toContain("калибровка");
+			expect(report).not.toContain("кредит");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("buildUsageReport: mixed costSource within one balance window is flagged, not silently summed", () => {
+	it("adds an explicit note when the window mixes provider and table costSource records", () => {
+		const { file, dir } = tmpUsageFile([
+			usageLine({ timestamp: "2026-08-24T06:00:00.000Z", costEstimate: 0.05, costSource: "provider" }),
+			usageLine({ timestamp: "2026-08-25T06:00:00.000Z", costEstimate: 0.06, costSource: "table" }),
+		]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-24" }));
+			expect(report).toContain("часть этой суммы — оценка по таблице цен");
+			// the sum still happens — every dollar was still spent
+			expect(report).toContain("Накопленный расход: 0.1100$ за 2 дн.");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("says nothing when every record in the window shares one costSource", () => {
+		const { file, dir } = tmpUsageFile([
+			usageLine({ timestamp: "2026-08-24T06:00:00.000Z", costEstimate: 0.05, costSource: "provider" }),
+			usageLine({ timestamp: "2026-08-25T06:00:00.000Z", costEstimate: 0.06, costSource: "provider" }),
+		]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-24" }));
+			expect(report).not.toContain("оценка по таблице цен");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("a pre-migration record with no costSource key at all counts as its own distinct bucket, not silently merged into either real value", () => {
+		const oldLine = JSON.stringify({
+			timestamp: "2026-08-24T06:00:00.000Z",
+			attempt: 1,
+			provider: "proxy.example.com",
+			model: "claude-sonnet-4-7",
+			promptVersion: 4,
+			tokensIn: 100,
+			tokensOut: 50,
+			tokensTotal: 150,
+			cachedTokens: null,
+			usageReported: true,
+			durationMs: 900,
+			outcome: "ok",
+			finishReason: "stop",
+			costEstimate: 0.5,
+			// no "costSource"/"providerName"/"dryRun" key — a genuine pre-migration record
+		});
+		const { file, dir } = tmpUsageFile([oldLine, usageLine({ timestamp: "2026-08-25T06:00:00.000Z", costEstimate: 0.05, costSource: "provider" })]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-24" }));
+			expect(report).toContain("часть этой суммы — оценка по таблице цен");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	// Step 6: the note must not fire every single day just because some
+	// mixed-costSource record exists *somewhere* in usage.jsonl's history — it
+	// only ever fires when a record inside the counted window itself doesn't
+	// match the others. A window that starts exactly on (or after) the
+	// AI_BALANCE_AS_OF transition date, once every record in that window
+	// shares one costSource, must read clean even though the file also holds
+	// older records under a completely different (pre-migration) scheme —
+	// those are never loaded into the window at all, not merely outvoted.
+	it("a window starting on the AI_BALANCE_AS_OF transition day never flags mixed costSource from records strictly before that date", () => {
+		const oldSchemeLine = JSON.stringify({
+			// The day before the transition — old-style record, no costSource key
+			// at all (as if from before this migration), a completely different
+			// tokensIn/costEstimate shape. If this ever leaked into the window,
+			// it would trivially trigger the mixed-costSource note.
+			timestamp: "2026-08-23T06:00:00.000Z",
+			attempt: 1,
+			provider: "proxy.example.com",
+			model: "claude-sonnet-4-7",
+			promptVersion: 4,
+			tokensIn: 3081,
+			tokensOut: 287,
+			tokensTotal: 3368,
+			cachedTokens: null,
+			usageReported: true,
+			durationMs: 900,
+			outcome: "ok",
+			finishReason: "stop",
+			costEstimate: 0.5,
+		});
+		const { file, dir } = tmpUsageFile([
+			oldSchemeLine,
+			// From the transition date onward, every record is uniformly "provider" —
+			// a clean cutover, balanceAsOf set to the first fully-migrated day.
+			usageLine({ timestamp: "2026-08-24T06:00:00.000Z", costEstimate: 0.05, costSource: "provider" }),
+			usageLine({ timestamp: "2026-08-25T06:00:00.000Z", costEstimate: 0.06, costSource: "provider" }),
+			usageLine({ timestamp: "2026-08-26T06:00:00.000Z", costEstimate: 0.06, costSource: "provider" }),
+		]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-24" }));
+			expect(report).not.toContain("часть этой суммы — оценка по таблице цен");
+			// sanity: the old-scheme day's cost genuinely isn't in this sum —
+			// only the three "provider" records (0.05 + 0.06 + 0.06) are.
+			expect(report).toContain("Накопленный расход: 0.1700$ за 3 дн.");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -141,10 +253,10 @@ describe("buildUsageReport: dryRun lines count toward balance/remaining but not 
 		try {
 			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-23" }));
 			// накопленный расход/остаток: all three days, dry-run included — "потраченное потрачено"
-			expect(report).toContain("Накопленный расход: 3.0000 кредитов за 3 дн.");
-			expect(report).toContain("Остаток баланса: 997.0000 кредитов");
+			expect(report).toContain("Накопленный расход: 3.0000$ за 3 дн.");
+			expect(report).toContain("Остаток баланса: 997.0000$");
 			// среднее/прогноз: only the two real days — the dry-run burst doesn't inflate the modeled daily rate
-			expect(report).toContain("Среднее: 0.5000 кредитов/день, хватит примерно на 1994 дн.");
+			expect(report).toContain("Среднее: 0.5000$/день, хватит примерно на 1994 дн.");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -171,7 +283,7 @@ describe("buildUsageReport: dryRun lines count toward balance/remaining but not 
 		const { file, dir } = tmpUsageFile([oldLine]);
 		try {
 			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-24" }));
-			expect(report).toContain("Среднее: 0.5000 кредитов/день");
+			expect(report).toContain("Среднее: 0.5000$/день");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -188,7 +300,7 @@ describe("buildUsageReport: a corrupted/truncated usage.jsonl line doesn't break
 		try {
 			expect(readUsageRecords(file)).toHaveLength(2);
 			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-24" }));
-			expect(report).toContain("Накопленный расход: 0.1100 кредитов за 2 дн.");
+			expect(report).toContain("Накопленный расход: 0.1100$ за 2 дн.");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -220,14 +332,14 @@ describe("buildUsageReport: balance thresholds", () => {
 		}
 	});
 
-	it("adds an attention line when the day's tokens exceed AI_DAILY_TOKEN_WARN", () => {
-		const report = buildUsageReport(baseInput({ today: today({ tokensIn: 5000, tokensOut: 2000 }), dailyTokenWarn: 1000 }));
-		expect(report!.split("\n")[0]).toContain("⚠️");
-		expect(report!.split("\n")[0]).toContain("токены дня выше порога");
-	});
+	// AI_DAILY_TOKEN_WARN and its "токены дня выше порога" attention line were
+	// removed outright (26.08 provider migration, legacy-variable cleanup) —
+	// not replaced by anything; UsageReportInput no longer has a
+	// dailyTokenWarn field at all. The test that used to cover it is gone
+	// with the feature, not left behind pointing at dead code.
 
 	it("is neutral — no warning markers — on an ordinary day", () => {
-		const report = buildUsageReport(baseInput({ dailyTokenWarn: 100_000, balanceStart: 1000, balanceAsOf: "2026-08-25", balanceWarn: 10 }));
+		const report = buildUsageReport(baseInput({ balanceStart: 1000, balanceAsOf: "2026-08-25", balanceWarn: 10 }));
 		expect(report).not.toContain("⚠️");
 	});
 });

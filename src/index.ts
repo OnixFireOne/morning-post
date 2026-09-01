@@ -2,32 +2,57 @@ import "dotenv/config";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { formatAlert, sendAlert } from "./alert.js";
+import { resolveProviderProfile } from "./ai/providers.js";
 import { buildUsageReport } from "./ai/usageReport.js";
 import { captureSnapshotAndScreenshot } from "./capture.js";
+import { parseArgs, type CliArgs } from "./cliArgs.js";
 import { RetryExhaustedError } from "./errors.js";
 import { computeFacts, type StateDay } from "./facts.js";
 import { appendFactsLogLine } from "./factsLog.js";
 import { renderPost } from "./renderPost.js";
-import { loadSnapshotFromFile } from "./snapshot.js";
+import { loadSnapshotFileOrThrow, resolveSnapshotSource } from "./snapshot.js";
 import { appendDay, findPostedDay, readState, writeStateAtomic } from "./state.js";
 import { sendMessage, sendPhoto } from "./telegram.js";
 
-function readEnv() {
-	const args = process.argv.slice(2);
-	// Позиционный аргумент — обход .env для разовых прогонов на фикстуре, без
-	// префиксов вида `SNAPSHOT_FILE=... npm run dry`, которые не работают в
-	// PowerShell/cmd (раздел 6): `npm run dry:fixture -- fixtures/green.json`.
-	const snapshotFileOverride = args.find((a) => !a.startsWith("--"));
+/**
+ * Режим определяется исключительно аргументами командной строки — .env
+ * хранит только адреса/ключи/пороги. Разбирается до всего остального: сбой
+ * здесь — это опечатка в самой команде запуска, а не ошибка во время
+ * работы, поэтому печатается и завершает процесс сразу же, без алерта
+ * (Telegram ещё даже не проверен на этом шаге — validateStartupConfig ниже
+ * его и не видел).
+ */
+function parseArgsOrExit(): CliArgs {
+	try {
+		return parseArgs(process.argv.slice(2));
+	} catch (err) {
+		console.error(`[startup] ${err instanceof Error ? err.message : String(err)}`);
+		process.exit(1);
+	}
+}
+
+const args = parseArgsOrExit();
+
+function readEnv(args: CliArgs) {
 	const stateFile = path.resolve(process.env.STATE_FILE || "data/state.json");
 	const usageReportMode = process.env.AI_USAGE_REPORT === "weekly" ? "weekly" : process.env.AI_USAGE_REPORT === "0" ? "0" : "daily";
+	// Resolved once, up front: an unrecognized AI_PROVIDER must fail loudly at
+	// startup (before any browser/network work), not fall back silently.
+	// inputOverhead lives entirely in the profile itself (0 for both current
+	// profiles) — no env knob for it: an external override for "correct for
+	// someone else's undocumented billing" is a direct invitation to repeat
+	// that exact history with a different magic number (see git history for
+	// what that looked like the first time).
+	const providerProfile = resolveProviderProfile(process.env.AI_PROVIDER);
 	return {
 		siteUrl: process.env.SITE_URL ?? "",
 		// `||`, not `??`, everywhere below: an empty string in .env (e.g. a value
 		// swallowed by an unquoted `#` comment) must fall back too, not become 0/"".
 		chartSelector: process.env.CHART_SELECTOR || "#hot-coins-chart",
-		snapshotFile: snapshotFileOverride || process.env.SNAPSHOT_FILE || "",
+		// --fixture=<path>, parsed and validated (only with --dry) in cliArgs.ts.
+		fixture: args.fixture,
 		minSwarmSize: Number(process.env.MIN_SWARM_SIZE || 20),
-		dryRun: process.env.DRY_RUN === "1",
+		dryRun: args.dry,
 		outDir: path.resolve(process.env.OUT_DIR || "out"),
 		stateFile,
 		// Section 3.2: usage.jsonl lives in ./data (the same mounted volume as
@@ -39,7 +64,7 @@ function readEnv() {
 		// own 60-day cap). Same mounted ./data volume by default, own
 		// independently configurable path.
 		factsLogFile: path.resolve(process.env.FACTS_LOG_FILE || "data/facts.jsonl"),
-		force: args.includes("--force"),
+		force: args.force,
 		telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || "",
 		telegramTargetChatId: process.env.TELEGRAM_TARGET_CHAT_ID || "",
 		telegramAdminChatId: process.env.TELEGRAM_ADMIN_CHAT_ID || "",
@@ -47,24 +72,26 @@ function readEnv() {
 		// must stay "0" until a human has run the full manual verification — see
 		// .env.example. When it's off, none of the fields below are read.
 		aiEnabled: process.env.AI_ENABLED === "1",
-		aiBaseUrl: process.env.AI_BASE_URL || "",
+		// AI_PROVIDER selects the profile (src/ai/providers.ts) — the one place
+		// a provider name, base URL default, model default, or price number may
+		// live (tests/ai-providers-leak.test.ts enforces this). AI_BASE_URL/
+		// AI_MODEL/AI_MODEL_FALLBACK, when actually set in .env, still override
+		// the selected profile's own default for exactly that field — the
+		// profile fills gaps, it never forces a value nobody asked to change.
+		aiProvider: providerProfile,
+		aiBaseUrl: process.env.AI_BASE_URL || providerProfile.baseUrl,
 		aiApiKey: process.env.AI_API_KEY || "",
-		aiModel: process.env.AI_MODEL || "",
-		aiModelFallback: process.env.AI_MODEL_FALLBACK || "",
+		aiModel: process.env.AI_MODEL || providerProfile.primaryModel,
+		aiModelFallback: process.env.AI_MODEL_FALLBACK || providerProfile.fallbackModel,
 		aiTimeoutMs: Number(process.env.AI_TIMEOUT_MS || 25000),
 		aiTotalBudgetMs: Number(process.env.AI_TOTAL_BUDGET_MS || 70000),
 		aiMaxAttempts: Number(process.env.AI_MAX_ATTEMPTS || 2),
 		promptVersion: Number(process.env.PROMPT_VERSION || 1),
-		// null (not 0) means "price unknown, don't estimate cost" — distinct from a free model.
-		aiPriceIn: process.env.AI_PRICE_IN ? Number(process.env.AI_PRICE_IN) : null,
-		aiPriceOut: process.env.AI_PRICE_OUT ? Number(process.env.AI_PRICE_OUT) : null,
-		aiFallbackPriceIn: process.env.AI_FALLBACK_PRICE_IN ? Number(process.env.AI_FALLBACK_PRICE_IN) : null,
-		aiFallbackPriceOut: process.env.AI_FALLBACK_PRICE_OUT ? Number(process.env.AI_FALLBACK_PRICE_OUT) : null,
-		aiDailyTokenWarn: process.env.AI_DAILY_TOKEN_WARN ? Number(process.env.AI_DAILY_TOKEN_WARN) : null,
-		// Section 3.4: DRY_RUN=1 must never spend a real request on its own —
-		// this is the explicit opt-in a human sets on the command line for a
-		// deliberate obkatka run under DRY_RUN=1.
-		aiAllowRealInDry: process.env.AI_ALLOW_REAL_IN_DRY === "1",
+		// Section 3.4: --dry must never spend a real request on its own — --ai
+		// is the explicit opt-in on the command line for a deliberate obkatka
+		// run. Meaningless (and unchecked) outside --dry: a real, non-dry
+		// publish already asks the model whenever AI_ENABLED=1, flag or not.
+		aiFlag: args.ai,
 		// Not AI_BASE_URL's own proxy (AiClientOptions.proxyUrl) — this is the
 		// outbound network proxy for reaching it at all (section 2).
 		aiProxyUrl: process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "",
@@ -80,7 +107,7 @@ type Env = ReturnType<typeof readEnv>;
 
 // Доступны process-level обработчикам ниже, которые не видят локальные
 // переменные main() — поэтому шаг и env кэшируются на уровне модуля.
-const env = readEnv();
+const env = readEnv(args);
 let currentStep = "startup";
 let alerted = false;
 
@@ -146,6 +173,16 @@ process.on("unhandledRejection", (reason) => {
 });
 
 async function main() {
+	// До любого тяжёлого шага и до validateStartupConfig — не нужно разбирать
+	// стек, чтобы понять, какой режим вообще отработал и почему.
+	const snapshotSource = resolveSnapshotSource({ fixture: env.fixture, siteUrl: env.siteUrl });
+	// В бою ИИ решает единственный аварийный выключатель, AI_ENABLED; всухую —
+	// --ai (аварийный выключатель прода всё равно первым — см. renderPost.ts).
+	const aiActive = env.aiEnabled && (env.dryRun ? env.aiFlag : true);
+	console.log(
+		`mode: ${env.dryRun ? "dry" : "production"} / ${snapshotSource.mode === "file" ? `fixture ${snapshotSource.path}` : "live site"} / AI ${aiActive ? "on" : "off"}`,
+	);
+
 	validateStartupConfig();
 
 	let snapshot;
@@ -153,13 +190,12 @@ async function main() {
 	let stabilizationReads = 0;
 
 	currentStep = "capture";
-	if (env.snapshotFile) {
-		snapshot = loadSnapshotFromFile(env.snapshotFile);
-		console.log(`[capture] snapshot from file: ${env.snapshotFile}`);
+	if (snapshotSource.mode === "file") {
+		snapshot = loadSnapshotFileOrThrow(snapshotSource.path);
 	} else {
-		if (!env.siteUrl) throw new Error("SITE_URL is not set (.env)");
+		if (!snapshotSource.url) throw new Error("SITE_URL is not set (.env)");
 		const result = await captureSnapshotAndScreenshot({
-			siteUrl: env.siteUrl,
+			siteUrl: snapshotSource.url,
 			chartSelector: env.chartSelector,
 			minSwarmSize: env.minSwarmSize,
 		});
@@ -213,38 +249,26 @@ async function main() {
 		if (!delivered) console.error(text);
 	}
 
-	// Third outcome (2026-08-26): the AI response was fixed by cutting one
-	// sentence (validator:observation_day_count only — see attemptDayCountTrim)
-	// instead of falling back to the template. Not a failure — the post still
-	// goes out AI-sourced — but it's still a repair worth knowing about, same
+	// Third outcome (2026-08-26, generalized 2026-09-01 to any trimmable
+	// reason — see validator.ts's TRIMMABLE_REASONS/attemptObservationTrim):
+	// the AI response was fixed by cutting one sentence instead of falling
+	// back to the template. Not a failure — the post still goes out
+	// AI-sourced — but it's still a repair worth knowing about, same
 	// non-blocking alert mechanism and priority as the fallback alert above.
+	// AiGenerationResult doesn't carry which reason triggered the cut (only
+	// AiJsonOutput's own attempts[].outcome does, for offline debugging), so
+	// this message stays reason-agnostic rather than naming one specific
+	// validator item that may not be the one that actually fired.
 	if (env.aiEnabled && rendered.source === "ai_trimmed") {
 		currentStep = "ai:trim-alert";
 		const text = formatAlert({
 			step: "ai:trimmed",
-			error: new Error(`cut one sentence for validator:observation_day_count: "${rendered.trimmedSentence}"`),
+			error: new Error(`cut one sentence that failed validation: "${rendered.trimmedSentence}"`),
 			siteUrl: env.siteUrl || undefined,
 			exitCode: 0,
 		});
 		const delivered = await sendAlert({ botToken: env.telegramBotToken, chatId: env.telegramAdminChatId, text });
 		if (!delivered) console.error(text);
-	}
-
-	// One generation per day (single daily cron run) — this run's token total
-	// is the day's token total, no need to sum usage.jsonl across runs.
-	if (env.aiEnabled && env.aiDailyTokenWarn !== null && rendered.tokensIn !== null && rendered.tokensOut !== null) {
-		const totalTokens = rendered.tokensIn + rendered.tokensOut;
-		if (totalTokens > env.aiDailyTokenWarn) {
-			currentStep = "ai:token-warn-alert";
-			const text = formatAlert({
-				step: "ai:token-warn",
-				error: new Error(`AI token usage today: ${totalTokens} > AI_DAILY_TOKEN_WARN=${env.aiDailyTokenWarn}`),
-				siteUrl: env.siteUrl || undefined,
-				exitCode: 0,
-			});
-			const delivered = await sendAlert({ botToken: env.telegramBotToken, chatId: env.telegramAdminChatId, text });
-			if (!delivered) console.error(text);
-		}
 	}
 
 	// Раздел 5: если за сегодняшнюю (московскую) дату уже есть пост — выходим
@@ -313,6 +337,7 @@ async function main() {
 			topLoser: facts.losers[0] ? { ticker: facts.losers[0].ticker, change24h: facts.losers[0].change24h } : null,
 			source: rendered.source,
 			model: rendered.model,
+			provider: rendered.responseProvider,
 			promptVersion: rendered.promptVersion,
 		});
 	} catch (err) {
@@ -351,16 +376,9 @@ async function main() {
 					failureReason: rendered.failureReason,
 				},
 				usageFile: env.usageFile,
-				dailyTokenWarn: env.aiDailyTokenWarn,
 				balanceStart: env.aiBalanceStart,
 				balanceAsOf: env.aiBalanceAsOf,
 				balanceWarn: env.aiBalanceWarn,
-				modelPrices: {
-					...(env.aiModel && env.aiPriceIn !== null && env.aiPriceOut !== null ? { [env.aiModel]: { priceInPerMillion: env.aiPriceIn, priceOutPerMillion: env.aiPriceOut } } : {}),
-					...(env.aiModelFallback && env.aiFallbackPriceIn !== null && env.aiFallbackPriceOut !== null
-						? { [env.aiModelFallback]: { priceInPerMillion: env.aiFallbackPriceIn, priceOutPerMillion: env.aiFallbackPriceOut } }
-						: {}),
-				},
 			});
 			if (report) {
 				const delivered = await sendAlert({ botToken: env.telegramBotToken, chatId: env.telegramAdminChatId, text: report });

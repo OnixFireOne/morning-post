@@ -45,11 +45,11 @@ import "dotenv/config";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createAiClient, type AiClient, type AiUsage } from "../src/ai/client.js";
+import { createAiClient, type AiClient, type FetchLike } from "../src/ai/client.js";
 import { buildAiPayload, stateHistoryToAiHistory, type AiPayload } from "../src/ai/payload.js";
 import { buildRetryObservationPrompt, buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
-import { billedInputTokens, computeCost, PROXY_INPUT_TOKEN_OVERHEAD } from "../src/ai/usage.js";
-import { attemptDayCountTrim, validateAiObservation, type ObservationValidationFailureReason } from "../src/ai/validator.js";
+import { computeAttemptCost, resolveProviderProfile, type AiProviderProfile } from "../src/ai/providers.js";
+import { attemptObservationTrim, isTrimmableReason, validateAiObservation, type ObservationValidationFailureReason } from "../src/ai/validator.js";
 import { computeFacts, shiftDateKey, type Facts, type StateHistory } from "../src/facts.js";
 import { buildParagraphs, pickPicture, type PostParagraphs } from "../src/render.js";
 import { loadSnapshotFromFile } from "../src/snapshot.js";
@@ -82,6 +82,15 @@ const ALL_FIXTURE_NAMES = [
 // data variance — checked once per report, not once per fixture.
 const SYSTEM_PROMPT_NORM_MAX_CHARS = 4000;
 
+// The dollar is the only unit anywhere in this project (see
+// src/ai/providers.ts's own unitRate note and src/ai/usageReport.ts's own
+// CURRENCY_SYMBOL) — this tool's own local copy of that one literal, since
+// this file lives in tools/, outside src/'s own leak-scan scope
+// (tests/ai-providers-leak.test.ts). computeAttemptCost() (src/ai/providers.js)
+// already returns USD; this constant is display formatting only, never a
+// second place currency conversion could happen.
+const CURRENCY_SYMBOL = "$";
+
 /**
  * validateAiObservation's own checks (PROMPT_VERSION 7's active path — items
  * 1/7/9/10, the numbers whitelist/digit day-count/derived-number words/
@@ -112,8 +121,10 @@ export type RunOutcome =
 			tokensOut: number | null;
 			durationMs: number;
 			costEstimate: number | null;
-			/** The proxy's own usage block, untouched — see AiGenerateResult.rawUsage in client.ts. */
+			/** The provider's own usage block, untouched — see AiGenerateResult.rawUsage in client.ts. */
 			rawUsage: unknown;
+			/** OpenRouter's own generation id — see fetchModelPermaslug below. null for a provider that doesn't report one. */
+			responseId: string | null;
 	  }
 	| {
 			kind: "rejected";
@@ -125,12 +136,14 @@ export type RunOutcome =
 			durationMs: number;
 			costEstimate: number | null;
 			rawUsage: unknown;
+			responseId: string | null;
 	  }
-	// Third outcome (2026-08-26): would have been "rejected" for
-	// validator:observation_day_count, but exactly one sentence carried the
-	// violation and cutting it left a paragraph that passed
-	// validateAiObservation whole — see validator.ts's attemptDayCountTrim.
-	// A distinct grade from "accepted", shown separately in the report: the
+	// Third outcome (2026-08-26, generalized 2026-09-01): would have been
+	// "rejected" for a trimmable reason (validator:observation_day_count or
+	// validator:length), but cutting one sentence left a paragraph that
+	// passed validateAiObservation whole — see validator.ts's
+	// attemptObservationTrim. A distinct grade from "accepted", shown
+	// separately in the report: the
 	// model's raw answer wasn't clean, even though what got published was.
 	| {
 			kind: "trimmed";
@@ -144,6 +157,7 @@ export type RunOutcome =
 			durationMs: number;
 			costEstimate: number | null;
 			rawUsage: unknown;
+			responseId: string | null;
 	  }
 	| { kind: "transport"; label: string; errorMessage: string | null; durationMs: number }
 	// --chain-degrade only: this step deliberately skipped the model entirely
@@ -177,9 +191,12 @@ export function outcomeLabel(outcome: RunOneOutcome): string {
 export type CompareOptions = {
 	client: AiClient;
 	modelId: string;
-	/** This run's own price knobs — the fallback's when modelId is the fallback model, mirroring how production prices an attempt by whichever model actually answered it. */
-	priceInPerMillion: number | null;
-	priceOutPerMillion: number | null;
+	/** Drives cost computation (costSource/priceTable/inputOverhead — see providers.ts's computeAttemptCost) for every run in this call, regardless of whether modelId is the profile's primary or fallback model. */
+	provider: AiProviderProfile;
+	/** Needed only for the post-run model_permaslug lookup (fetchModelPermaslug) — the real API key, same one the client was built with. Never logged. */
+	apiKey: string;
+	/** Injectable for tests — defaults to the global fetch when omitted. Only ever used for the one GET .../generation?id=... lookup after every run is done; client.generate() calls go through `client` above, unaffected by this. */
+	permaslugFetchImpl?: FetchLike;
 	fixtureNames: string[];
 	runsPerFixture: number;
 	timeoutMs: number;
@@ -234,8 +251,7 @@ async function runOne(
 	user: string,
 	timeoutMs: number,
 	payload: AiPayload,
-	priceInPerMillion: number | null,
-	priceOutPerMillion: number | null,
+	provider: AiProviderProfile,
 	/** Paragraph 1 is code-generated (pickPicture), never part of the model's response — needed here only to attach it to the "accepted" outcome for the report's pairwise display. */
 	facts: Facts,
 ): Promise<RunOneOutcome> {
@@ -248,7 +264,7 @@ async function runOne(
 
 	const rawText = result.content ?? "";
 	const validation = validateAiObservation(rawText, payload);
-	const costEstimate = computeCost(result.usage, priceInPerMillion, priceOutPerMillion);
+	const costEstimate = computeAttemptCost(provider, modelId, result.usage, result.rawUsage);
 	const tokensIn = result.usage?.promptTokens ?? null;
 	const tokensOut = result.usage?.completionTokens ?? null;
 
@@ -263,15 +279,17 @@ async function runOne(
 			durationMs: result.durationMs,
 			costEstimate,
 			rawUsage: result.rawUsage,
+			responseId: result.responseId,
 		};
 	}
 
 	// Same third outcome as generate.ts's production path (src/ai/generate.ts) —
 	// one shared definition of the eligibility/re-validation rules
-	// (validator.ts's attemptDayCountTrim), so this report can never disagree
-	// with what the real post would have done for the exact same response.
-	if (validation.reason === "validator:observation_day_count") {
-		const trim = attemptDayCountTrim(rawText, payload);
+	// (validator.ts's attemptObservationTrim), so this report can never
+	// disagree with what the real post would have done for the exact same
+	// response.
+	if (isTrimmableReason(validation.reason)) {
+		const trim = attemptObservationTrim(rawText, payload, validation.reason);
 		if (trim.ok) {
 			return {
 				kind: "trimmed",
@@ -285,6 +303,7 @@ async function runOne(
 				durationMs: result.durationMs,
 				costEstimate,
 				rawUsage: result.rawUsage,
+				responseId: result.responseId,
 			};
 		}
 		// "not_eligible" or "trim_failed" — either way, this specific rawText
@@ -303,6 +322,7 @@ async function runOne(
 		durationMs: result.durationMs,
 		costEstimate,
 		rawUsage: result.rawUsage,
+		responseId: result.responseId,
 	};
 }
 
@@ -323,42 +343,92 @@ export async function runOneWithOptionalRetry(
 	user: string,
 	timeoutMs: number,
 	payload: AiPayload,
-	priceInPerMillion: number | null,
-	priceOutPerMillion: number | null,
+	provider: AiProviderProfile,
 	facts: Facts,
 	retry: boolean,
 ): Promise<{ outcome: RunOneOutcome; retryOutcome?: RunOneOutcome }> {
-	const outcome = await runOne(client, modelId, system, user, timeoutMs, payload, priceInPerMillion, priceOutPerMillion, facts);
+	const outcome = await runOne(client, modelId, system, user, timeoutMs, payload, provider, facts);
 	if (!retry || outcome.kind !== "rejected") return { outcome };
 
 	const retryUser = buildRetryObservationPrompt(payload, outcome.reason);
-	const retryOutcome = await runOne(client, modelId, system, retryUser, timeoutMs, payload, priceInPerMillion, priceOutPerMillion, facts);
+	const retryOutcome = await runOne(client, modelId, system, retryUser, timeoutMs, payload, provider, facts);
 	return { outcome, retryOutcome };
 }
 
 function formatCostLine(costEstimate: number | null): string {
-	return costEstimate !== null ? `- Стоимость (оценка): ${costEstimate.toFixed(4)} кредитов` : `- Стоимость: не посчитана (цена для этой модели не задана в .env)`;
+	return costEstimate !== null ? `- Стоимость: ${costEstimate.toFixed(4)}${CURRENCY_SYMBOL}` : "- Стоимость: не посчитана (модель не в price table, и costSource не provider)";
+}
+
+/** As-is, no interpretation — exactly what client.ts's AiGenerateResult.rawUsage carries, for comparing against the provider's own billing panel by eye. */
+function formatRawUsageBlock(rawUsage: unknown): string {
+	return ["**Сырой usage от провайдера (как есть, без интерпретации):**", "```json", JSON.stringify(rawUsage, null, 2), "```"].join("\n");
 }
 
 /**
- * Same formula computeCost() already uses — just called with promptTokens
- * reduced by billedInputTokens() (src/ai/usage.js — the one shared
- * definition, also used by src/ai/usageReport.ts's balance calibration).
- * Returns null (no line) under the exact same conditions computeCost()
- * itself would: no usage, or either price knob unset for this model.
+ * The most recent real (non-transport, non-forced) run's own OpenRouter
+ * generation id, newest run last in `runs` — used once per report, after
+ * every run is done, to look up which exact upstream model actually
+ * answered (see fetchModelPermaslug below). null when nothing in the report
+ * ever got a real response with an id (every run was transport/forced, or
+ * the provider doesn't report generation ids at all).
  */
-export function formatCalibratedCostLine(tokensIn: number | null, tokensOut: number | null, priceInPerMillion: number | null, priceOutPerMillion: number | null): string | null {
-	if (tokensIn === null || tokensOut === null) return null;
-	const calibratedTokensIn = billedInputTokens(tokensIn);
-	const calibratedUsage: AiUsage = { promptTokens: calibratedTokensIn, completionTokens: tokensOut, totalTokens: calibratedTokensIn + tokensOut, cachedTokens: null };
-	const calibratedCost = computeCost(calibratedUsage, priceInPerMillion, priceOutPerMillion);
-	if (calibratedCost === null) return null;
-	return `- Оценка с поправкой на оверхед прокси (−${PROXY_INPUT_TOKEN_OVERHEAD} входных токенов): ${calibratedCost.toFixed(4)} кредитов — эмпирическая калибровка по панели прокси, не данные API.`;
+function lastResponseId(runs: FixtureRun[]): string | null {
+	for (let i = runs.length - 1; i >= 0; i--) {
+		const final = finalOutcome(runs[i]!);
+		if (final.kind === "accepted" || final.kind === "trimmed" || final.kind === "rejected") return final.responseId;
+	}
+	return null;
 }
 
-/** As-is, no interpretation — exactly what client.ts's AiGenerateResult.rawUsage carries, for comparing against the proxy's own billing panel by eye. */
-function formatRawUsageBlock(rawUsage: unknown): string {
-	return ["**Сырой usage от прокси (как есть, без интерпретации):**", "```json", JSON.stringify(rawUsage, null, 2), "```"].join("\n");
+/** Success carries the permaslug; failure carries a human-readable reason (HTTP status plus the body's own error message when the body parses, or the exception message on a network error) — 01.09's report showed a bare "запрос не удался" for every failure mode, indistinguishable from each other and useless for telling an expired/under-scoped key apart from a transient miss. */
+export type PermaslugLookupResult = { ok: true; permaslug: string } | { ok: false; reason: string };
+
+/**
+ * OpenRouter-specific: GET /api/v1/generation?id=<id> after a run has
+ * already happened, to learn model_permaslug — which exact upstream model
+ * variant actually answered (routing can normalize the requested slug).
+ * ai:compare-only: this is one extra network round trip purely for the
+ * report's own header, not worth paying at 9am on the production path —
+ * generate.ts never calls this. Never throws: a failed lookup (network
+ * error, non-2xx, unexpected shape) just means the header line says so via
+ * PermaslugLookupResult's own reason, it never breaks report generation
+ * over a cosmetic extra fact.
+ */
+export async function fetchModelPermaslug(baseUrl: string, apiKey: string, generationId: string, fetchImpl: FetchLike): Promise<PermaslugLookupResult> {
+	const url = `${baseUrl.replace(/\/+$/, "")}/generation?id=${encodeURIComponent(generationId)}`;
+	let response: Awaited<ReturnType<FetchLike>>;
+	try {
+		response = await fetchImpl(url, { method: "GET", headers: { Authorization: `Bearer ${apiKey}` } });
+	} catch (err) {
+		return { ok: false, reason: `сетевая ошибка: ${err instanceof Error ? err.message : String(err)}` };
+	}
+
+	if (!response.ok) {
+		let bodyDetail = "";
+		try {
+			const body = (await response.json()) as { error?: { message?: string } };
+			if (body.error?.message) bodyDetail = `: ${body.error.message}`;
+		} catch {
+			// body isn't JSON, or is empty — the HTTP status alone is still useful
+		}
+		return { ok: false, reason: `HTTP ${response.status}${bodyDetail}` };
+	}
+
+	let data: { data?: { model_permaslug?: string } };
+	try {
+		data = (await response.json()) as { data?: { model_permaslug?: string } };
+	} catch {
+		return { ok: false, reason: "тело ответа не JSON" };
+	}
+	const permaslug = data.data?.model_permaslug;
+	if (!permaslug) return { ok: false, reason: "ответ без model_permaslug" };
+	return { ok: true, permaslug };
+}
+
+/** Shared by runCompare and runChain's own header — null means fetchModelPermaslug was never called at all (no generationId to look up). */
+function formatPermaslugLine(result: PermaslugLookupResult | null): string {
+	if (result === null) return "н/д (нет generation id в ответе)";
+	return result.ok ? result.permaslug : `н/д (${result.reason})`;
 }
 
 function formatSection31Line(label: string, leaked: string[]): string {
@@ -422,7 +492,7 @@ function formatFixtureHeader(fixtureName: string, facts: Facts, payload: AiPaylo
  * always did; a real label ("Первая попытка"/"Повторная попытка (--retry)")
  * is only used once a run actually has two attempts to tell apart.
  */
-function formatAttemptOutcome(label: string | null, outcome: RunOneOutcome, priceInPerMillion: number | null, priceOutPerMillion: number | null): string {
+function formatAttemptOutcome(label: string | null, outcome: RunOneOutcome): string {
 	const labelLines = label ? [`**${label}:**`, ""] : [];
 
 	if (outcome.kind === "transport") {
@@ -434,7 +504,6 @@ function formatAttemptOutcome(label: string | null, outcome: RunOneOutcome, pric
 	const tokensLine = `- Токены: in=${outcome.tokensIn ?? "н/д"} out=${outcome.tokensOut ?? "н/д"}`;
 	const timeLine = `- Время ответа: ${outcome.durationMs} ms`;
 	const costLine = formatCostLine(outcome.costEstimate);
-	const calibratedCostLine = formatCalibratedCostLine(outcome.tokensIn, outcome.tokensOut, priceInPerMillion, priceOutPerMillion);
 
 	if (outcome.kind === "accepted") {
 		return [
@@ -442,7 +511,6 @@ function formatAttemptOutcome(label: string | null, outcome: RunOneOutcome, pric
 			"- Вердикт: ✅ принято",
 			tokensLine,
 			costLine,
-			...(calibratedCostLine ? [calibratedCostLine] : []),
 			timeLine,
 			"",
 			formatRawUsageBlock(outcome.rawUsage),
@@ -463,7 +531,6 @@ function formatAttemptOutcome(label: string | null, outcome: RunOneOutcome, pric
 			"- Вердикт: ✂️ починено вырезанием предложения (новое: любой счёт дней (словом или цифрой), исходно только в одном предложении из трёх+)",
 			tokensLine,
 			costLine,
-			...(calibratedCostLine ? [calibratedCostLine] : []),
 			timeLine,
 			"",
 			formatRawUsageBlock(outcome.rawUsage),
@@ -489,7 +556,6 @@ function formatAttemptOutcome(label: string | null, outcome: RunOneOutcome, pric
 		`- Вердикт: ❌ отклонено — ${VALIDATOR_ITEM_LABELS[outcome.reason]}: ${outcome.detail}`,
 		tokensLine,
 		costLine,
-		...(calibratedCostLine ? [calibratedCostLine] : []),
 		timeLine,
 		"",
 		formatRawUsageBlock(outcome.rawUsage),
@@ -509,7 +575,7 @@ export function verdictText(outcome: RunOneOutcome): string {
 	return `❌ отклонено — ${VALIDATOR_ITEM_LABELS[outcome.reason]}`;
 }
 
-function formatRunSection(fr: FixtureRun, totalRuns: number, priceInPerMillion: number | null, priceOutPerMillion: number | null): string {
+function formatRunSection(fr: FixtureRun, totalRuns: number): string {
 	const { run, outcome, retryOutcome } = fr;
 	const header = `### ИИ — прогон ${run}/${totalRuns}`;
 
@@ -529,15 +595,15 @@ function formatRunSection(fr: FixtureRun, totalRuns: number, priceInPerMillion: 
 	}
 
 	if (!retryOutcome) {
-		return [header, "", formatAttemptOutcome(null, outcome, priceInPerMillion, priceOutPerMillion)].join("\n");
+		return [header, "", formatAttemptOutcome(null, outcome)].join("\n");
 	}
 
 	return [
 		header,
 		"",
-		formatAttemptOutcome("Первая попытка", outcome, priceInPerMillion, priceOutPerMillion),
+		formatAttemptOutcome("Первая попытка", outcome),
 		"",
-		formatAttemptOutcome("Повторная попытка (--retry)", retryOutcome, priceInPerMillion, priceOutPerMillion),
+		formatAttemptOutcome("Повторная попытка (--retry)", retryOutcome),
 		"",
 		`**Итог по прогону:** ${verdictText(retryOutcome)} — достигнуто ретраем`,
 	].join("\n");
@@ -615,11 +681,11 @@ export function formatSummary(runs: FixtureRun[], balance: number): string {
 	);
 
 	if (totalCost !== null) {
-		lines.push(`- Суммарная стоимость (все попытки, включая ретраи): ${totalCost.toFixed(4)} кредитов (оценка по цене модели, не счёт от прокси)`);
-		lines.push(`- Остаток от баланса ${balance}: ${(balance - totalCost).toFixed(4)} кредитов (оценка, не запрос к прокси)`);
+		lines.push(`- Суммарная стоимость (все попытки, включая ретраи): ${totalCost.toFixed(4)}${CURRENCY_SYMBOL}`);
+		lines.push(`- Остаток от баланса ${balance}${CURRENCY_SYMBOL}: ${(balance - totalCost).toFixed(4)}${CURRENCY_SYMBOL}`);
 	} else {
-		lines.push("- Суммарная стоимость: не посчитана — цена для этой модели не задана в .env");
-		lines.push(`- Остаток от баланса ${balance}: н/д (стоимость не посчитана)`);
+		lines.push("- Суммарная стоимость: не посчитана — модель не в price table, и costSource не provider");
+		lines.push(`- Остаток от баланса ${balance}${CURRENCY_SYMBOL}: н/д (стоимость не посчитана)`);
 	}
 	return lines.join("\n");
 }
@@ -649,24 +715,19 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 
 		for (let run = 1; run <= opts.runsPerFixture; run++) {
 			process.stdout.write(`[ai:compare] ${fixtureName} run ${run}/${opts.runsPerFixture}... `);
-			const { outcome, retryOutcome } = await runOneWithOptionalRetry(
-				opts.client,
-				opts.modelId,
-				system,
-				user,
-				opts.timeoutMs,
-				payload,
-				opts.priceInPerMillion,
-				opts.priceOutPerMillion,
-				facts,
-				opts.retry,
-			);
+			const { outcome, retryOutcome } = await runOneWithOptionalRetry(opts.client, opts.modelId, system, user, opts.timeoutMs, payload, opts.provider, facts, opts.retry);
 			console.log(retryOutcome ? `${outcomeLabel(outcome)} -> retry: ${outcomeLabel(retryOutcome)}` : outcomeLabel(outcome));
 			const fr: FixtureRun = { fixtureName, run, outcome, retryOutcome };
 			allRuns.push(fr);
-			sections.push(formatRunSection(fr, opts.runsPerFixture, opts.priceInPerMillion, opts.priceOutPerMillion));
+			sections.push(formatRunSection(fr, opts.runsPerFixture));
 		}
 	}
+
+	// Once, after every run — never per-attempt, never on the production
+	// path (see fetchModelPermaslug's own comment). A missing/failed lookup
+	// just changes what the header line says, it never blocks the report.
+	const generationId = lastResponseId(allRuns);
+	const permaslugResult = generationId ? await fetchModelPermaslug(opts.provider.baseUrl, opts.apiKey, generationId, opts.permaslugFetchImpl ?? (fetch as unknown as FetchLike)) : null;
 
 	const header = [
 		`# ai:compare — ${opts.modelId}`,
@@ -678,7 +739,8 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 		opts.retry
 			? "- Фолбэк отключён (одна модель за прогон). --retry включён: на содержательный отказ делается ровно одна повторная попытка тем же путём, что generate.ts (buildRetryObservationPrompt, тот же лимит) — показана отдельной строкой в каждом прогоне, итог по прогону считается по финальному исходу."
 			: "- Ретраи и фолбэк отключены — каждый прогон это ровно одна попытка одной моделью, без ретрая на содержательный отказ.",
-		"- Стоимость везде в кредитах прокси (1 кредит = 50 000 токенов), не в $ — см. AI_PRICE_IN/AI_PRICE_OUT в .env.",
+		`- Стоимость везде в ${CURRENCY_SYMBOL} — costSource: ${opts.provider.costSource} (${opts.provider.costSource === "provider" ? "точный счёт от провайдера" : "оценка по таблице цен"}).`,
+		`- model_permaslug (OpenRouter, по последнему реальному ответу): ${formatPermaslugLine(permaslugResult)}`,
 		`- Длина system-сообщения: ${system.length} символов (норма: до ${SYSTEM_PROMPT_NORM_MAX_CHARS}) — ${systemInNorm ? "✅ в норме" : "⚠️ аномально большой"}`,
 		...(systemInNorm
 			? []
@@ -702,8 +764,12 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 export type ChainOptions = {
 	client: AiClient;
 	modelId: string;
-	priceInPerMillion: number | null;
-	priceOutPerMillion: number | null;
+	/** Drives cost computation (costSource/priceTable/inputOverhead — see providers.ts's computeAttemptCost). */
+	provider: AiProviderProfile;
+	/** Needed only for the post-run model_permaslug lookup (fetchModelPermaslug) — the real API key, same one the client was built with. Never logged. */
+	apiKey: string;
+	/** Injectable for tests — defaults to the global fetch when omitted. */
+	permaslugFetchImpl?: FetchLike;
 	fixtureNames: string[];
 	chainLength: number;
 	timeoutMs: number;
@@ -1028,8 +1094,7 @@ async function runChainForFixture(
 	client: AiClient,
 	modelId: string,
 	timeoutMs: number,
-	priceInPerMillion: number | null,
-	priceOutPerMillion: number | null,
+	provider: AiProviderProfile,
 	forcedDegradeSteps: Set<number>,
 	retry: boolean,
 ): Promise<{ sections: string[]; runs: FixtureRun[] }> {
@@ -1079,7 +1144,7 @@ async function runChainForFixture(
 			const fr: FixtureRun = { fixtureName, run: k, outcome: { kind: "forced", template } };
 			runs.push(fr);
 
-			const sectionParts = [formatRunSection(fr, chainLength, priceInPerMillion, priceOutPerMillion)];
+			const sectionParts = [formatRunSection(fr, chainLength)];
 			if (k > 1) {
 				sectionParts.push(formatLeadInTable(steps));
 				sectionParts.push(formatRepetitionSection(steps));
@@ -1093,12 +1158,12 @@ async function runChainForFixture(
 		const user = buildUserPrompt(payload);
 
 		process.stdout.write(`[ai:compare] ${fixtureName} chain ${k}/${chainLength}... `);
-		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, modelId, system, user, timeoutMs, payload, priceInPerMillion, priceOutPerMillion, facts, retry);
+		const { outcome, retryOutcome } = await runOneWithOptionalRetry(client, modelId, system, user, timeoutMs, payload, provider, facts, retry);
 		console.log(retryOutcome ? `${outcomeLabel(outcome)} -> retry: ${outcomeLabel(retryOutcome)}` : outcomeLabel(outcome));
 
 		const fr: FixtureRun = { fixtureName, run: k, outcome, retryOutcome };
 		runs.push(fr);
-		const sectionParts = [formatRunSection(fr, chainLength, priceInPerMillion, priceOutPerMillion)];
+		const sectionParts = [formatRunSection(fr, chainLength)];
 
 		const final = finalOutcome(fr);
 		if (final.kind === "accepted" || final.kind === "trimmed") {
@@ -1135,20 +1200,14 @@ export async function runChain(opts: ChainOptions): Promise<void> {
 	const allRuns: FixtureRun[] = [];
 
 	for (const fixtureName of opts.fixtureNames) {
-		const { sections, runs } = await runChainForFixture(
-			fixtureName,
-			opts.chainLength,
-			opts.client,
-			opts.modelId,
-			opts.timeoutMs,
-			opts.priceInPerMillion,
-			opts.priceOutPerMillion,
-			forcedSet,
-			opts.retry,
-		);
+		const { sections, runs } = await runChainForFixture(fixtureName, opts.chainLength, opts.client, opts.modelId, opts.timeoutMs, opts.provider, forcedSet, opts.retry);
 		allSections.push(...sections);
 		allRuns.push(...runs);
 	}
+
+	// Once, after every run — see runCompare's own identical comment.
+	const generationId = lastResponseId(allRuns);
+	const permaslugResult = generationId ? await fetchModelPermaslug(opts.provider.baseUrl, opts.apiKey, generationId, opts.permaslugFetchImpl ?? (fetch as unknown as FetchLike)) : null;
 
 	const header = [
 		`# ai:compare --chain=${opts.chainLength} — ${opts.modelId}`,
@@ -1162,7 +1221,8 @@ export async function runChain(opts: ChainOptions): Promise<void> {
 		opts.retry
 			? "- Фолбэк отключён (одна модель за прогон). --retry включён: на содержательный отказ делается ровно одна повторная попытка тем же путём, что generate.ts (buildRetryObservationPrompt, тот же лимит) — показана отдельной строкой в каждом прогоне, итог по прогону считается по финальному исходу."
 			: "- Ретраи и фолбэк отключены, как и в обычном режиме — один запрос это одна попытка.",
-		"- Стоимость везде в кредитах прокси (1 кредит = 50 000 токенов), не в $ — см. AI_PRICE_IN/AI_PRICE_OUT в .env.",
+		`- Стоимость везде в ${CURRENCY_SYMBOL} — costSource: ${opts.provider.costSource} (${opts.provider.costSource === "provider" ? "точный счёт от провайдера" : "оценка по таблице цен"}).`,
+		`- model_permaslug (OpenRouter, по последнему реальному ответу): ${formatPermaslugLine(permaslugResult)}`,
 		"- Завязки первых предложений — материал для взгляда человека, не автоматический вердикт: валидатор на повтор формулировок не расширялся, это вопрос стиля, а не фактической ошибки.",
 	].join("\n");
 
@@ -1176,18 +1236,21 @@ export async function runChain(opts: ChainOptions): Promise<void> {
 // --- CLI entry point ---
 
 function readEnv() {
+	// Same AI_PROVIDER selection and AI_BASE_URL/AI_MODEL/AI_MODEL_FALLBACK
+	// override pattern as src/index.ts's own readEnv() — see providers.ts.
+	// inputOverhead has no env knob at all (see providers.ts's own comment on
+	// the field) — this tool's own report already shows the raw usage block
+	// for a human to check by eye (formatRawUsageBlock), same as production.
+	const provider = resolveProviderProfile(process.env.AI_PROVIDER);
 	return {
-		baseUrl: process.env.AI_BASE_URL || "",
+		baseUrl: process.env.AI_BASE_URL || provider.baseUrl,
 		apiKey: process.env.AI_API_KEY || "",
 		proxyUrl: process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "",
-		model: process.env.AI_MODEL || "",
-		modelFallback: process.env.AI_MODEL_FALLBACK || "",
+		model: process.env.AI_MODEL || provider.primaryModel,
+		modelFallback: process.env.AI_MODEL_FALLBACK || provider.fallbackModel,
+		provider,
 		timeoutMs: Number(process.env.AI_TIMEOUT_MS || 25000),
 		promptVersion: Number(process.env.PROMPT_VERSION || 1),
-		priceIn: process.env.AI_PRICE_IN ? Number(process.env.AI_PRICE_IN) : null,
-		priceOut: process.env.AI_PRICE_OUT ? Number(process.env.AI_PRICE_OUT) : null,
-		fallbackPriceIn: process.env.AI_FALLBACK_PRICE_IN ? Number(process.env.AI_FALLBACK_PRICE_IN) : null,
-		fallbackPriceOut: process.env.AI_FALLBACK_PRICE_OUT ? Number(process.env.AI_FALLBACK_PRICE_OUT) : null,
 		stateFile: path.resolve(process.env.STATE_FILE || "data/state.json"),
 	};
 }
@@ -1320,13 +1383,18 @@ async function main() {
 		return;
 	}
 
-	// Priced like production prices a fallback answer: by the model that
-	// actually answers this run, not unconditionally by the primary's rate.
-	const isFallbackModel = env.modelFallback !== "" && modelId === env.modelFallback;
-	const priceInPerMillion = isFallbackModel ? env.fallbackPriceIn : env.priceIn;
-	const priceOutPerMillion = isFallbackModel ? env.fallbackPriceOut : env.priceOut;
-
-	const client = createAiClient({ baseUrl: env.baseUrl, apiKey: env.apiKey, proxyUrl: env.proxyUrl || undefined });
+	// computeAttemptCost (src/ai/providers.ts) already prices whichever model
+	// actually answered a given attempt by looking that model's own id up in
+	// provider.priceTable (or, for costSource: "provider", by reading the
+	// response's own real bill) — no separate primary/fallback price
+	// selection needed here the way the old per-env-var knobs required.
+	const client = createAiClient({
+		baseUrl: env.baseUrl,
+		apiKey: env.apiKey,
+		proxyUrl: env.proxyUrl || undefined,
+		authStyle: env.provider.authStyle,
+		extraHeaders: env.provider.extraHeaders,
+	});
 	const stateHistory = readState(env.stateFile);
 
 	// reports/ is tracked by git (unlike out/) — a report from a real, paid
@@ -1345,8 +1413,8 @@ async function main() {
 		await runChain({
 			client,
 			modelId,
-			priceInPerMillion,
-			priceOutPerMillion,
+			provider: env.provider,
+			apiKey: env.apiKey,
 			fixtureNames: args.fixtureNames,
 			chainLength: args.chain,
 			timeoutMs: env.timeoutMs,
@@ -1363,8 +1431,8 @@ async function main() {
 	await runCompare({
 		client,
 		modelId,
-		priceInPerMillion,
-		priceOutPerMillion,
+		provider: env.provider,
+		apiKey: env.apiKey,
 		fixtureNames: args.fixtureNames,
 		runsPerFixture: args.runs,
 		timeoutMs: env.timeoutMs,

@@ -279,8 +279,13 @@ describe("validateAiParagraphs: language check strips known tickers/BTC first", 
 });
 
 describe("MAX_PARAGRAPH_LENGTH", () => {
-	it("is 420, a hardcoded constant shared with the prompt (step 4), not an env knob", () => {
-		expect(MAX_PARAGRAPH_LENGTH).toBe(420);
+	// The value itself is derived from the 1024-char caption budget, not
+	// chosen here — see tests/render.test.ts's worst-case-caption test for the
+	// actual derivation and its own boundary check. This only guards the two
+	// properties specific to *this* constant's role: hardcoded (shared with
+	// the prompt, step 4), not an env knob.
+	it("is a hardcoded constant shared with the prompt (step 4), not an env knob", () => {
+		expect(MAX_PARAGRAPH_LENGTH).toBe(545);
 	});
 });
 

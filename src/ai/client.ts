@@ -45,13 +45,19 @@ export type AiGenerateResult = {
 	/**
 	 * The provider's own `usage` object, exactly as received — no field
 	 * renaming, no derived values, none of this client's own interpretation.
-	 * For manual inspection only (e.g. tools/ai-compare.ts dumping it so a
-	 * human can check the proxy's actual billing math against computeCost()'s
-	 * estimate); production code (generate.ts) never reads this field, only
-	 * the normalized `usage` above. null whenever there's no parsed body at
-	 * all (any transport-level failure) or the provider omitted usage.
+	 * providers.ts's computeAttemptCost reads this directly for a "provider"
+	 * costSource (OpenRouter's usage.cost); production code otherwise only
+	 * reads the normalized `usage` above. null whenever there's no parsed
+	 * body at all (any transport-level failure) or the provider omitted
+	 * usage.
 	 */
 	rawUsage: unknown;
+	/** Which upstream inference backend actually answered — OpenRouter-specific top-level response field, distinct from the `usage` object above. null when the response doesn't carry one (any transport failure, or a provider that doesn't report it). */
+	responseProvider: string | null;
+	/** The model id the response itself echoes back — can differ from the requested model under routing/aliasing. null on any transport failure. */
+	responseModel: string | null;
+	/** OpenRouter's own generation id — only ever used by tools/ai-compare.ts's model_permaslug lookup, never read on the production path. null on any transport failure or when the provider doesn't report one. */
+	responseId: string | null;
 };
 
 export type AiModel = {
@@ -84,6 +90,10 @@ export type AiClientOptions = {
 	apiKey: string;
 	/** HTTPS_PROXY/HTTP_PROXY, if set — respected via undici's ProxyAgent. */
 	proxyUrl?: string;
+	/** "bearer" (default, `Authorization: Bearer <key>`) or "x-api-key" (`x-api-key: <key>`, Anthropic's own native header name) — src/ai/providers.ts's AiProviderProfile.authStyle. */
+	authStyle?: "bearer" | "x-api-key";
+	/** Static headers merged into every request on top of Content-Type/auth — src/ai/providers.ts's AiProviderProfile.extraHeaders. Never used to carry a secret; the API key only ever goes through authStyle above. */
+	extraHeaders?: Record<string, string>;
 	/** Injectable for tests — defaults to the global fetch. Tests never hit the network. */
 	fetchImpl?: FetchLike;
 };
@@ -103,6 +113,11 @@ type OpenAiChatCompletion = {
 		total_tokens: number;
 		prompt_tokens_details?: { cached_tokens?: number };
 	};
+	/** OpenRouter-specific top-level fields — absent from other OpenAI-compatible providers, which is fine: both simply come back undefined below. */
+	provider?: string;
+	model?: string;
+	/** OpenRouter's own generation id ("gen-...") — the `id` query param GET /api/v1/generation?id=<id> needs (tools/ai-compare.ts's own model_permaslug lookup; never called from the production path). */
+	id?: string;
 };
 
 type OpenAiModelList = {
@@ -126,7 +141,8 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 	const providerHost = getHost(opts.baseUrl);
 
 	function authHeaders(): Record<string, string> {
-		return { "Content-Type": "application/json", Authorization: `Bearer ${opts.apiKey}` };
+		const auth: Record<string, string> = opts.authStyle === "x-api-key" ? { "x-api-key": opts.apiKey } : { Authorization: `Bearer ${opts.apiKey}` };
+		return { "Content-Type": "application/json", ...auth, ...opts.extraHeaders };
 	}
 
 	async function generate(params: AiGenerateParams): Promise<AiGenerateResult> {
@@ -166,6 +182,9 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 				errorKind: aborted ? "timeout" : "network",
 				errorMessage: aborted ? `request timed out after ${params.timeoutMs}ms` : sanitizeNetworkError(opts.baseUrl, opts.proxyUrl),
 				rawUsage: null,
+				responseProvider: null,
+				responseModel: null,
+				responseId: null,
 			};
 		} finally {
 			clearTimeout(timeout);
@@ -185,6 +204,9 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 				errorKind: "http_error",
 				errorMessage: `HTTP ${response.status}`,
 				rawUsage: null,
+				responseProvider: null,
+				responseModel: null,
+				responseId: null,
 			};
 		}
 
@@ -206,6 +228,9 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 				errorKind: "http_error",
 				errorMessage: "response body was not valid JSON",
 				rawUsage: null,
+				responseProvider: null,
+				responseModel: null,
+				responseId: null,
 			};
 		}
 
@@ -234,6 +259,9 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 			// cost/cache fields), and JSON.parse() keeps them at runtime even though
 			// the type above doesn't name them. data.usage as-is, unlike `usage`.
 			rawUsage: data.usage ?? null,
+			responseProvider: data.provider ?? null,
+			responseModel: data.model ?? null,
+			responseId: data.id ?? null,
 		};
 	}
 

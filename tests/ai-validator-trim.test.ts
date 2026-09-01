@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { attemptDayCountTrim, splitIntoSentences } from "../src/ai/validator.js";
+import { attemptObservationTrim, splitIntoSentences } from "../src/ai/validator.js";
 import { buildAiPayload } from "../src/ai/payload.js";
 import type { Facts } from "../src/facts.js";
+
+/** attemptDayCountTrim's old single-purpose signature, kept as a thin call-site alias in these tests only — every case below is the same day-count fixture/assertions this file had before the reason parameter was generalized (see validator.ts's attemptObservationTrim). */
+function attemptDayCountTrim(raw: string, payload: ReturnType<typeof buildAiPayload>) {
+	return attemptObservationTrim(raw, payload, "validator:observation_day_count");
+}
 
 // Same market picture as fixtures/green.json (the fixture behind the six live
 // rejections this feature was built from — see
@@ -30,7 +35,7 @@ function rawText(observation: string): string {
 	return JSON.stringify({ observation, direction: "green" });
 }
 
-describe("attemptDayCountTrim: the six real 2026-08-25 rejections (validator:observation_day_count)", () => {
+describe("attemptObservationTrim(reason=validator:observation_day_count): the six real 2026-08-25 rejections — unchanged after generalizing the trim mechanism to other reasons", () => {
 	it("18:05, прогон 2/3 — day count in sentence 1 of 3", () => {
 		const observation =
 			"Второй день подряд биток тянет рой вверх, и рой охотно подчиняется — зелёных монет снова подавляющее большинство. XRP на этот раз не просто выбился вперёд, а устроил настоящий отрыв от пелотона, пока VVV тихо сползает против течения. Рынок явно не спешит выдыхать.";
@@ -109,7 +114,7 @@ describe("attemptDayCountTrim: the six real 2026-08-25 rejections (validator:obs
 	});
 });
 
-describe("attemptDayCountTrim: negative cases", () => {
+describe("attemptObservationTrim(reason=validator:observation_day_count): negative cases", () => {
 	// Cutting exactly one sentence out of a two-sentence response would leave a
 	// one-sentence remainder — never a real second paragraph. The >=3-total
 	// gate is what stops that before a remainder is ever computed at all: the
@@ -152,6 +157,76 @@ describe("attemptDayCountTrim: negative cases", () => {
 		if (result.ok) throw new Error("expected ok:false");
 		expect(result.stage).toBe("trim_failed");
 		expect(result.detail).toContain("chars");
+	});
+});
+
+// 2026-09-01: generalized from the day-count-only mechanism above after a
+// live --all rerun on anthropic/claude-sonnet-5 (reports/compare-2026-09-01-
+// 1751-*-all.md) came back 7/10, all seven rejections "п.2 длина" — two of
+// them over by just 1-2 chars. Unlike day-count, there's no single
+// "offending sentence" a length overflow can be pinned to (see validator.ts's
+// selectSentenceToTrim), so this always cuts the *last* sentence and leans
+// on the shared whole-paragraph revalidation to reject the cut when it
+// wasn't enough.
+describe("attemptObservationTrim(reason=validator:length)", () => {
+	// Long, digit-free, forbidden-pattern-free filler sentences — real prose
+	// shape, not lorem ipsum, so they clear every other validateAiObservation
+	// check (numbers, forbidden patterns, day-count words, ratio claims,
+	// language) and isolate the length check being exercised.
+	const s1 =
+		"Рой уверенно движется вперёд без резких рывков, и общий настрой участников остаётся ровным и спокойным на протяжении всего наблюдения, без каких-либо всплесков паники или эйфории, которые могли бы исказить общую картину происходящего на рынке в этот момент времени.";
+	const s2 =
+		"Капитал распределяется широким фронтом, не концентрируясь в одной точке, а спокойно перетекая между разными активами по мере того, как участники присматриваются к новым возможностям и стараются действовать без лишней спешки и суеты.";
+
+	it("1-char overflow (546 chars, limit 545) — cutting the last of 3 sentences clears the limit and passes revalidation", () => {
+		const s3 = "Настроение остаётся ровнымыыыыыыыыыыыыыыыыыыыы.";
+		const observation = `${s1} ${s2} ${s3}`;
+		expect(observation.length).toBe(546);
+		const result = attemptObservationTrim(rawText(observation), payload, "validator:length");
+		expect(result.ok).toBe(true);
+		if (!result.ok) throw new Error("expected ok:true");
+		expect(result.removedSentence).toBe(s3);
+		expect(result.observation).toBe(`${s1} ${s2}`);
+		expect(result.observation.length).toBe(498);
+	});
+
+	it("2-char overflow (547 chars, limit 545) — same cut, one char further over", () => {
+		const s3 = "Настроение остаётся ровнымыыыыыыыыыыыыыыыыыыыыы.";
+		const observation = `${s1} ${s2} ${s3}`;
+		expect(observation.length).toBe(547);
+		const result = attemptObservationTrim(rawText(observation), payload, "validator:length");
+		expect(result.ok).toBe(true);
+		if (!result.ok) throw new Error("expected ok:true");
+		expect(result.removedSentence).toBe(s3);
+		expect(result.observation).toBe(`${s1} ${s2}`);
+	});
+
+	it("trim_failed — gross overflow (686 chars, limit 545): cutting the last sentence still leaves 647 chars, over the limit", () => {
+		const g1 =
+			"Рой уверенно движется вперёд без резких рывков, и общий настрой участников остаётся ровным и спокойным на протяжении всего наблюдения, без каких-либо всплесков паники или эйфории, которые могли бы исказить общую картину происходящего на рынке в этот момент времени, и никто не спешит менять свою тактику под влиянием случайных колебаний котировок.";
+		const g2 =
+			"Капитал распределяется широким фронтом, не концентрируясь в одной точке, а спокойно перетекая между разными активами по мере того, как участники присматриваются к новым возможностям и стараются действовать без лишней спешки и суеты, наблюдая за развитием событий со стороны и избегая резких решений.";
+		const g3 = "Атмосфера остаётся ровной и спокойной.";
+		const observation = `${g1} ${g2} ${g3}`;
+		expect(observation.length).toBe(686);
+		expect(splitIntoSentences(observation)).toHaveLength(3);
+
+		const result = attemptObservationTrim(rawText(observation), payload, "validator:length");
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("expected ok:false");
+		expect(result.stage).toBe("trim_failed");
+		expect(result.detail).toContain("validator:length");
+		expect(result.detail).toContain("647");
+	});
+
+	it("not_eligible — only 2 sentences total, below the shared >=3 floor (same gate as the day-count reason)", () => {
+		const observation = `${s1} ${s2}`;
+		expect(splitIntoSentences(observation)).toHaveLength(2);
+		const result = attemptObservationTrim(rawText(observation), payload, "validator:length");
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("expected ok:false");
+		expect(result.stage).toBe("not_eligible");
+		expect(result.detail).toContain("2 sentence");
 	});
 });
 
