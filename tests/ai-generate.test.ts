@@ -462,3 +462,114 @@ describe("buildParagraphsAI: ai.json is written for every outcome, including ful
 		expect(data.attempts).toHaveLength(0);
 	});
 });
+
+describe("buildParagraphsAI: third outcome — validator:observation_day_count fixed by trimming one sentence", () => {
+	const threeSentenceDayCount = JSON.stringify({
+		observation:
+			"Второй день подряд биток топчется в минусе — красных монет заметно больше зелёных. TRAC держится крепче остальных, почти не поддаваясь давлению. PI, наоборот, проседает быстрее прочих, оставаясь в числе главных аутсайдеров.",
+		direction: "red",
+	});
+
+	it("returns source ai_trimmed, the cut remainder, and the removed sentence — with no retry call made", async () => {
+		const { client, calls } = fakeClient("provider.example.com", [okResult(threeSentenceDayCount)]);
+		const options = baseOptions({ client, primary: modelConfig("primary-model") });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(calls).toHaveLength(1); // trimming replaces the retry — no second request
+		expect(result.source).toBe("ai_trimmed");
+		expect(result.model).toBe("primary-model");
+		expect(result.failureReason).toBeNull();
+		expect(result.trimmedSentence).toContain("Второй день подряд");
+		expect(result.observation).not.toContain("Второй день подряд");
+		expect(result.observation).toContain("TRAC");
+		expect(result.observation).toContain("PI");
+		// paragraph 1 is still always code-generated, unaffected by the trim
+		expect(result.picture).toBe(pickPicture(options.facts));
+	});
+
+	it("usage.jsonl still logs the raw attempt's real outcome (validator:observation_day_count) — the trim is a processing decision, not a rewrite of what happened", async () => {
+		const { client } = fakeClient("provider.example.com", [okResult(threeSentenceDayCount)]);
+		const options = baseOptions({ client });
+
+		await buildParagraphsAI(options);
+
+		const lines = readUsageLines(options.usageFile);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]!.outcome).toBe("validator:observation_day_count");
+	});
+
+	it("ai.json carries source: ai_trimmed and the removed sentence", async () => {
+		const { client } = fakeClient("provider.example.com", [okResult(threeSentenceDayCount)]);
+		const options = baseOptions({ client });
+
+		await buildParagraphsAI(options);
+
+		const data = readAiJson(options.aiJsonFile);
+		expect(data.result.source).toBe("ai_trimmed");
+		expect(data.result.trimmedSentence).toContain("Второй день подряд");
+		expect(data.attempts).toHaveLength(1);
+	});
+
+	it("a trim that fails its own post-checks goes straight to the template — no retry, no fallback model", async () => {
+		// Only two sentences after the cut would be too short/too few to matter here:
+		// this response's remainder ("TRAC лидирует. PI падает.") is far under the
+		// 80-char floor, so trimming is attempted (eligible: 3 sentences, exactly
+		// one violates) but fails its own post-check.
+		const shortRemainder = JSON.stringify({
+			observation: "Второй день подряд биток топчется в минусе, а рой безучастно наблюдает за этим со стороны. TRAC лидирует. PI падает.",
+			direction: "red",
+		});
+		const { client, calls } = fakeClient("provider.example.com", [okResult(shortRemainder), okResult(fixtureText("observation-good"))]);
+		const options = baseOptions({ client, maxAttemptsPerModel: 2 });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(calls).toHaveLength(1); // no retry attempt, no fallback-model attempt — straight to template
+		expect(result.source).toBe("template");
+		expect(result.failureReason).toContain("trim attempted but failed");
+	});
+
+	// Replaces the earlier version of this test, which asserted calls.length
+	// === 2 (a same-model retry) for exactly this fixture: a day-count
+	// rejection that attemptDayCountTrim can't safely fix (only one sentence
+	// total here, need >= 3) used to fall through to the pre-existing
+	// retry-same-model behavior. That's no longer true — a same-model retry
+	// on validator:observation_day_count has no realistic upside once
+	// buildRetryObservationPrompt's own day-count instruction is the thing
+	// that already produced the sentence trimming couldn't salvage, so
+	// "not_eligible" now goes straight to the template too, same as
+	// "trim_failed" — no second paid request either way.
+	it("not_eligible for trimming (day count confined to a single-sentence response) goes straight to the template — no retry, exactly one call", async () => {
+		const { client, calls } = fakeClient("provider.example.com", [okResult(fixtureText("observation-day-count")), okResult(fixtureText("observation-good"))]);
+		const options = baseOptions({ client, maxAttemptsPerModel: 2 });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(calls).toHaveLength(1); // the second canned response (a would-be retry) is never consumed
+		expect(result.source).toBe("template");
+		expect(result.failureReason).toContain("not eligible for trim");
+	});
+
+	it("every other rejection reason keeps retrying under AI_MAX_ATTEMPTS, untouched by this outcome — a digit rejection still gets its retry", async () => {
+		const { client, calls } = fakeClient("provider.example.com", [okResult(fixtureText("observation-digit")), okResult(fixtureText("observation-good"))]);
+		const options = baseOptions({ client, maxAttemptsPerModel: 2 });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(calls).toHaveLength(2);
+		expect(JSON.parse(calls[1]!.user).retryInstruction).toBeDefined();
+		expect(result.source).toBe("ai"); // the retry succeeded
+	});
+
+	it("every other rejection reason keeps retrying under AI_MAX_ATTEMPTS, untouched by this outcome — a forbidden-pattern rejection still gets its retry", async () => {
+		const { client, calls } = fakeClient("provider.example.com", [okResult(fixtureText("advice")), okResult(fixtureText("observation-good"))]);
+		const options = baseOptions({ client, maxAttemptsPerModel: 2 });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(calls).toHaveLength(2);
+		expect(JSON.parse(calls[1]!.user).retryInstruction).toBeDefined();
+		expect(result.source).toBe("ai"); // the retry succeeded
+	});
+});

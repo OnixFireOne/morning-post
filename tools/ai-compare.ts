@@ -49,7 +49,7 @@ import { createAiClient, type AiClient, type AiUsage } from "../src/ai/client.js
 import { buildAiPayload, stateHistoryToAiHistory, type AiPayload } from "../src/ai/payload.js";
 import { buildRetryObservationPrompt, buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
 import { billedInputTokens, computeCost, PROXY_INPUT_TOKEN_OVERHEAD } from "../src/ai/usage.js";
-import { validateAiObservation, type ObservationValidationFailureReason } from "../src/ai/validator.js";
+import { attemptDayCountTrim, validateAiObservation, type ObservationValidationFailureReason } from "../src/ai/validator.js";
 import { computeFacts, shiftDateKey, type Facts, type StateHistory } from "../src/facts.js";
 import { buildParagraphs, pickPicture, type PostParagraphs } from "../src/render.js";
 import { loadSnapshotFromFile } from "../src/snapshot.js";
@@ -126,6 +126,25 @@ export type RunOutcome =
 			costEstimate: number | null;
 			rawUsage: unknown;
 	  }
+	// Third outcome (2026-08-26): would have been "rejected" for
+	// validator:observation_day_count, but exactly one sentence carried the
+	// violation and cutting it left a paragraph that passed
+	// validateAiObservation whole — see validator.ts's attemptDayCountTrim.
+	// A distinct grade from "accepted", shown separately in the report: the
+	// model's raw answer wasn't clean, even though what got published was.
+	| {
+			kind: "trimmed";
+			picture: string;
+			observation: string;
+			direction: string;
+			originalObservation: string;
+			removedSentence: string;
+			tokensIn: number | null;
+			tokensOut: number | null;
+			durationMs: number;
+			costEstimate: number | null;
+			rawUsage: unknown;
+	  }
 	| { kind: "transport"; label: string; errorMessage: string | null; durationMs: number }
 	// --chain-degrade only: this step deliberately skipped the model entirely
 	// (no client.generate() call at all) to force a degraded day on demand,
@@ -136,12 +155,12 @@ export type FixtureRun = {
 	fixtureName: string;
 	run: number;
 	outcome: RunOutcome;
-	/** --retry only: present exactly when the first attempt was "rejected" (content-level) and a second attempt was made — the second attempt's own outcome, built the same way generate.ts's own retry does (buildRetryObservationPrompt keyed by the rejection reason). Never set for "transport" (matches generate.ts's own retry-vs-fallback split: a transport failure moves to a different model in production, and this tool has no fallback model to move to) or "forced" (--chain-degrade skips the model entirely, nothing to retry). */
+	/** --retry only: present exactly when the first attempt was "rejected" (content-level) and a second attempt was made — the second attempt's own outcome, built the same way generate.ts's own retry does (buildRetryObservationPrompt keyed by the rejection reason). Never set for "transport" (matches generate.ts's own retry-vs-fallback split: a transport failure moves to a different model in production, and this tool has no fallback model to move to) or "forced" (--chain-degrade skips the model entirely, nothing to retry). Never set when the first attempt is "trimmed" either — a trimmed attempt is already a resolved, publishable outcome, same as "accepted", nothing left to retry. */
 	retryOutcome?: RunOneOutcome;
 };
 
 /** What a real model call can produce — "forced" is never one of runOne()'s own results, it's only ever constructed directly by --chain-degrade's own branch, which skips runOne() entirely. */
-export type RunOneOutcome = Extract<RunOutcome, { kind: "accepted" } | { kind: "rejected" } | { kind: "transport" }>;
+export type RunOneOutcome = Extract<RunOutcome, { kind: "accepted" } | { kind: "rejected" } | { kind: "trimmed" } | { kind: "transport" }>;
 
 /** The outcome that actually determines a run's verdict/summary classification — the retry's own outcome when one happened, otherwise the first attempt's. Exported for direct testing alongside runOneWithOptionalRetry/runTotals. */
 export function finalOutcome(fr: FixtureRun): RunOutcome {
@@ -150,6 +169,7 @@ export function finalOutcome(fr: FixtureRun): RunOutcome {
 
 export function outcomeLabel(outcome: RunOneOutcome): string {
 	if (outcome.kind === "accepted") return "ok";
+	if (outcome.kind === "trimmed") return "trimmed (cut 1 sentence)";
 	if (outcome.kind === "rejected") return `rejected (${outcome.reason})`;
 	return `transport (${outcome.label})`;
 }
@@ -245,6 +265,34 @@ async function runOne(
 			rawUsage: result.rawUsage,
 		};
 	}
+
+	// Same third outcome as generate.ts's production path (src/ai/generate.ts) —
+	// one shared definition of the eligibility/re-validation rules
+	// (validator.ts's attemptDayCountTrim), so this report can never disagree
+	// with what the real post would have done for the exact same response.
+	if (validation.reason === "validator:observation_day_count") {
+		const trim = attemptDayCountTrim(rawText, payload);
+		if (trim.ok) {
+			return {
+				kind: "trimmed",
+				picture: pickPicture(facts),
+				observation: trim.observation,
+				direction: trim.direction,
+				originalObservation: trim.originalObservation,
+				removedSentence: trim.removedSentence,
+				tokensIn,
+				tokensOut,
+				durationMs: result.durationMs,
+				costEstimate,
+				rawUsage: result.rawUsage,
+			};
+		}
+		// "not_eligible" or "trim_failed" — either way, this specific rawText
+		// stays a plain rejection, same as before this outcome existed. The
+		// stage/detail difference only matters to generate.ts's own
+		// retry-vs-template branching, not to this report.
+	}
+
 	return {
 		kind: "rejected",
 		reason: validation.reason,
@@ -409,6 +457,33 @@ function formatAttemptOutcome(label: string | null, outcome: RunOneOutcome, pric
 		].join("\n");
 	}
 
+	if (outcome.kind === "trimmed") {
+		return [
+			...labelLines,
+			"- Вердикт: ✂️ починено вырезанием предложения (новое: любой счёт дней (словом или цифрой), исходно только в одном предложении из трёх+)",
+			tokensLine,
+			costLine,
+			...(calibratedCostLine ? [calibratedCostLine] : []),
+			timeLine,
+			"",
+			formatRawUsageBlock(outcome.rawUsage),
+			"",
+			"**Абзац 2 (observation) до вырезания:**",
+			`> ${outcome.originalObservation}`,
+			"",
+			"**Вырезанное предложение:**",
+			`> ${outcome.removedSentence}`,
+			"",
+			"**Абзац 1 (picture):**",
+			`> ${outcome.picture}`,
+			"",
+			"**Абзац 2 (observation) после вырезания — именно это ушло бы в пост:**",
+			`> ${outcome.observation}`,
+			"",
+			`**direction:** ${outcome.direction}`,
+		].join("\n");
+	}
+
 	return [
 		...labelLines,
 		`- Вердикт: ❌ отклонено — ${VALIDATOR_ITEM_LABELS[outcome.reason]}: ${outcome.detail}`,
@@ -426,8 +501,10 @@ function formatAttemptOutcome(label: string | null, outcome: RunOneOutcome, pric
 	].join("\n");
 }
 
-function verdictText(outcome: RunOneOutcome): string {
+/** Exported for direct testing — the same short verdict string used in formatRunSection's "Итог по прогону" line. */
+export function verdictText(outcome: RunOneOutcome): string {
 	if (outcome.kind === "accepted") return "✅ принято";
+	if (outcome.kind === "trimmed") return "✂️ починено вырезанием";
 	if (outcome.kind === "transport") return `⚠️ transport — ${outcome.label}`;
 	return `❌ отклонено — ${VALIDATOR_ITEM_LABELS[outcome.reason]}`;
 }
@@ -469,7 +546,7 @@ function formatRunSection(fr: FixtureRun, totalRuns: number, priceInPerMillion: 
 /** Real spend for one run — both attempts' tokens/cost when a retry happened (a retry is a second real request, priced like the first), not just whichever attempt turned out final. null+null only when nothing is known at all, never invented as 0. */
 export function runTotals(fr: FixtureRun): { tokensIn: number | null; tokensOut: number | null; costEstimate: number | null } {
 	const candidates: (RunOneOutcome | undefined)[] = [fr.outcome.kind === "forced" ? undefined : fr.outcome, fr.retryOutcome];
-	const attempts = candidates.filter((o): o is Extract<RunOneOutcome, { kind: "accepted" | "rejected" }> => o !== undefined && o.kind !== "transport");
+	const attempts = candidates.filter((o): o is Extract<RunOneOutcome, { kind: "accepted" | "rejected" | "trimmed" }> => o !== undefined && o.kind !== "transport");
 	if (attempts.length === 0) return { tokensIn: null, tokensOut: null, costEstimate: null };
 	const sum = (nums: (number | null)[]) => (nums.every((n) => n === null) ? null : nums.reduce((a: number, b) => a + (b ?? 0), 0));
 	return {
@@ -479,10 +556,12 @@ export function runTotals(fr: FixtureRun): { tokensIn: number | null; tokensOut:
 	};
 }
 
-function formatSummary(runs: FixtureRun[], balance: number): string {
+/** Exported for direct testing — the "## Итог" block at the end of every ai:compare report. */
+export function formatSummary(runs: FixtureRun[], balance: number): string {
 	const total = runs.length;
 	const finals = runs.map((r) => finalOutcome(r));
 	const accepted = finals.filter((f) => f.kind === "accepted");
+	const trimmed = finals.filter((f) => f.kind === "trimmed");
 	const rejected = finals.filter((f): f is Extract<RunOutcome, { kind: "rejected" }> => f.kind === "rejected");
 	const transport = finals.filter((f): f is Extract<RunOutcome, { kind: "transport" }> => f.kind === "transport");
 	const forced = finals.filter((f): f is Extract<RunOutcome, { kind: "forced" }> => f.kind === "forced");
@@ -516,8 +595,11 @@ function formatSummary(runs: FixtureRun[], balance: number): string {
 		"",
 		`- Всего прогонов: ${total}`,
 		`- Принято: ${accepted.length} (${total ? Math.round((accepted.length / total) * 100) : 0}%)`,
-		`- Отклонено/ошибок: ${total - accepted.length}`,
 	];
+	if (trimmed.length > 0) {
+		lines.push(`- Починено вырезанием предложения: ${trimmed.length} (${total ? Math.round((trimmed.length / total) * 100) : 0}%)`);
+	}
+	lines.push(`- Отклонено/ошибок: ${total - accepted.length - trimmed.length}`);
 	if (retried.length > 0) {
 		const acceptedByRetry = retried.filter((r) => r.retryOutcome?.kind === "accepted").length;
 		lines.push(`- Из них достигнуто ретраем: ${retried.length} (успешно после ретрая: ${acceptedByRetry})`);
@@ -636,7 +718,7 @@ export type ChainOptions = {
 	retry: boolean;
 };
 
-export type ChainStep = { run: number; dateLabel: string; picture: string; observation: string; source: "ai" | "template" };
+export type ChainStep = { run: number; dateLabel: string; picture: string; observation: string; source: "ai" | "ai_trimmed" | "template" };
 
 /** First few words of a paragraph — enough to spot a repeated opening by eye, not a full sentence. */
 function leadIn(text: string, wordCount = 6): string {
@@ -649,7 +731,7 @@ function leadIn(text: string, wordCount = 6): string {
 function formatLeadInTable(steps: ChainStep[]): string {
 	const lines = ["**Завязки по цепочке (picture / observation) — для сравнения глазами, без автоматического вердикта:**"];
 	for (const step of steps) {
-		const sourceTag = step.source === "template" ? " [шаблон]" : "";
+		const sourceTag = step.source === "template" ? " [шаблон]" : step.source === "ai_trimmed" ? " [починено]" : "";
 		lines.push(`- прогон ${step.run} (${step.dateLabel})${sourceTag}: «${leadIn(step.picture)}» / «${leadIn(step.observation)}»`);
 	}
 	return lines.join("\n");
@@ -1019,7 +1101,8 @@ async function runChainForFixture(
 		const sectionParts = [formatRunSection(fr, chainLength, priceInPerMillion, priceOutPerMillion)];
 
 		const final = finalOutcome(fr);
-		if (final.kind === "accepted") {
+		if (final.kind === "accepted" || final.kind === "trimmed") {
+			const source = final.kind === "accepted" ? "ai" : "ai_trimmed";
 			chainHistory = appendDay(chainHistory, {
 				date: todayKey,
 				swarmState: facts.swarmState,
@@ -1028,9 +1111,9 @@ async function runChainForFixture(
 				messageId: 0,
 				picture: final.picture,
 				observation: final.observation,
-				source: "ai",
+				source,
 			});
-			steps.push({ run: k, dateLabel: facts.dateLabel, picture: final.picture, observation: final.observation, source: "ai" });
+			steps.push({ run: k, dateLabel: facts.dateLabel, picture: final.picture, observation: final.observation, source });
 		} else {
 			const template = recordTemplateStep(k, facts, todayKey);
 			sectionParts.push(formatDegradedTemplateBlock(template));

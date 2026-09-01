@@ -23,7 +23,7 @@ export type StateDay = {
 	/** The text actually posted — written for template days too, not just AI ones, so anti-repeat history has no holes on a day the AI path failed. */
 	picture?: string;
 	observation?: string;
-	source?: "ai" | "template";
+	source?: "ai" | "ai_trimmed" | "template";
 	/** null when source is "template" (or absent on pre-v2 records). */
 	model?: string | null;
 	provider?: string | null;

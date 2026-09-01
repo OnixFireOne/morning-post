@@ -488,6 +488,101 @@ export function validateAiObservation(rawText: string, payload: AiPayload): Obse
 	return { ok: true, result: { observation, direction } };
 }
 
+// --- third outcome (2026-08-26): trim one sentence instead of an outright
+// rejection, but *only* for the narrowest, safest case — a day-count word
+// ("второй день подряд", "третий день кряду"...) sitting in exactly one
+// sentence of an observation that has at least three, so removing it still
+// leaves a real paragraph behind. Found on six live rejections (25.08,
+// reports/compare-2026-08-25-{1805,1844,1913,1943}-*.md): a model that
+// avoided naming the day count in its opening sentence would sometimes still
+// slip it into a later sentence about the day's leader ticker ("XRP
+// удерживает лидерство уже второй день подряд...") — in every one of those
+// six cases the other two sentences stood on their own as a complete,
+// valid paragraph once that one sentence was gone. Every other rejection
+// reason (digit, forbidden pattern, wrong direction, ratio mismatch,
+// language, day count spread across more than one sentence, too few
+// sentences to safely cut one) is left exactly as it was: an outright
+// rejection, handled by the caller's existing retry/fallback machinery.
+
+/** Boundary is ".", "!", "?" only — never ":" or "—", both of which sit *inside* a sentence in this app's observations (colons introduce a clause, em-dashes join two clauses) — see the six cases above for real examples of both. Punctuation stays attached to its own sentence so a rejoined remainder still "ends like a sentence" (endsLikeASentence) without extra glue. Observation text never contains digits (rejected upstream by findAnyDigit before this ever runs), so there's no decimal-point/abbreviation ambiguity to worry about. */
+const SENTENCE_RE = /[^.!?]+[.!?]+/g;
+
+/** Exported for direct testing — also used by tools/ai-compare.ts's own trim reporting so both share one definition of "a sentence" in this codebase. */
+export function splitIntoSentences(text: string): string[] {
+	const matches = text.match(SENTENCE_RE);
+	if (matches) return matches.map((s) => s.trim()).filter(Boolean);
+	const trimmed = text.trim();
+	return trimmed ? [trimmed] : [];
+}
+
+/** Below this, a "fixed" paragraph reads as a fragment, not a real second thought — same order of magnitude as MAX_PARAGRAPH_LENGTH but a floor, not a ceiling. */
+const MIN_TRIMMED_OBSERVATION_LENGTH = 80;
+/** A one-sentence remainder isn't a paragraph — pickPicture (paragraph 1) already covers "the market in one line" on its own. */
+const MIN_REMAINING_SENTENCES = 2;
+/** Below this, there's no safe cut: removing one of only two sentences leaves one, and removing one of one leaves none. */
+const MIN_TOTAL_SENTENCES_FOR_TRIM = 3;
+
+export type ObservationTrimResult =
+	| { ok: true; observation: string; direction: AiPayload["today"]["swarmState"]; removedSentence: string; originalObservation: string }
+	// Trim was never attempted — the caller's existing retry/fallback handling
+	// for the original rejection should proceed exactly as before this outcome
+	// existed.
+	| { ok: false; stage: "not_eligible"; detail: string }
+	// Trim was attempted (the narrow eligibility above was met) but the
+	// result didn't hold up — per spec, this goes straight to the template,
+	// no second cut, no extra model call.
+	| { ok: false; stage: "trim_failed"; detail: string };
+
+/**
+ * Only ever worth calling after validateAiObservation has already returned
+ * reason "validator:observation_day_count" for this exact rawText — this
+ * function re-parses and re-derives everything itself rather than trusting
+ * the caller's own parse, so it can never disagree with validateAiObservation
+ * about what the text actually says.
+ */
+export function attemptDayCountTrim(rawText: string, payload: AiPayload): ObservationTrimResult {
+	const parsed = parseAiObservationJson(rawText);
+	if (!parsed) return { ok: false, stage: "not_eligible", detail: "no valid {observation, direction} JSON to trim" };
+
+	const observation = parsed.observation.trim();
+	const sentences = splitIntoSentences(observation);
+	if (sentences.length < MIN_TOTAL_SENTENCES_FOR_TRIM) {
+		return { ok: false, stage: "not_eligible", detail: `only ${sentences.length} sentence(s), need >= ${MIN_TOTAL_SENTENCES_FOR_TRIM} to safely cut one` };
+	}
+
+	const violatingIndices: number[] = [];
+	sentences.forEach((sentence, i) => {
+		if (findAnyDayCountWord(sentence)) violatingIndices.push(i);
+	});
+	if (violatingIndices.length !== 1) {
+		return { ok: false, stage: "not_eligible", detail: `day-count wording appears in ${violatingIndices.length} sentence(s), can only cut exactly one` };
+	}
+
+	const removedSentence = sentences[violatingIndices[0]!]!;
+	const remainingSentences = sentences.filter((_, i) => i !== violatingIndices[0]);
+	const trimmedObservation = remainingSentences.join(" ");
+
+	if (trimmedObservation.length < MIN_TRIMMED_OBSERVATION_LENGTH) {
+		return { ok: false, stage: "trim_failed", detail: `remainder is ${trimmedObservation.length} chars, need >= ${MIN_TRIMMED_OBSERVATION_LENGTH}` };
+	}
+	if (remainingSentences.length < MIN_REMAINING_SENTENCES) {
+		return { ok: false, stage: "trim_failed", detail: `remainder has ${remainingSentences.length} sentence(s), need >= ${MIN_REMAINING_SENTENCES}` };
+	}
+
+	// The cut changes the Cyrillic ratio and can silently invalidate the
+	// green/red ratio check (removing a sentence never removes a digit — none
+	// are allowed here at all — but it can remove the only sentence that made
+	// a multiplicity claim, or leave one that no longer reads naturally) — so
+	// the remainder is re-validated whole, not just re-checked for day-count
+	// wording.
+	const revalidated = validateAiObservation(JSON.stringify({ observation: trimmedObservation, direction: parsed.direction }), payload);
+	if (!revalidated.ok) {
+		return { ok: false, stage: "trim_failed", detail: `remainder fails validateAiObservation: ${revalidated.reason} — ${revalidated.detail}` };
+	}
+
+	return { ok: true, observation: revalidated.result.observation, direction: revalidated.result.direction, removedSentence, originalObservation: observation };
+}
+
 /**
  * Section 5, checks in this order (first failure wins — order doesn't change
  * correctness, each check is independent): parse -> non-empty/not cut off ->

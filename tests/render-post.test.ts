@@ -134,3 +134,36 @@ describe("renderPost: section 3.4 dry-run gate", () => {
 		expect(result.source).toBe("template");
 	});
 });
+
+describe("renderPost: third outcome — ai_trimmed passes through with the caption built from the cut remainder", () => {
+	function trimmedFetch(): FetchLike {
+		const observation = JSON.stringify({
+			observation:
+				"Второй день подряд биток топчется в минусе — красных монет заметно больше зелёных. TRAC держится крепче остальных, почти не поддаваясь давлению. PI, наоборот, проседает быстрее прочих, оставаясь в числе главных аутсайдеров.",
+			direction: "red",
+		});
+		return async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({
+				choices: [{ message: { content: observation }, finish_reason: "stop" }],
+				usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+			}),
+		});
+	}
+
+	it("returns source ai_trimmed, the cut observation in paragraphs/caption, and the removed sentence", async () => {
+		const fetchImpl = vi.fn(trimmedFetch());
+		const config = baseConfig({ dryRun: false });
+
+		const result = await renderPost(specExampleFacts(), EMPTY_HISTORY, false, config, fetchImpl);
+
+		expect(fetchImpl).toHaveBeenCalledTimes(1); // trimming replaces the retry — no second request
+		expect(result.source).toBe("ai_trimmed");
+		expect(result.failureReason).toBeNull();
+		expect(result.trimmedSentence).toContain("Второй день подряд");
+		expect(result.paragraphs.observation).not.toContain("Второй день подряд");
+		expect(result.caption).toContain(result.paragraphs.observation);
+		expect(result.caption).not.toContain("Второй день подряд");
+	});
+});

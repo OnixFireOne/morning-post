@@ -16,7 +16,7 @@ import type { StateHistory } from "./state.js";
 export type RenderedPost = {
 	caption: string;
 	paragraphs: PostParagraphs;
-	source: "ai" | "template";
+	source: "ai" | "ai_trimmed" | "template";
 	model: string | null;
 	provider: string | null;
 	promptVersion: number | null;
@@ -28,6 +28,8 @@ export type RenderedPost = {
 	totalCost: number | null;
 	/** Non-null exactly when the AI path was attempted and didn't produce what got published — drives the non-blocking fallback alert in main(). */
 	failureReason: string | null;
+	/** Non-null exactly when source is "ai_trimmed" — the one sentence that was cut, drives the non-blocking trim alert in main(). */
+	trimmedSentence: string | null;
 };
 
 /** Exactly the env fields renderPost() needs — index.ts's full Env satisfies this structurally, no cast required. */
@@ -65,6 +67,7 @@ function templateResult(facts: Facts): RenderedPost {
 		attempts: null,
 		totalCost: null,
 		failureReason: null,
+		trimmedSentence: null,
 	};
 }
 
@@ -120,7 +123,7 @@ export async function renderPost(facts: Facts, history: StateHistory, skipAi: bo
 		dryRun: config.dryRun,
 	});
 
-	if (result.source === "ai") {
+	if (result.source === "ai" || result.source === "ai_trimmed") {
 		const { winnerLine, loserLine } = buildLeaderLines(facts);
 		const paragraphs: PostParagraphs = { picture: result.picture, winnerLine, loserLine, observation: result.observation };
 		const caption = buildCaptionFromParagraphs(facts, paragraphs); // no shortPicture: overflow here is a total AI-path failure, not a reason to graft template text on
@@ -128,7 +131,7 @@ export async function renderPost(facts: Facts, history: StateHistory, skipAi: bo
 			return {
 				caption,
 				paragraphs,
-				source: "ai",
+				source: result.source,
 				model: result.model,
 				provider: result.provider,
 				promptVersion: result.promptVersion,
@@ -137,6 +140,7 @@ export async function renderPost(facts: Facts, history: StateHistory, skipAi: bo
 				attempts: result.attempts,
 				totalCost: result.totalCost,
 				failureReason: null,
+				trimmedSentence: result.trimmedSentence,
 			};
 		}
 		return {
@@ -151,6 +155,7 @@ export async function renderPost(facts: Facts, history: StateHistory, skipAi: bo
 			attempts: result.attempts,
 			totalCost: result.totalCost,
 			failureReason: "AI paragraphs were valid but the caption still exceeded CAPTION_LIMIT after dropping the observation paragraph",
+			trimmedSentence: null,
 		};
 	}
 
@@ -167,5 +172,6 @@ export async function renderPost(facts: Facts, history: StateHistory, skipAi: bo
 		attempts: result.attempts,
 		totalCost: result.totalCost,
 		failureReason: result.failureReason,
+		trimmedSentence: null,
 	};
 }

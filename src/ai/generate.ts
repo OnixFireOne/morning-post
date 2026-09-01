@@ -14,7 +14,7 @@ import type { AiClient } from "./client.js";
 import { buildAiPayload, type AiHistoryEntry, type AiPayload } from "./payload.js";
 import { buildRetryObservationPrompt, buildSystemPrompt, buildUserPrompt } from "./prompt.js";
 import { appendUsageLine, computeCost, type UsageRecord } from "./usage.js";
-import { validateAiObservation, type ObservationValidationFailureReason } from "./validator.js";
+import { attemptDayCountTrim, validateAiObservation, type ObservationValidationFailureReason } from "./validator.js";
 
 export type AiModelConfig = {
 	model: string;
@@ -40,14 +40,17 @@ export type BuildParagraphsAiOptions = {
 };
 
 export type AiGenerationResult = {
-	source: "ai" | "template";
+	/** "ai_trimmed": the model's response would otherwise have been rejected for validator:observation_day_count — one sentence was cut and the remainder passed validateAiObservation whole (see validator.ts's attemptDayCountTrim). */
+	source: "ai" | "ai_trimmed" | "template";
 	picture: string;
 	observation: string;
 	model: string | null;
 	provider: string | null;
 	promptVersion: number | null;
-	/** Human-readable summary for the "AI fell back to template" alert. null only when source is "ai". */
+	/** Human-readable summary for the "AI fell back to template" alert. null only when source is "ai"/"ai_trimmed". */
 	failureReason: string | null;
+	/** Non-null only when source is "ai_trimmed" — the exact sentence that was cut, for the admin-chat trim alert. */
+	trimmedSentence: string | null;
 	attempts: number;
 	totalTokensIn: number;
 	totalTokensOut: number;
@@ -78,10 +81,12 @@ export type AiJsonOutput = {
 	payload: AiPayload;
 	attempts: AiJsonAttempt[];
 	result: {
-		source: "ai" | "template";
+		source: "ai" | "ai_trimmed" | "template";
 		model: string | null;
 		promptVersion: number | null;
 		failureReason: string | null;
+		/** Non-null only when source is "ai_trimmed" — see AiGenerationResult.trimmedSentence. */
+		trimmedSentence: string | null;
 	};
 };
 
@@ -125,7 +130,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 			provider: options.client.providerHost,
 			payload,
 			attempts,
-			result: { source: "template", model: null, promptVersion: null, failureReason },
+			result: { source: "template", model: null, promptVersion: null, failureReason, trimmedSentence: null },
 		});
 		return {
 			source: "template",
@@ -135,6 +140,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 			provider: null,
 			promptVersion: null,
 			failureReason,
+			trimmedSentence: null,
 			attempts: attemptCounter,
 			totalTokensIn,
 			totalTokensOut,
@@ -263,7 +269,7 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 						provider: options.client.providerHost,
 						payload,
 						attempts,
-						result: { source: "ai", model: modelConfig.model, promptVersion: options.promptVersion, failureReason: null },
+						result: { source: "ai", model: modelConfig.model, promptVersion: options.promptVersion, failureReason: null, trimmedSentence: null },
 					});
 					return {
 						source: "ai",
@@ -273,12 +279,58 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 						provider: options.client.providerHost,
 						promptVersion: options.promptVersion,
 						failureReason: null,
+						trimmedSentence: null,
 						attempts: attemptCounter,
 						totalTokensIn,
 						totalTokensOut,
 						totalDurationMs: Date.now() - startedAt,
 						totalCost: anyCostKnown ? totalCost : null,
 					};
+				}
+
+				// Third outcome: a validator:observation_day_count rejection, and
+				// only that reason, gets one narrow chance to be fixed by cutting the
+				// single sentence that caused it — see validator.ts's
+				// attemptDayCountTrim for the full eligibility/re-validation rules.
+				// Neither failure branch of attemptDayCountTrim retries the model:
+				// "not_eligible" (can't safely cut — too few sentences, or the day
+				// count spans more than one) and "trim_failed" (cut attempted, the
+				// remainder didn't hold up) both go straight to the template. A
+				// same-model retry on this exact reason has no realistic upside —
+				// buildRetryObservationPrompt's day-count instruction is already
+				// what produced the very sentence attemptDayCountTrim just failed to
+				// salvage — so it's not worth a second paid request. Every *other*
+				// rejection reason is untouched below: AI_MAX_ATTEMPTS still governs
+				// its own retry exactly as before this outcome existed.
+				if (validation.reason === "validator:observation_day_count") {
+					const trim = attemptDayCountTrim(rawText, payload);
+					if (trim.ok) {
+						safeWriteAiJson(options.aiJsonFile, {
+							dateKey: options.facts.dateKey,
+							provider: options.client.providerHost,
+							payload,
+							attempts,
+							result: { source: "ai_trimmed", model: modelConfig.model, promptVersion: options.promptVersion, failureReason: null, trimmedSentence: trim.removedSentence },
+						});
+						return {
+							source: "ai_trimmed",
+							picture: pickPicture(options.facts),
+							observation: trim.observation,
+							model: modelConfig.model,
+							provider: options.client.providerHost,
+							promptVersion: options.promptVersion,
+							failureReason: null,
+							trimmedSentence: trim.removedSentence,
+							attempts: attemptCounter,
+							totalTokensIn,
+							totalTokensOut,
+							totalDurationMs: Date.now() - startedAt,
+							totalCost: anyCostKnown ? totalCost : null,
+						};
+					}
+					const trimFailureLabel = trim.stage === "not_eligible" ? "not eligible for trim" : "trim attempted but failed";
+					failureSummary.push(`${modelConfig.model} attempt ${attemptOnModel}: ${outcome}, ${trimFailureLabel} (${trim.detail})`);
+					return finish();
 				}
 
 				// Content-level failure — retry the same model if attempts remain.

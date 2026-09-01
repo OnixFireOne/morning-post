@@ -213,6 +213,23 @@ async function main() {
 		if (!delivered) console.error(text);
 	}
 
+	// Third outcome (2026-08-26): the AI response was fixed by cutting one
+	// sentence (validator:observation_day_count only — see attemptDayCountTrim)
+	// instead of falling back to the template. Not a failure — the post still
+	// goes out AI-sourced — but it's still a repair worth knowing about, same
+	// non-blocking alert mechanism and priority as the fallback alert above.
+	if (env.aiEnabled && rendered.source === "ai_trimmed") {
+		currentStep = "ai:trim-alert";
+		const text = formatAlert({
+			step: "ai:trimmed",
+			error: new Error(`cut one sentence for validator:observation_day_count: "${rendered.trimmedSentence}"`),
+			siteUrl: env.siteUrl || undefined,
+			exitCode: 0,
+		});
+		const delivered = await sendAlert({ botToken: env.telegramBotToken, chatId: env.telegramAdminChatId, text });
+		if (!delivered) console.error(text);
+	}
+
 	// One generation per day (single daily cron run) — this run's token total
 	// is the day's token total, no need to sum usage.jsonl across runs.
 	if (env.aiEnabled && env.aiDailyTokenWarn !== null && rendered.tokensIn !== null && rendered.tokensOut !== null) {

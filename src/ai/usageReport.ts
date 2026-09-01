@@ -26,7 +26,7 @@ import { dateKeyToLabel, moscowDateKey, shiftDateKey } from "../facts.js";
 import { billedInputTokens, computeCost, type UsageRecord } from "./usage.js";
 
 export type TodayUsage = {
-	source: "ai" | "template";
+	source: "ai" | "ai_trimmed" | "template";
 	model: string | null;
 	attempts: number;
 	tokensIn: number | null;

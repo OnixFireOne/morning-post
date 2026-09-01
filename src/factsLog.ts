@@ -14,7 +14,7 @@ export type FactsLogEntry = {
 	/** Denormalized from facts.winners[0]/losers[0] — same data, just not requiring a reader to re-derive "who actually led" from the full leaderboard arrays every time. */
 	topGainer: { ticker: string; change24h: number } | null;
 	topLoser: { ticker: string; change24h: number } | null;
-	source: "ai" | "template";
+	source: "ai" | "ai_trimmed" | "template";
 	model: string | null;
 	promptVersion: number | null;
 };
