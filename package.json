@@ -18,7 +18,8 @@
     "post": "cross-env DRY_RUN=0 tsx src/index.ts",
     "post:force": "cross-env DRY_RUN=0 tsx src/index.ts --force",
     "ai:models": "tsx src/ai/listModels.ts",
-    "ai:compare": "tsx tools/ai-compare.ts"
+    "ai:compare": "tsx tools/ai-compare.ts",
+    "ai:prompt": "tsx tools/ai-prompt.ts"
   },
   "dependencies": {
     "cross-env": "10.1.0",
