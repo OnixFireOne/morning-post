@@ -4,13 +4,25 @@
 // env at all). User is one JSON object, no prose around it, even on retry —
 // the retry instruction is a field inside that same object, not a wrapper.
 import type { AiPayload } from "./payload.js";
-import { MAX_PARAGRAPH_LENGTH, type ObservationValidationFailureReason, type ValidationFailureReason } from "./validator.js";
+import type { ObservationValidationFailureReason, ValidationFailureReason } from "./validator.js";
 
 /**
  * Section 4's system prompt: tone, bans, length, format — everything that
- * never changes per-day. MAX_PARAGRAPH_LENGTH is imported from validator.ts,
- * not restated as a literal here — the same number the validator enforces is
- * the one the model is told, so the two can never quietly drift apart.
+ * never changes per-day.
+ *
+ * PROMPT_VERSION 10: ДЛИНА no longer mentions MAX_PARAGRAPH_LENGTH or a
+ * character count at all — a live --all rerun on the primary model
+ * (env.aiModel — see providers.ts) came back 7/10, all seven "п.2 длина",
+ * because a model has no reliable way to count characters as it writes. The
+ * rule is now "exactly three
+ * sentences, each at most twenty words" — units the model can actually track
+ * while generating. MAX_PARAGRAPH_LENGTH itself is untouched and still
+ * enforced by validator.ts: the model is never told the char limit exists,
+ * it's a safety net against a rule the model *thinks* it's already
+ * satisfying, not a number to aim for. Same reasoning for both retry
+ * instructions below (RETRY_INSTRUCTIONS/RETRY_INSTRUCTIONS_OBSERVATION,
+ * "validator:length") — a retry that suddenly mentioned a character count
+ * would teach the model a rule PROMPT_VERSION 10 deliberately never states.
  *
  * PROMPT_VERSION 7: one-paragraph contract. Paragraph 1 (picture) is now
  * entirely code-generated (render.ts's pickPicture) — the model writes only
@@ -49,7 +61,7 @@ export function buildSystemPrompt(): string {
 
 ПОВТОРЫ. В history — твои наблюдения за последние дни. Не повторяй их образы и синтаксические конструкции, даже если состояние роя сегодня такое же. Это касается и глагольных конструкций отдельно: не переиспользуй их из history, даже подставив другие существительные — «превращает тикер в …» вчера и та же конструкция с другим тикером сегодня это тот же повтор, что дословное совпадение. Если history пуст (пустой список) — значит контекста о прошлых днях нет вообще: не пиши и не придумывай ничего о том, что было раньше («после тишины», «на фоне спокойных дней», «как и накануне» и подобное). Пустая history — повод молчать о прошлом, а не тема для абзаца: не пиши и о самом отсутствии данных («контекста нет», «сравнивать не с чем», «судим только по сегодняшнему срезу» и подобное) — это твоя внутренняя техническая деталь, читатель никогда не видит входной JSON и не должен даже заподозрить, что в нём есть такое поле. То же самое — про непустую history: сам механизм антиповтора тоже внутренняя техническая деталь, о ней не говорят вслух — не называй что-то повтором и не ссылайся на прошлые абзацы как на источник («вчерашний образ», «вчерашний сценарий», «уже использовано» и подобное), просто не повторяй, не объясняя вслух, что ты этого не делаешь. Пиши только о сегодняшнем дне.
 
-ДЛИНА. Абзац — не длиннее ${MAX_PARAGRAPH_LENGTH} символов.
+ДЛИНА. Абзац — ровно три предложения, каждое не длиннее двадцати слов.
 
 ЯЗЫК. Только русский.
 
@@ -86,7 +98,7 @@ const RETRY_INSTRUCTIONS: Record<ValidationFailureReason, string> = {
 		"Предыдущий ответ не получилось разобрать как JSON-объект с полями picture, observation и direction. Верни только один валидный JSON-объект с этими тремя полями, без синтаксических ошибок.",
 	"validator:numbers":
 		"В предыдущем ответе встретилось число, которого нет в allowedNumbers. Используй только числа из этого списка, ровно в записанном там виде — ничего не добавляй, не округляй и не пересказывай приблизительно.",
-	"validator:length": `Один из абзацев в предыдущем ответе оказался длиннее ${MAX_PARAGRAPH_LENGTH} символов. Сократи оба абзаца так, чтобы каждый уложился в этот лимит.`,
+	"validator:length": "Один из абзацев в предыдущем ответе получился слишком длинным. Перепиши оба абзаца так, чтобы каждый состоял ровно из трёх предложений, и ни одно предложение не превышало двадцати слов.",
 	"validator:forbidden_pattern":
 		"В предыдущем ответе был запрещённый элемент — прогноз, совет купить/продать, обещание иксов, хэштег, ссылка, HTML-тег или эмодзи. Перепиши текст без него.",
 	"validator:direction":
@@ -114,7 +126,7 @@ export function buildRetryUserPrompt(payload: AiPayload, reason: ValidationFailu
 const RETRY_INSTRUCTIONS_OBSERVATION: Record<ObservationValidationFailureReason, string> = {
 	invalid_json:
 		'Предыдущий ответ не получилось разобрать как JSON-объект с полями observation и direction. Верни только один валидный JSON-объект вида {"observation": "...", "direction": "..."}, без синтаксических ошибок.',
-	"validator:length": `Абзац в предыдущем ответе оказался длиннее ${MAX_PARAGRAPH_LENGTH} символов. Сократи его так, чтобы он уложился в этот лимит.`,
+	"validator:length": "Абзац в предыдущем ответе получился слишком длинным. Перепиши его строго тремя предложениями, каждое не длиннее двадцати слов.",
 	"validator:forbidden_pattern":
 		"В предыдущем ответе был запрещённый элемент — прогноз, совет купить/продать, обещание иксов, хэштег, ссылка, HTML-тег или эмодзи. Перепиши текст без него.",
 	"validator:direction":

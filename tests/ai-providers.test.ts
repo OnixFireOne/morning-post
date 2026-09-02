@@ -20,6 +20,14 @@ describe("resolveProviderProfile", () => {
 		expect(Object.keys(profile.priceTable).length).toBeGreaterThan(0);
 	});
 
+	// 02.09: this header is what makes openrouter_metadata show up in the
+	// response at all (client.ts's OpenAiChatCompletion) — the primary path
+	// for resolving which exact model/provider answered, replacing the old
+	// post-hoc GET /api/v1/generation?id=<id> lookup.
+	it("openrouter profile sends X-OpenRouter-Metadata: enabled on every request", () => {
+		expect(resolveProviderProfile("openrouter").extraHeaders["X-OpenRouter-Metadata"]).toBe("enabled");
+	});
+
 	it("falls back to DEFAULT_PROVIDER_NAME when the name is empty/undefined", () => {
 		expect(resolveProviderProfile(undefined).name).toBe(DEFAULT_PROVIDER_NAME);
 		expect(resolveProviderProfile("").name).toBe(DEFAULT_PROVIDER_NAME);

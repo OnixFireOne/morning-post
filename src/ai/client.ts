@@ -56,8 +56,8 @@ export type AiGenerateResult = {
 	responseProvider: string | null;
 	/** The model id the response itself echoes back — can differ from the requested model under routing/aliasing. null on any transport failure. */
 	responseModel: string | null;
-	/** OpenRouter's own generation id — only ever used by tools/ai-compare.ts's model_permaslug lookup, never read on the production path. null on any transport failure or when the provider doesn't report one. */
-	responseId: string | null;
+	/** OpenRouter's own richer model/provider identification, present only when the request carried X-OpenRouter-Metadata: enabled (see OpenAiChatCompletion.openrouter_metadata's own comment) — only ever read by tools/ai-compare.ts's report header, never on the production path. null on any transport failure, when the provider doesn't report it, or when the field's shape doesn't match what's expected (never thrown over — a report header line degrades, nothing more). */
+	openrouterMetadata: { model: string | null; provider: string | null } | null;
 };
 
 export type AiModel = {
@@ -116,8 +116,24 @@ type OpenAiChatCompletion = {
 	/** OpenRouter-specific top-level fields — absent from other OpenAI-compatible providers, which is fine: both simply come back undefined below. */
 	provider?: string;
 	model?: string;
-	/** OpenRouter's own generation id ("gen-...") — the `id` query param GET /api/v1/generation?id=<id> needs (tools/ai-compare.ts's own model_permaslug lookup; never called from the production path). */
-	id?: string;
+	/**
+	 * OpenRouter-specific, present only when the request carried
+	 * `X-OpenRouter-Metadata: enabled` (src/ai/providers.ts's OPENROUTER
+	 * profile sets it on every request via extraHeaders) — the exact upstream
+	 * model/provider variant that answered, more precise than the plain
+	 * `model`/`provider` fields above (which can be the requested slug
+	 * unchanged, not what actually routed). 02.09: replaces the old
+	 * GET /api/v1/generation?id=<id> lookup (tools/ai-compare.ts) — that was a
+	 * second network round trip after the fact, and its 404s turned out to be
+	 * genuine ("not found", not "not ready yet" — OpenRouter's own docs; a
+	 * live rerun with a retry+pause still 404'd). This rides on the same
+	 * response the request already got, no second call needed. Shape is this
+	 * project's best reading of OpenRouter's docs, not independently verified
+	 * against a live response (zero network calls this session) — every
+	 * reader of this field treats a missing/malformed value as absent and
+	 * falls back, never throws, exactly because that shape isn't guaranteed.
+	 */
+	openrouter_metadata?: { model?: string; provider?: string };
 };
 
 type OpenAiModelList = {
@@ -126,6 +142,16 @@ type OpenAiModelList = {
 
 function joinUrl(baseUrl: string, path: string): string {
 	return `${baseUrl.replace(/\/+$/, "")}${path}`;
+}
+
+/** Defensive on purpose (see OpenAiChatCompletion.openrouter_metadata's own comment) — a missing field, or one with neither sub-field a usable string, comes back null rather than `{model: null, provider: null}`: the caller (tools/ai-compare.ts) treats null as "try the next fallback tier", and an object with two nulls would look like a confirmed-empty answer instead. */
+function extractOpenrouterMetadata(data: OpenAiChatCompletion): { model: string | null; provider: string | null } | null {
+	const raw = data.openrouter_metadata;
+	if (!raw || typeof raw !== "object") return null;
+	const model = typeof raw.model === "string" && raw.model ? raw.model : null;
+	const provider = typeof raw.provider === "string" && raw.provider ? raw.provider : null;
+	if (!model && !provider) return null;
+	return { model, provider };
 }
 
 /** The raw error is discarded on purpose — it can embed the proxy URL with credentials. */
@@ -184,7 +210,7 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 				rawUsage: null,
 				responseProvider: null,
 				responseModel: null,
-				responseId: null,
+				openrouterMetadata: null,
 			};
 		} finally {
 			clearTimeout(timeout);
@@ -206,7 +232,7 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 				rawUsage: null,
 				responseProvider: null,
 				responseModel: null,
-				responseId: null,
+				openrouterMetadata: null,
 			};
 		}
 
@@ -230,7 +256,7 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 				rawUsage: null,
 				responseProvider: null,
 				responseModel: null,
-				responseId: null,
+				openrouterMetadata: null,
 			};
 		}
 
@@ -261,7 +287,7 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 			rawUsage: data.usage ?? null,
 			responseProvider: data.provider ?? null,
 			responseModel: data.model ?? null,
-			responseId: data.id ?? null,
+			openrouterMetadata: extractOpenrouterMetadata(data),
 		};
 	}
 

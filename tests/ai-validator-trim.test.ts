@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { attemptObservationTrim, splitIntoSentences } from "../src/ai/validator.js";
+import { attemptObservationTrim, splitIntoSentences, validateAiObservation } from "../src/ai/validator.js";
 import { buildAiPayload } from "../src/ai/payload.js";
 import type { Facts } from "../src/facts.js";
 
@@ -223,6 +223,60 @@ describe("attemptObservationTrim(reason=validator:length)", () => {
 		const observation = `${s1} ${s2}`;
 		expect(splitIntoSentences(observation)).toHaveLength(2);
 		const result = attemptObservationTrim(rawText(observation), payload, "validator:length");
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("expected ok:false");
+		expect(result.stage).toBe("not_eligible");
+		expect(result.detail).toContain("2 sentence");
+	});
+});
+
+// 2026-09-02: generalized to a second reason — same eligibility technique as
+// day-count (re-run the per-item check against each sentence on its own,
+// require exactly one match), but reusing findForbiddenPattern instead of
+// findAnyDayCountWord. The matched pattern's own label rides along on the
+// ok:true result's `detail` — see validator.ts's ObservationTrimResult.
+describe("attemptObservationTrim(reason=validator:forbidden_pattern)", () => {
+	const s1 = "Рой уверенно держит зелёный настрой на протяжении всего дня.";
+	const s2 = "К вечеру рынок наверняка сдвинется в другую сторону, так уже бывало.";
+	const s3 = "XRP по-прежнему опережает большинство монет в этом движении.";
+
+	it("cuts the one sentence carrying the pattern (not necessarily the last), remainder passes revalidation, detail names the pattern", () => {
+		const observation = `${s1} ${s2} ${s3}`;
+		const wholeTextRejection = validateAiObservation(rawText(observation), payload);
+		expect(wholeTextRejection.ok).toBe(false);
+		if (wholeTextRejection.ok) throw new Error("expected ok:false");
+		expect(wholeTextRejection.reason).toBe("validator:forbidden_pattern");
+
+		const result = attemptObservationTrim(rawText(observation), payload, "validator:forbidden_pattern");
+		expect(result.ok).toBe(true);
+		if (!result.ok) throw new Error("expected ok:true");
+		expect(result.removedSentence).toBe(s2);
+		expect(result.observation).toBe(`${s1} ${s3}`);
+		expect(result.detail).toBe("forecast language");
+	});
+
+	it("not_eligible — the pattern fires in two sentences, not exactly one, so there's no single safe cut", () => {
+		const twoMatches = `${s1} К вечеру рынок наверняка сдвинется в другую сторону. Прогноз тут простой: движение продолжится и завтра.`;
+		const result = attemptObservationTrim(rawText(twoMatches), payload, "validator:forbidden_pattern");
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("expected ok:false");
+		expect(result.stage).toBe("not_eligible");
+		expect(result.detail).toContain("2 sentence");
+	});
+
+	it("trim_failed — eligible (>=3 sentences, exactly one carries the pattern), but the remainder is too short (<80 chars)", () => {
+		const observation = "Рой зелёный. К вечеру всё изменится, так всегда бывает на этом рынке. XRP лидирует.";
+		const result = attemptObservationTrim(rawText(observation), payload, "validator:forbidden_pattern");
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("expected ok:false");
+		expect(result.stage).toBe("trim_failed");
+		expect(result.detail).toContain("chars");
+	});
+
+	it("not_eligible — only 2 sentences total, below the shared >=3 floor (same gate as every other reason)", () => {
+		const observation = `${s1} ${s2}`;
+		expect(splitIntoSentences(observation)).toHaveLength(2);
+		const result = attemptObservationTrim(rawText(observation), payload, "validator:forbidden_pattern");
 		expect(result.ok).toBe(false);
 		if (result.ok) throw new Error("expected ok:false");
 		expect(result.stage).toBe("not_eligible");

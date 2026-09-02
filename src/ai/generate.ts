@@ -40,7 +40,7 @@ export type BuildParagraphsAiOptions = {
 };
 
 export type AiGenerationResult = {
-	/** "ai_trimmed": the model's response would otherwise have been rejected for a trimmable reason (validator:observation_day_count or validator:length) — one sentence was cut and the remainder passed validateAiObservation whole (see validator.ts's attemptObservationTrim). */
+	/** "ai_trimmed": the model's response would otherwise have been rejected for a trimmable reason (see validator.ts's TRIMMABLE_REASONS) — one sentence was cut and the remainder passed validateAiObservation whole (see validator.ts's attemptObservationTrim). */
 	source: "ai" | "ai_trimmed" | "template";
 	picture: string;
 	observation: string;

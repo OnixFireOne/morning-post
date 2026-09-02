@@ -74,6 +74,11 @@ const OPENROUTER: AiProviderProfile = {
 		// ignores unknown headers.
 		"HTTP-Referer": "https://github.com/morning-post",
 		"X-Title": "morning-post",
+		// 02.09: makes every response (production and ai:compare alike) carry
+		// openrouter_metadata — see client.ts's OpenAiChatCompletion comment for
+		// why this replaces the old post-hoc GET /api/v1/generation?id=<id>
+		// lookup instead of a second request.
+		"X-OpenRouter-Metadata": "enabled",
 	},
 	// Confirmed live against a real GET /models call (26.08) — vendor/model
 	// slugs, unlike the old proxy's bare "claude-sonnet-4-7".

@@ -19,6 +19,16 @@ export type FactsLogEntry = {
 	/** The upstream inference backend that actually answered (RenderedPost.responseProvider) — null on "template", or when the provider doesn't report one. Section 5 of the 26.08 provider migration: "provider и model из ответа" recorded here alongside model, not just model as before. */
 	provider: string | null;
 	promptVersion: number | null;
+	/**
+	 * How many requests this day's AI attempt took, null when AI was never
+	 * attempted at all (AI_ENABLED=0) — mirrors RenderedPost.attempts. Added
+	 * 02.09: without this, a day recovered by a same-model retry (e.g. a
+	 * malformed invalid_json first response) is indistinguishable here from a
+	 * clean first-try success — both show source: "ai" and no failureReason.
+	 * usage.jsonl already has this per-attempt, but only facts.jsonl carries
+	 * it alongside the day's own facts for at-a-glance reading.
+	 */
+	attempts: number | null;
 };
 
 export function formatFactsLogLine(entry: FactsLogEntry): string {

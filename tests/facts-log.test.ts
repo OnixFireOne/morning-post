@@ -34,6 +34,7 @@ function entry(overrides: Partial<FactsLogEntry> = {}): FactsLogEntry {
 		model: "anthropic/claude-sonnet-5",
 		provider: "Anthropic",
 		promptVersion: 4,
+		attempts: 1,
 		...overrides,
 	};
 }
@@ -107,6 +108,37 @@ describe("appendFactsLogLine", () => {
 			expect(parsed.source).toBe("template");
 			expect(parsed.model).toBeNull();
 			expect(parsed.promptVersion).toBeNull();
+		});
+	});
+
+	// 02.09: without `attempts`, a day recovered by a same-model retry (e.g. a
+	// malformed invalid_json first response — src/ai/generate.ts) was
+	// indistinguishable here from a clean first-try success: both show
+	// source: "ai" and no failureReason. This is the field that tells them
+	// apart, alongside usage.jsonl's own per-attempt record.
+	it("attempts distinguishes a retry-recovered day (attempts: 2) from a clean first-try success (attempts: 1) — both source: ai", () => {
+		withTmpDir((dir) => {
+			const file = path.join(dir, "facts.jsonl");
+			appendFactsLogLine(file, entry({ date: "2026-08-23", attempts: 1 }));
+			appendFactsLogLine(file, entry({ date: "2026-08-24", attempts: 2, facts: specExampleFacts({ dateKey: "2026-08-24" }) }));
+
+			const lines = readFileSync(file, "utf8").trim().split("\n");
+			const [clean, retried] = lines.map((l) => JSON.parse(l) as FactsLogEntry);
+			expect(clean!.source).toBe("ai");
+			expect(clean!.attempts).toBe(1);
+			expect(retried!.source).toBe("ai");
+			expect(retried!.attempts).toBe(2);
+		});
+	});
+
+	it("attempts is null when AI was never attempted at all (AI_ENABLED=0), same as model/promptVersion", () => {
+		withTmpDir((dir) => {
+			const file = path.join(dir, "facts.jsonl");
+			appendFactsLogLine(file, entry({ source: "template", model: null, promptVersion: null, attempts: null }));
+
+			const [line] = readFileSync(file, "utf8").trim().split("\n");
+			const parsed = JSON.parse(line!) as FactsLogEntry;
+			expect(parsed.attempts).toBeNull();
 		});
 	});
 

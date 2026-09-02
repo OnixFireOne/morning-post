@@ -47,20 +47,25 @@ const ALL_REASONS: ValidationFailureReason[] = [
 	"validator:streak_word_mismatch",
 ];
 
-describe("buildSystemPrompt: length limit comes from the same constant the validator reads", () => {
-	it("interpolates MAX_PARAGRAPH_LENGTH itself, not a restated literal", () => {
-		const system = buildSystemPrompt();
-		expect(system).toContain(String(MAX_PARAGRAPH_LENGTH));
+// PROMPT_VERSION 10: the char-count rule below (tied to MAX_PARAGRAPH_LENGTH)
+// is gone — a live --all rerun on anthropic/claude-sonnet-5 came back 7/10,
+// all seven "п.2 длина", because a model can't reliably count characters as
+// it writes. Replaced with units a model can actually track while
+// generating: exactly three sentences, each at most twenty words.
+// MAX_PARAGRAPH_LENGTH itself is untouched (still validator.ts's real
+// enforcement) — the model is deliberately never told the char limit exists,
+// so this suite must assert its *absence* from the prompt, not its presence.
+describe("buildSystemPrompt: PROMPT_VERSION 10 — sentence/word length, not a character count", () => {
+	const system = buildSystemPrompt();
+
+	it("states the length rule as three sentences of at most twenty words", () => {
+		expect(system).toMatch(/ровно три предложения/);
+		expect(system).toMatch(/не длиннее двадцати слов/);
 	});
 
-	it("would still be correct if the shared constant changed — proven by asserting against the import, not the number 320", () => {
-		// This test doesn't hardcode "320" anywhere. If validator.ts's constant
-		// ever changes, this assertion tracks it automatically; a version of
-		// prompt.ts that had its own separate "320" literal would still pass a
-		// test that checked for "320" specifically, which is exactly the drift
-		// this is meant to catch.
-		expect(MAX_PARAGRAPH_LENGTH).toBeGreaterThan(0);
-		expect(buildSystemPrompt().includes(`${MAX_PARAGRAPH_LENGTH} символов`)).toBe(true);
+	it("never mentions MAX_PARAGRAPH_LENGTH's value or a character count — the model must not know the char limit exists", () => {
+		expect(system).not.toContain(String(MAX_PARAGRAPH_LENGTH));
+		expect(system).not.toMatch(/символ/);
 	});
 });
 

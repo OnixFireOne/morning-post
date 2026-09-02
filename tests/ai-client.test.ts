@@ -247,13 +247,12 @@ describe("createAiClient: authStyle (26.08 provider migration — src/ai/provide
 	});
 });
 
-describe("createAiClient: responseProvider/responseModel/responseId (26.08 — OpenRouter-specific top-level response fields)", () => {
-	it("reads provider/model/id straight from the response body on success", async () => {
+describe("createAiClient: responseProvider/responseModel (26.08 — OpenRouter-specific top-level response fields)", () => {
+	it("reads provider/model straight from the response body on success", async () => {
 		const fetchImpl: FetchLike = async () => ({
 			ok: true,
 			status: 200,
 			json: async () => ({
-				id: "gen-abc123",
 				provider: "Anthropic",
 				model: "anthropic/claude-sonnet-5",
 				choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
@@ -263,7 +262,6 @@ describe("createAiClient: responseProvider/responseModel/responseId (26.08 — O
 		const result = await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
 		expect(result.responseProvider).toBe("Anthropic");
 		expect(result.responseModel).toBe("anthropic/claude-sonnet-5");
-		expect(result.responseId).toBe("gen-abc123");
 	});
 
 	it("are all null when the response doesn't carry them (a provider without OpenRouter's extensions)", async () => {
@@ -275,7 +273,6 @@ describe("createAiClient: responseProvider/responseModel/responseId (26.08 — O
 		const result = await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
 		expect(result.responseProvider).toBeNull();
 		expect(result.responseModel).toBeNull();
-		expect(result.responseId).toBeNull();
 	});
 
 	it("are all null on any transport-level failure — nothing was ever parsed", async () => {
@@ -283,6 +280,58 @@ describe("createAiClient: responseProvider/responseModel/responseId (26.08 — O
 		const result = await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
 		expect(result.responseProvider).toBeNull();
 		expect(result.responseModel).toBeNull();
-		expect(result.responseId).toBeNull();
+	});
+});
+
+// 02.09: replaces the old GET /api/v1/generation?id=<id> lookup — that was a
+// second round trip after the fact and its 404s turned out to be genuine
+// ("not found", not "not ready yet"). X-OpenRouter-Metadata: enabled (set by
+// providers.ts's OPENROUTER profile, on every request) makes the same
+// response carry this instead — no second call.
+describe("createAiClient: openrouterMetadata", () => {
+	function fetchWith(body: Record<string, unknown>): FetchLike {
+		return async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({ choices: [{ message: { content: "hi" }, finish_reason: "stop" }], ...body }),
+		});
+	}
+
+	it("reads model/provider from openrouter_metadata when present", async () => {
+		const result = await client(fetchWith({ openrouter_metadata: { model: "anthropic/claude-sonnet-4.5-20250929", provider: "Anthropic" } })).generate({
+			model: "m",
+			system: "s",
+			user: "u",
+			timeoutMs: 1000,
+		});
+		expect(result.openrouterMetadata).toEqual({ model: "anthropic/claude-sonnet-4.5-20250929", provider: "Anthropic" });
+	});
+
+	it("is null when the response has no openrouter_metadata field at all (header wasn't honored, or a non-OpenRouter provider)", async () => {
+		const result = await client(fetchWith({})).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+		expect(result.openrouterMetadata).toBeNull();
+	});
+
+	it("is null (never throws) when openrouter_metadata is present but malformed — wrong type, or neither sub-field a usable string", async () => {
+		for (const malformed of ["a string, not an object", 42, null, {}, { model: 5, provider: null }, { model: "", provider: "" }]) {
+			const result = await client(fetchWith({ openrouter_metadata: malformed })).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+			expect(result.openrouterMetadata, `expected null for ${JSON.stringify(malformed)}`).toBeNull();
+		}
+	});
+
+	it("keeps whichever sub-field is a real string even when the other is missing", async () => {
+		const result = await client(fetchWith({ openrouter_metadata: { model: "anthropic/claude-sonnet-4.5-20250929" } })).generate({
+			model: "m",
+			system: "s",
+			user: "u",
+			timeoutMs: 1000,
+		});
+		expect(result.openrouterMetadata).toEqual({ model: "anthropic/claude-sonnet-4.5-20250929", provider: null });
+	});
+
+	it("is null on any transport-level failure", async () => {
+		const fetchImpl: FetchLike = async () => ({ ok: false, status: 500, json: async () => ({}) });
+		const result = await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+		expect(result.openrouterMetadata).toBeNull();
 	});
 });

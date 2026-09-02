@@ -49,7 +49,7 @@ import { createAiClient, type AiClient, type FetchLike } from "../src/ai/client.
 import { buildAiPayload, stateHistoryToAiHistory, type AiPayload } from "../src/ai/payload.js";
 import { buildRetryObservationPrompt, buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
 import { computeAttemptCost, resolveProviderProfile, type AiProviderProfile } from "../src/ai/providers.js";
-import { attemptObservationTrim, isTrimmableReason, validateAiObservation, type ObservationValidationFailureReason } from "../src/ai/validator.js";
+import { attemptObservationTrim, isTrimmableReason, validateAiObservation, type ObservationValidationFailureReason, type TrimmableFailureReason } from "../src/ai/validator.js";
 import { computeFacts, shiftDateKey, type Facts, type StateHistory } from "../src/facts.js";
 import { buildParagraphs, pickPicture, type PostParagraphs } from "../src/render.js";
 import { loadSnapshotFromFile } from "../src/snapshot.js";
@@ -111,6 +111,27 @@ const VALIDATOR_ITEM_LABELS: Record<ObservationValidationFailureReason, string> 
 	"validator:observation_ratio_mismatch": "новое: словесная кратность не совпадает с реальным соотношением зелёных/красных",
 };
 
+/** Which sentence attemptObservationTrim actually cut for a given trimmable reason — see validator.ts's selectSentenceToTrim. Shown in the report alongside VALIDATOR_ITEM_LABELS so the "trimmed" verdict names the real mechanism instead of always describing the original (day-count-only) one. */
+const TRIM_MECHANISM_DETAIL: Record<TrimmableFailureReason, string> = {
+	"validator:observation_day_count": "исходно только в одном предложении из трёх+",
+	"validator:length": "вырезано последнее предложение из трёх+",
+	"validator:forbidden_pattern": "вырезано предложение с сработавшим паттерном",
+};
+
+/**
+ * What one attempt's own response carried about which exact model/provider
+ * answered — everything resolveModelIdentity (below) needs, without keeping
+ * the whole AiGenerateResult around. Both fields come straight off
+ * client.ts's AiGenerateResult, unmodified.
+ */
+export type ModelIdentitySource = {
+	/** Present only when the request carried X-OpenRouter-Metadata: enabled (providers.ts's OPENROUTER profile sets it on every request) — see client.ts's OpenAiChatCompletion.openrouter_metadata for the full story. */
+	openrouterMetadata: { model: string | null; provider: string | null } | null;
+	/** The response body's own plain `model`/`provider` fields — the last-resort fallback tier when neither openrouter_metadata nor the /models/{slug} lookup produces anything. */
+	responseModel: string | null;
+	responseProvider: string | null;
+};
+
 export type RunOutcome =
 	| {
 			kind: "accepted";
@@ -123,8 +144,8 @@ export type RunOutcome =
 			costEstimate: number | null;
 			/** The provider's own usage block, untouched — see AiGenerateResult.rawUsage in client.ts. */
 			rawUsage: unknown;
-			/** OpenRouter's own generation id — see fetchModelPermaslug below. null for a provider that doesn't report one. */
-			responseId: string | null;
+			/** What this attempt's own response carried for model identity — see ModelIdentitySource's own comment. */
+			modelIdentity: ModelIdentitySource;
 	  }
 	| {
 			kind: "rejected";
@@ -136,17 +157,21 @@ export type RunOutcome =
 			durationMs: number;
 			costEstimate: number | null;
 			rawUsage: unknown;
-			responseId: string | null;
+			modelIdentity: ModelIdentitySource;
 	  }
-	// Third outcome (2026-08-26, generalized 2026-09-01): would have been
-	// "rejected" for a trimmable reason (validator:observation_day_count or
-	// validator:length), but cutting one sentence left a paragraph that
+	// Third outcome (2026-08-26, generalized 2026-09-01 and 2026-09-02): would
+	// have been "rejected" for a trimmable reason (see validator.ts's
+	// TRIMMABLE_REASONS), but cutting one sentence left a paragraph that
 	// passed validateAiObservation whole — see validator.ts's
 	// attemptObservationTrim. A distinct grade from "accepted", shown
 	// separately in the report: the
 	// model's raw answer wasn't clean, even though what got published was.
 	| {
 			kind: "trimmed";
+			/** Which validator item actually triggered the cut — day-count, length, and forbidden_pattern are all trimmable now (validator.ts's TRIMMABLE_REASONS), and the label shown in the report must be looked up from this, not hardcoded to the original (day-count-only) case. */
+			reason: TrimmableFailureReason;
+			/** Non-null only for reason "validator:forbidden_pattern" — the specific pattern label that matched (validator.ts's attemptObservationTrim own `detail`), so the report can show which one, not just "forbidden pattern" generically. */
+			detail: string | null;
 			picture: string;
 			observation: string;
 			direction: string;
@@ -157,7 +182,7 @@ export type RunOutcome =
 			durationMs: number;
 			costEstimate: number | null;
 			rawUsage: unknown;
-			responseId: string | null;
+			modelIdentity: ModelIdentitySource;
 	  }
 	| { kind: "transport"; label: string; errorMessage: string | null; durationMs: number }
 	// --chain-degrade only: this step deliberately skipped the model entirely
@@ -193,10 +218,10 @@ export type CompareOptions = {
 	modelId: string;
 	/** Drives cost computation (costSource/priceTable/inputOverhead — see providers.ts's computeAttemptCost) for every run in this call, regardless of whether modelId is the profile's primary or fallback model. */
 	provider: AiProviderProfile;
-	/** Needed only for the post-run model_permaslug lookup (fetchModelPermaslug) — the real API key, same one the client was built with. Never logged. */
+	/** Needed only for the post-run model-identity resolution (resolveModelIdentity) — the real API key, same one the client was built with. Never logged. */
 	apiKey: string;
-	/** Injectable for tests — defaults to the global fetch when omitted. Only ever used for the one GET .../generation?id=... lookup after every run is done; client.generate() calls go through `client` above, unaffected by this. */
-	permaslugFetchImpl?: FetchLike;
+	/** Injectable for tests — defaults to the global fetch when omitted. Only ever used for resolveModelIdentity's own GET /models/{slug} fallback (tier 2) after every run is done; client.generate() calls go through `client` above, unaffected by this. */
+	modelIdentityFetchImpl?: FetchLike;
 	fixtureNames: string[];
 	runsPerFixture: number;
 	timeoutMs: number;
@@ -279,7 +304,7 @@ async function runOne(
 			durationMs: result.durationMs,
 			costEstimate,
 			rawUsage: result.rawUsage,
-			responseId: result.responseId,
+			modelIdentity: { openrouterMetadata: result.openrouterMetadata, responseModel: result.responseModel, responseProvider: result.responseProvider },
 		};
 	}
 
@@ -293,6 +318,8 @@ async function runOne(
 		if (trim.ok) {
 			return {
 				kind: "trimmed",
+				reason: validation.reason,
+				detail: trim.detail,
 				picture: pickPicture(facts),
 				observation: trim.observation,
 				direction: trim.direction,
@@ -303,7 +330,7 @@ async function runOne(
 				durationMs: result.durationMs,
 				costEstimate,
 				rawUsage: result.rawUsage,
-				responseId: result.responseId,
+				modelIdentity: { openrouterMetadata: result.openrouterMetadata, responseModel: result.responseModel, responseProvider: result.responseProvider },
 			};
 		}
 		// "not_eligible" or "trim_failed" — either way, this specific rawText
@@ -322,7 +349,7 @@ async function runOne(
 		durationMs: result.durationMs,
 		costEstimate,
 		rawUsage: result.rawUsage,
-		responseId: result.responseId,
+		modelIdentity: { openrouterMetadata: result.openrouterMetadata, responseModel: result.responseModel, responseProvider: result.responseProvider },
 	};
 }
 
@@ -365,70 +392,89 @@ function formatRawUsageBlock(rawUsage: unknown): string {
 }
 
 /**
- * The most recent real (non-transport, non-forced) run's own OpenRouter
- * generation id, newest run last in `runs` — used once per report, after
- * every run is done, to look up which exact upstream model actually
- * answered (see fetchModelPermaslug below). null when nothing in the report
- * ever got a real response with an id (every run was transport/forced, or
- * the provider doesn't report generation ids at all).
+ * The most recent real (non-transport, non-forced) run's own model-identity
+ * data, newest run last in `runs` — used once per report, after every run is
+ * done, to resolve which exact upstream model/provider actually answered
+ * (see resolveModelIdentity below). null when nothing in the report ever got
+ * a real response at all (every run was transport/forced).
  */
-function lastResponseId(runs: FixtureRun[]): string | null {
+function lastModelIdentitySource(runs: FixtureRun[]): ModelIdentitySource | null {
 	for (let i = runs.length - 1; i >= 0; i--) {
 		const final = finalOutcome(runs[i]!);
-		if (final.kind === "accepted" || final.kind === "trimmed" || final.kind === "rejected") return final.responseId;
+		if (final.kind === "accepted" || final.kind === "trimmed" || final.kind === "rejected") return final.modelIdentity;
 	}
 	return null;
 }
 
-/** Success carries the permaslug; failure carries a human-readable reason (HTTP status plus the body's own error message when the body parses, or the exception message on a network error) — 01.09's report showed a bare "запрос не удался" for every failure mode, indistinguishable from each other and useless for telling an expired/under-scoped key apart from a transient miss. */
-export type PermaslugLookupResult = { ok: true; permaslug: string } | { ok: false; reason: string };
+export type ModelIdentityResult =
+	| { source: "openrouter_metadata"; model: string; provider: string | null }
+	| { source: "canonical_slug"; slug: string }
+	| { source: "response_body"; model: string | null; provider: string | null };
 
 /**
- * OpenRouter-specific: GET /api/v1/generation?id=<id> after a run has
- * already happened, to learn model_permaslug — which exact upstream model
- * variant actually answered (routing can normalize the requested slug).
- * ai:compare-only: this is one extra network round trip purely for the
- * report's own header, not worth paying at 9am on the production path —
- * generate.ts never calls this. Never throws: a failed lookup (network
- * error, non-2xx, unexpected shape) just means the header line says so via
- * PermaslugLookupResult's own reason, it never breaks report generation
- * over a cosmetic extra fact.
+ * OpenRouter-specific: GET /api/v1/models/{slug} — fallback tier 2 (see
+ * resolveModelIdentity), only reached when the response carried no usable
+ * openrouter_metadata (header not honored, or the provider isn't
+ * OpenRouter). Never throws: a failed lookup (network error, non-2xx,
+ * unexpected shape) just means resolution moves to tier 3, it never breaks
+ * report generation over a cosmetic extra fact.
  */
-export async function fetchModelPermaslug(baseUrl: string, apiKey: string, generationId: string, fetchImpl: FetchLike): Promise<PermaslugLookupResult> {
-	const url = `${baseUrl.replace(/\/+$/, "")}/generation?id=${encodeURIComponent(generationId)}`;
+export async function fetchCanonicalModelSlug(baseUrl: string, apiKey: string, modelSlug: string, fetchImpl: FetchLike): Promise<{ ok: true; slug: string } | { ok: false; reason: string }> {
+	const url = `${baseUrl.replace(/\/+$/, "")}/models/${modelSlug}`;
 	let response: Awaited<ReturnType<FetchLike>>;
 	try {
 		response = await fetchImpl(url, { method: "GET", headers: { Authorization: `Bearer ${apiKey}` } });
 	} catch (err) {
 		return { ok: false, reason: `сетевая ошибка: ${err instanceof Error ? err.message : String(err)}` };
 	}
+	if (!response.ok) return { ok: false, reason: `HTTP ${response.status}` };
 
-	if (!response.ok) {
-		let bodyDetail = "";
-		try {
-			const body = (await response.json()) as { error?: { message?: string } };
-			if (body.error?.message) bodyDetail = `: ${body.error.message}`;
-		} catch {
-			// body isn't JSON, or is empty — the HTTP status alone is still useful
-		}
-		return { ok: false, reason: `HTTP ${response.status}${bodyDetail}` };
-	}
-
-	let data: { data?: { model_permaslug?: string } };
+	let data: { data?: { canonical_slug?: string } };
 	try {
-		data = (await response.json()) as { data?: { model_permaslug?: string } };
+		data = (await response.json()) as { data?: { canonical_slug?: string } };
 	} catch {
 		return { ok: false, reason: "тело ответа не JSON" };
 	}
-	const permaslug = data.data?.model_permaslug;
-	if (!permaslug) return { ok: false, reason: "ответ без model_permaslug" };
-	return { ok: true, permaslug };
+	const slug = data.data?.canonical_slug;
+	if (!slug) return { ok: false, reason: "ответ без canonical_slug" };
+	return { ok: true, slug };
 }
 
-/** Shared by runCompare and runChain's own header — null means fetchModelPermaslug was never called at all (no generationId to look up). */
-function formatPermaslugLine(result: PermaslugLookupResult | null): string {
-	if (result === null) return "н/д (нет generation id в ответе)";
-	return result.ok ? result.permaslug : `н/д (${result.reason})`;
+/**
+ * 02.09: replaces the old GET /api/v1/generation?id=<id> lookup entirely —
+ * that endpoint 404'd on all three lookups in a live report even with a
+ * retry-after-pause (the eventual-consistency hypothesis was wrong: 404
+ * there means "not found", per OpenRouter's own docs, not "not ready yet").
+ * Three tiers, in order, never throws so a report can never fail over a
+ * cosmetic extra fact:
+ *   1. openrouter_metadata off the response the run already got — no extra
+ *      request at all (see ModelIdentitySource/client.ts's own comments).
+ *   2. GET /api/v1/models/{slug} for canonical_slug — the one extra request
+ *      this ever makes, only when tier 1 came up empty.
+ *   3. The response body's own plain model/provider fields — never fails,
+ *      so resolution always produces *something*, worst case a note that
+ *      the exact version is unavailable (see formatModelIdentityLine).
+ */
+export async function resolveModelIdentity(source: ModelIdentitySource | null, baseUrl: string, apiKey: string, modelSlug: string, fetchImpl: FetchLike): Promise<ModelIdentityResult | null> {
+	if (source === null) return null;
+
+	if (source.openrouterMetadata?.model) {
+		return { source: "openrouter_metadata", model: source.openrouterMetadata.model, provider: source.openrouterMetadata.provider };
+	}
+
+	const canonical = await fetchCanonicalModelSlug(baseUrl, apiKey, modelSlug, fetchImpl);
+	if (canonical.ok) return { source: "canonical_slug", slug: canonical.slug };
+
+	return { source: "response_body", model: source.responseModel, provider: source.responseProvider };
+}
+
+/** Shared by runCompare and runChain's own header — null means nothing in the report ever got a real response at all. */
+export function formatModelIdentityLine(result: ModelIdentityResult | null): string {
+	if (result === null) return "н/д (не было ни одного реального ответа)";
+	if (result.source === "openrouter_metadata") return `${result.model}${result.provider ? ` (${result.provider})` : ""}`;
+	if (result.source === "canonical_slug") return `${result.slug} (canonical_slug из /models — openrouter_metadata недоступен)`;
+	const body = result.model ? `${result.model}${result.provider ? ` (${result.provider})` : ""}` : "н/д";
+	return `${body} — точная версия недоступна`;
 }
 
 function formatSection31Line(label: string, leaked: string[]): string {
@@ -528,7 +574,7 @@ function formatAttemptOutcome(label: string | null, outcome: RunOneOutcome): str
 	if (outcome.kind === "trimmed") {
 		return [
 			...labelLines,
-			"- Вердикт: ✂️ починено вырезанием предложения (новое: любой счёт дней (словом или цифрой), исходно только в одном предложении из трёх+)",
+			`- Вердикт: ✂️ починено вырезанием предложения (${VALIDATOR_ITEM_LABELS[outcome.reason]}${outcome.detail ? `: ${outcome.detail}` : ""}, ${TRIM_MECHANISM_DETAIL[outcome.reason]})`,
 			tokensLine,
 			costLine,
 			timeLine,
@@ -575,7 +621,8 @@ export function verdictText(outcome: RunOneOutcome): string {
 	return `❌ отклонено — ${VALIDATOR_ITEM_LABELS[outcome.reason]}`;
 }
 
-function formatRunSection(fr: FixtureRun, totalRuns: number): string {
+/** Exported for direct testing — the full per-run report section, including the "Вердикт:" line whose reason-specific text used to be hardcoded to the day-count case (see the "trimmed" branch's own comment). */
+export function formatRunSection(fr: FixtureRun, totalRuns: number): string {
 	const { run, outcome, retryOutcome } = fr;
 	const header = `### ИИ — прогон ${run}/${totalRuns}`;
 
@@ -724,10 +771,10 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 	}
 
 	// Once, after every run — never per-attempt, never on the production
-	// path (see fetchModelPermaslug's own comment). A missing/failed lookup
-	// just changes what the header line says, it never blocks the report.
-	const generationId = lastResponseId(allRuns);
-	const permaslugResult = generationId ? await fetchModelPermaslug(opts.provider.baseUrl, opts.apiKey, generationId, opts.permaslugFetchImpl ?? (fetch as unknown as FetchLike)) : null;
+	// path (see resolveModelIdentity's own comment). A missing/failed
+	// resolution just changes what the header line says, it never blocks the
+	// report.
+	const modelIdentity = await resolveModelIdentity(lastModelIdentitySource(allRuns), opts.provider.baseUrl, opts.apiKey, opts.modelId, opts.modelIdentityFetchImpl ?? (fetch as unknown as FetchLike));
 
 	const header = [
 		`# ai:compare — ${opts.modelId}`,
@@ -740,7 +787,7 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 			? "- Фолбэк отключён (одна модель за прогон). --retry включён: на содержательный отказ делается ровно одна повторная попытка тем же путём, что generate.ts (buildRetryObservationPrompt, тот же лимит) — показана отдельной строкой в каждом прогоне, итог по прогону считается по финальному исходу."
 			: "- Ретраи и фолбэк отключены — каждый прогон это ровно одна попытка одной моделью, без ретрая на содержательный отказ.",
 		`- Стоимость везде в ${CURRENCY_SYMBOL} — costSource: ${opts.provider.costSource} (${opts.provider.costSource === "provider" ? "точный счёт от провайдера" : "оценка по таблице цен"}).`,
-		`- model_permaslug (OpenRouter, по последнему реальному ответу): ${formatPermaslugLine(permaslugResult)}`,
+		`- Модель (по последнему реальному ответу): ${formatModelIdentityLine(modelIdentity)}`,
 		`- Длина system-сообщения: ${system.length} символов (норма: до ${SYSTEM_PROMPT_NORM_MAX_CHARS}) — ${systemInNorm ? "✅ в норме" : "⚠️ аномально большой"}`,
 		...(systemInNorm
 			? []
@@ -766,10 +813,10 @@ export type ChainOptions = {
 	modelId: string;
 	/** Drives cost computation (costSource/priceTable/inputOverhead — see providers.ts's computeAttemptCost). */
 	provider: AiProviderProfile;
-	/** Needed only for the post-run model_permaslug lookup (fetchModelPermaslug) — the real API key, same one the client was built with. Never logged. */
+	/** Needed only for the post-run model-identity resolution (resolveModelIdentity) — the real API key, same one the client was built with. Never logged. */
 	apiKey: string;
 	/** Injectable for tests — defaults to the global fetch when omitted. */
-	permaslugFetchImpl?: FetchLike;
+	modelIdentityFetchImpl?: FetchLike;
 	fixtureNames: string[];
 	chainLength: number;
 	timeoutMs: number;
@@ -1206,8 +1253,7 @@ export async function runChain(opts: ChainOptions): Promise<void> {
 	}
 
 	// Once, after every run — see runCompare's own identical comment.
-	const generationId = lastResponseId(allRuns);
-	const permaslugResult = generationId ? await fetchModelPermaslug(opts.provider.baseUrl, opts.apiKey, generationId, opts.permaslugFetchImpl ?? (fetch as unknown as FetchLike)) : null;
+	const modelIdentity = await resolveModelIdentity(lastModelIdentitySource(allRuns), opts.provider.baseUrl, opts.apiKey, opts.modelId, opts.modelIdentityFetchImpl ?? (fetch as unknown as FetchLike));
 
 	const header = [
 		`# ai:compare --chain=${opts.chainLength} — ${opts.modelId}`,
@@ -1222,7 +1268,7 @@ export async function runChain(opts: ChainOptions): Promise<void> {
 			? "- Фолбэк отключён (одна модель за прогон). --retry включён: на содержательный отказ делается ровно одна повторная попытка тем же путём, что generate.ts (buildRetryObservationPrompt, тот же лимит) — показана отдельной строкой в каждом прогоне, итог по прогону считается по финальному исходу."
 			: "- Ретраи и фолбэк отключены, как и в обычном режиме — один запрос это одна попытка.",
 		`- Стоимость везде в ${CURRENCY_SYMBOL} — costSource: ${opts.provider.costSource} (${opts.provider.costSource === "provider" ? "точный счёт от провайдера" : "оценка по таблице цен"}).`,
-		`- model_permaslug (OpenRouter, по последнему реальному ответу): ${formatPermaslugLine(permaslugResult)}`,
+		`- Модель (по последнему реальному ответу): ${formatModelIdentityLine(modelIdentity)}`,
 		"- Завязки первых предложений — материал для взгляда человека, не автоматический вердикт: валидатор на повтор формулировок не расширялся, это вопрос стиля, а не фактической ошибки.",
 	].join("\n");
 

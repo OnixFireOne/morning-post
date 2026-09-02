@@ -60,7 +60,7 @@ function okResult(content: string, overrides: Partial<AiGenerateResult> = {}): A
 		rawUsage: null,
 		responseProvider: null,
 		responseModel: null,
-		responseId: null,
+		openrouterMetadata: null,
 		...overrides,
 	};
 }
@@ -79,7 +79,7 @@ function failResult(errorKind: NonNullable<AiErrorKind>, overrides: Partial<AiGe
 		rawUsage: null,
 		responseProvider: null,
 		responseModel: null,
-		responseId: null,
+		openrouterMetadata: null,
 		...overrides,
 	};
 }
@@ -367,6 +367,60 @@ describe("buildParagraphsAI: retry vs fallback split by errorKind", () => {
 		expect(calls).toHaveLength(2);
 		expect(calls[0]!.model).toBe("primary-model");
 		expect(calls[1]!.model).toBe("fallback-model"); // straight to fallback, not a second primary attempt
+		expect(result.source).toBe("ai");
+		expect(result.model).toBe("fallback-model");
+	});
+});
+
+// 02.09 08:22 live --all run: 1/20 attempts came back invalid_json (the
+// content simply didn't parse as JSON — not a validator rejection of a
+// well-formed answer). invalid_json was never excluded from the generic
+// content-level-failure branch (isTrimmableReason returns false for it, same
+// as validator:direction/language/... — see the "retry vs fallback split"
+// block above), so this pins that down explicitly rather than leaving it as
+// an untested implication. AI_MAX_ATTEMPTS still governs it exactly like any
+// other content-level reason — no separate budget, no separate limit.
+describe("buildParagraphsAI: invalid_json (malformed response) retries the same model, same as any other content-level failure", () => {
+	it("a malformed first response retries the same model and succeeds on the second try", async () => {
+		const { client, calls } = fakeClient("provider.example.com", [okResult("this is not json at all {{{"), okResult(fixtureText("observation-good"))]);
+		const options = baseOptions({ client, primary: modelConfig("primary-model"), maxAttemptsPerModel: 2 });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(calls).toHaveLength(2);
+		expect(calls[0]!.model).toBe("primary-model");
+		expect(calls[1]!.model).toBe("primary-model"); // still the primary — a retry, not a fallback switch
+		expect(JSON.parse(calls[1]!.user).retryInstruction).toBeDefined();
+		expect(result.source).toBe("ai");
+		expect(result.model).toBe("primary-model");
+		// Distinguishable from a clean first-attempt success purely by attempts —
+		// source/failureReason alone would look identical to attempts: 1.
+		expect(result.attempts).toBe(2);
+		expect(result.failureReason).toBeNull();
+	});
+
+	it("usage.jsonl records the malformed attempt as invalid_json, not folded into some other outcome label", async () => {
+		const { client } = fakeClient("provider.example.com", [okResult("not json"), okResult(fixtureText("observation-good"))]);
+		const options = baseOptions({ client, maxAttemptsPerModel: 2 });
+
+		await buildParagraphsAI(options);
+
+		const lines = readUsageLines(options.usageFile);
+		expect(lines).toHaveLength(2);
+		expect(lines[0]!.outcome).toBe("invalid_json");
+		expect(lines[1]!.outcome).toBe("ok");
+	});
+
+	it("exhausting both attempts on the primary model with invalid_json falls through to the fallback model — same budget, no special-casing", async () => {
+		const { client, calls } = fakeClient("provider.example.com", [okResult("{{{"), okResult("{{{"), okResult(fixtureText("observation-good"))]);
+		const options = baseOptions({ client, primary: modelConfig("primary-model"), fallback: modelConfig("fallback-model"), maxAttemptsPerModel: 2 });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(calls).toHaveLength(3);
+		expect(calls[0]!.model).toBe("primary-model");
+		expect(calls[1]!.model).toBe("primary-model");
+		expect(calls[2]!.model).toBe("fallback-model");
 		expect(result.source).toBe("ai");
 		expect(result.model).toBe("fallback-model");
 	});
@@ -665,14 +719,55 @@ describe("buildParagraphsAI: third outcome — validator:observation_day_count f
 		expect(result.source).toBe("ai"); // the retry succeeded
 	});
 
-	it("every other rejection reason keeps retrying under AI_MAX_ATTEMPTS, untouched by this outcome — a forbidden-pattern rejection still gets its retry", async () => {
+	// 02.09: validator:forbidden_pattern joined TRIMMABLE_REASONS, so this
+	// fixture's old premise ("forbidden-pattern rejections always retry") no
+	// longer holds universally — whether it retries or trims-then-templates
+	// now depends on the response's own sentence shape. advice.txt's
+	// observation is a single sentence, below the >=3 floor to safely cut
+	// one, so it's not_eligible and goes straight to the template, exactly
+	// like the day-count case above — see the next describe block below for
+	// a forbidden-pattern response that *is* trim-eligible.
+	it("a forbidden-pattern rejection too short to trim (single sentence) goes straight to the template — no retry, exactly one call", async () => {
 		const { client, calls } = fakeClient("provider.example.com", [okResult(fixtureText("advice")), okResult(fixtureText("observation-good"))]);
 		const options = baseOptions({ client, maxAttemptsPerModel: 2 });
 
 		const result = await buildParagraphsAI(options);
 
-		expect(calls).toHaveLength(2);
-		expect(JSON.parse(calls[1]!.user).retryInstruction).toBeDefined();
-		expect(result.source).toBe("ai"); // the retry succeeded
+		expect(calls).toHaveLength(1); // the second canned response (a would-be retry) is never consumed
+		expect(result.source).toBe("template");
+		expect(result.failureReason).toContain("not eligible for trim");
+	});
+});
+
+describe("buildParagraphsAI: third outcome — validator:forbidden_pattern fixed by trimming one sentence (02.09)", () => {
+	const threeSentenceForecast = JSON.stringify({
+		observation:
+			"Рой продолжает двигаться в минус без резких рывков. К вечеру ситуация наверняка изменится, ждать осталось недолго. TRAC держится крепче остальных, а PI отстаёт заметнее прочих.",
+		direction: "red",
+	});
+
+	it("returns source ai_trimmed, cutting the forecast sentence specifically — not the last one", async () => {
+		const { client, calls } = fakeClient("provider.example.com", [okResult(threeSentenceForecast)]);
+		const options = baseOptions({ client, primary: modelConfig("primary-model") });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(calls).toHaveLength(1); // trimming replaces the retry — no second request
+		expect(result.source).toBe("ai_trimmed");
+		expect(result.trimmedSentence).toContain("К вечеру");
+		expect(result.observation).not.toContain("К вечеру");
+		expect(result.observation).toContain("TRAC");
+		expect(result.observation).toContain("PI");
+	});
+
+	it("usage.jsonl still logs the raw attempt's real outcome (validator:forbidden_pattern) — the trim is a processing decision, not a rewrite of what happened", async () => {
+		const { client } = fakeClient("provider.example.com", [okResult(threeSentenceForecast)]);
+		const options = baseOptions({ client });
+
+		await buildParagraphsAI(options);
+
+		const lines = readUsageLines(options.usageFile);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]!.outcome).toBe("validator:forbidden_pattern");
 	});
 });

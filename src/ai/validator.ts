@@ -503,10 +503,9 @@ export function validateAiObservation(rawText: string, payload: AiPayload): Obse
 // as a remainder that fails revalidation for any other reason. Neither
 // failure branch ("not_eligible" — never attempted; "trim_failed" —
 // attempted and rejected) retries the model; the caller falls back to the
-// template. Every rejection reason this mechanism doesn't cover (forbidden
-// pattern, wrong direction, ratio mismatch, language...) is untouched: an
-// outright rejection, handled by the caller's existing retry/fallback
-// machinery.
+// template. Every rejection reason this mechanism doesn't cover (wrong
+// direction, ratio mismatch, language...) is untouched: an outright
+// rejection, handled by the caller's existing retry/fallback machinery.
 //
 // validator:observation_day_count (original case, found on six live
 // rejections — 25.08, reports/compare-2026-08-25-{1805,1844,1913,1943}-*.md):
@@ -530,6 +529,15 @@ export function validateAiObservation(rawText: string, payload: AiPayload): Obse
 // revalidation's own length re-check (nothing special-cased here) catches
 // that and falls through to trim_failed exactly the same way a too-short
 // remainder does.
+//
+// validator:forbidden_pattern (added 2026-09-02): like day-count, the
+// offending sentence can be pinned down — findForbiddenPattern re-run
+// against each sentence on its own, same as the whole-observation check
+// that first caught it. Eligible only when exactly one sentence matches;
+// with more than one, cutting either alone still leaves a rejection, so
+// there's no single safe cut. The matched label (e.g. "forecast language")
+// is carried on the ok:true result's `detail` so a report can show which
+// specific pattern fired, not just "forbidden pattern" generically.
 
 /** Boundary is ".", "!", "?" only — never ":" or "—", both of which sit *inside* a sentence in this app's observations (colons introduce a clause, em-dashes join two clauses) — see the six cases above for real examples of both. Punctuation stays attached to its own sentence so a rejoined remainder still "ends like a sentence" (endsLikeASentence) without extra glue. Observation text never contains digits (rejected upstream by findAnyDigit before this ever runs), so there's no decimal-point/abbreviation ambiguity to worry about. */
 const SENTENCE_RE = /[^.!?]+[.!?]+/g;
@@ -550,7 +558,11 @@ const MIN_REMAINING_SENTENCES = 2;
 const MIN_TOTAL_SENTENCES_FOR_TRIM = 3;
 
 export type ObservationTrimResult =
-	| { ok: true; observation: string; direction: AiPayload["today"]["swarmState"]; removedSentence: string; originalObservation: string }
+	// `detail` is non-null only for validator:forbidden_pattern — the specific
+	// pattern label that matched (e.g. "forecast language"), for the report to
+	// show which one actually fired. day-count/length have nothing comparable
+	// to name, so it's null for both.
+	| { ok: true; observation: string; direction: AiPayload["today"]["swarmState"]; removedSentence: string; originalObservation: string; detail: string | null }
 	// Trim was never attempted — the caller's existing retry/fallback handling
 	// for the original rejection should proceed exactly as before this outcome
 	// existed.
@@ -561,15 +573,15 @@ export type ObservationTrimResult =
 	| { ok: false; stage: "trim_failed"; detail: string };
 
 /** The rejection reasons attemptObservationTrim knows how to trim for — the single source of truth callers check against before calling it. Extending trim to a new reason means adding it here and to selectSentenceToTrim's switch, nowhere else. */
-export const TRIMMABLE_REASONS = ["validator:observation_day_count", "validator:length"] as const;
+export const TRIMMABLE_REASONS = ["validator:observation_day_count", "validator:length", "validator:forbidden_pattern"] as const;
 export type TrimmableFailureReason = (typeof TRIMMABLE_REASONS)[number];
 
 export function isTrimmableReason(reason: ObservationValidationFailureReason): reason is TrimmableFailureReason {
 	return (TRIMMABLE_REASONS as readonly ObservationValidationFailureReason[]).includes(reason);
 }
 
-/** Which sentence to cut for a given trimmable reason, checked after the shared >= 3-sentences gate in attemptObservationTrim. A reason-specific "not eligible" (day-count spread across more than one sentence) is distinct from the shared one (too few sentences) so the detail message names the actual cause. */
-function selectSentenceToTrim(sentences: string[], reason: TrimmableFailureReason): { index: number } | { notEligible: string } {
+/** Which sentence to cut for a given trimmable reason, checked after the shared >= 3-sentences gate in attemptObservationTrim. A reason-specific "not eligible" (day-count/forbidden-pattern spread across more than one sentence) is distinct from the shared one (too few sentences) so the detail message names the actual cause. `detail` on the eligible branch carries the matched pattern's own label for validator:forbidden_pattern (null otherwise) — see ObservationTrimResult's own comment. */
+function selectSentenceToTrim(sentences: string[], reason: TrimmableFailureReason, payload: AiPayload): { index: number; detail: string | null } | { notEligible: string } {
 	if (reason === "validator:observation_day_count") {
 		const violatingIndices: number[] = [];
 		sentences.forEach((sentence, i) => {
@@ -578,12 +590,27 @@ function selectSentenceToTrim(sentences: string[], reason: TrimmableFailureReaso
 		if (violatingIndices.length !== 1) {
 			return { notEligible: `day-count wording appears in ${violatingIndices.length} sentence(s), can only cut exactly one` };
 		}
-		return { index: violatingIndices[0]! };
+		return { index: violatingIndices[0]!, detail: null };
+	}
+	if (reason === "validator:forbidden_pattern") {
+		// Same technique as day-count: re-run the per-item check against each
+		// sentence on its own, not the whole observation — the whole-text check
+		// already fired once (that's how this reason was reached at all), this
+		// only needs to know *which* sentence carries it.
+		const matches: { index: number; label: string }[] = [];
+		sentences.forEach((sentence, i) => {
+			const label = findForbiddenPattern(sentence, payload);
+			if (label) matches.push({ index: i, label });
+		});
+		if (matches.length !== 1) {
+			return { notEligible: `forbidden pattern appears in ${matches.length} sentence(s), can only cut exactly one` };
+		}
+		return { index: matches[0]!.index, detail: matches[0]!.label };
 	}
 	// validator:length — see this section's own top comment for why the last
 	// sentence is always the cut candidate, and why an insufficient cut is
 	// left to revalidation below rather than decided here.
-	return { index: sentences.length - 1 };
+	return { index: sentences.length - 1, detail: null };
 }
 
 /**
@@ -603,7 +630,7 @@ export function attemptObservationTrim(rawText: string, payload: AiPayload, reas
 		return { ok: false, stage: "not_eligible", detail: `only ${sentences.length} sentence(s), need >= ${MIN_TOTAL_SENTENCES_FOR_TRIM} to safely cut one` };
 	}
 
-	const selection = selectSentenceToTrim(sentences, reason);
+	const selection = selectSentenceToTrim(sentences, reason, payload);
 	if ("notEligible" in selection) {
 		return { ok: false, stage: "not_eligible", detail: selection.notEligible };
 	}
@@ -628,7 +655,7 @@ export function attemptObservationTrim(rawText: string, payload: AiPayload, reas
 		return { ok: false, stage: "trim_failed", detail: `remainder fails validateAiObservation: ${revalidated.reason} — ${revalidated.detail}` };
 	}
 
-	return { ok: true, observation: revalidated.result.observation, direction: revalidated.result.direction, removedSentence, originalObservation: observation };
+	return { ok: true, observation: revalidated.result.observation, direction: revalidated.result.direction, removedSentence, originalObservation: observation, detail: selection.detail };
 }
 
 /**

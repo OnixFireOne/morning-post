@@ -58,7 +58,7 @@ function okResult(content: string, overrides: Partial<AiGenerateResult> = {}): A
 		rawUsage: null,
 		responseProvider: null,
 		responseModel: null,
-		responseId: null,
+		openrouterMetadata: null,
 		...overrides,
 	};
 }
@@ -77,7 +77,7 @@ function failResult(overrides: Partial<AiGenerateResult> = {}): AiGenerateResult
 		rawUsage: null,
 		responseProvider: null,
 		responseModel: null,
-		responseId: null,
+		openrouterMetadata: null,
 		...overrides,
 	};
 }
@@ -157,7 +157,7 @@ describe("runOneWithOptionalRetry", () => {
 
 describe("finalOutcome", () => {
 	it("returns the first attempt's outcome when no retry happened", () => {
-		const fr: FixtureRun = { fixtureName: "f", run: 1, outcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, responseId: null } };
+		const fr: FixtureRun = { fixtureName: "f", run: 1, outcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, modelIdentity: { openrouterMetadata: null, responseModel: null, responseProvider: null } } };
 		expect(finalOutcome(fr).kind).toBe("accepted");
 	});
 
@@ -165,8 +165,8 @@ describe("finalOutcome", () => {
 		const fr: FixtureRun = {
 			fixtureName: "f",
 			run: 1,
-			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, responseId: null },
-			retryOutcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, responseId: null },
+			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, modelIdentity: { openrouterMetadata: null, responseModel: null, responseProvider: null } },
+			retryOutcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, modelIdentity: { openrouterMetadata: null, responseModel: null, responseProvider: null } },
 		};
 		expect(finalOutcome(fr).kind).toBe("accepted");
 	});
@@ -174,7 +174,7 @@ describe("finalOutcome", () => {
 
 describe("outcomeLabel", () => {
 	it("formats each outcome kind for the console progress line", () => {
-		const accepted: RunOneOutcome = { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, responseId: null };
+		const accepted: RunOneOutcome = { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 1, tokensOut: 1, durationMs: 1, costEstimate: null, rawUsage: null, modelIdentity: { openrouterMetadata: null, responseModel: null, responseProvider: null } };
 		const rejected: RunOneOutcome = {
 			kind: "rejected",
 			reason: "validator:observation_digit",
@@ -185,7 +185,7 @@ describe("outcomeLabel", () => {
 			durationMs: 1,
 			costEstimate: null,
 			rawUsage: null,
-			responseId: null,
+			modelIdentity: { openrouterMetadata: null, responseModel: null, responseProvider: null },
 		};
 		const transport: RunOneOutcome = { kind: "transport", label: "таймаут", errorMessage: null, durationMs: 1 };
 
@@ -200,14 +200,14 @@ describe("runTotals: real spend per run, both attempts summed when a retry happe
 		const fr: FixtureRun = {
 			fixtureName: "f",
 			run: 1,
-			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null, responseId: null },
-			retryOutcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 80, tokensOut: 30, durationMs: 1, costEstimate: 0.8, rawUsage: null, responseId: null },
+			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null, modelIdentity: { openrouterMetadata: null, responseModel: null, responseProvider: null } },
+			retryOutcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 80, tokensOut: 30, durationMs: 1, costEstimate: 0.8, rawUsage: null, modelIdentity: { openrouterMetadata: null, responseModel: null, responseProvider: null } },
 		};
 		expect(runTotals(fr)).toEqual({ tokensIn: 180, tokensOut: 70, costEstimate: 1.8 });
 	});
 
 	it("returns just the single attempt's own totals when there was no retry", () => {
-		const fr: FixtureRun = { fixtureName: "f", run: 1, outcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null, responseId: null } };
+		const fr: FixtureRun = { fixtureName: "f", run: 1, outcome: { kind: "accepted", picture: "p", observation: "o", direction: "red", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null, modelIdentity: { openrouterMetadata: null, responseModel: null, responseProvider: null } } };
 		expect(runTotals(fr)).toEqual({ tokensIn: 100, tokensOut: 40, costEstimate: 1 });
 	});
 
@@ -215,7 +215,7 @@ describe("runTotals: real spend per run, both attempts summed when a retry happe
 		const fr: FixtureRun = {
 			fixtureName: "f",
 			run: 1,
-			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null, responseId: null },
+			outcome: { kind: "rejected", reason: "validator:observation_digit", detail: "d", rawResponse: "r", tokensIn: 100, tokensOut: 40, durationMs: 1, costEstimate: 1, rawUsage: null, modelIdentity: { openrouterMetadata: null, responseModel: null, responseProvider: null } },
 			retryOutcome: { kind: "transport", label: "таймаут", errorMessage: null, durationMs: 1 },
 		};
 		expect(runTotals(fr)).toEqual({ tokensIn: 100, tokensOut: 40, costEstimate: 1 });

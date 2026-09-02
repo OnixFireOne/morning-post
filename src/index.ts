@@ -339,6 +339,7 @@ async function main() {
 			model: rendered.model,
 			provider: rendered.responseProvider,
 			promptVersion: rendered.promptVersion,
+			attempts: rendered.attempts,
 		});
 	} catch (err) {
 		console.error("[facts-log] failed to append:", err instanceof Error ? err.message : err);
