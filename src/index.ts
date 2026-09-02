@@ -5,7 +5,7 @@ import { formatAlert, sendAlert } from "./alert.js";
 import { resolveProviderProfile } from "./ai/providers.js";
 import { buildUsageReport } from "./ai/usageReport.js";
 import { captureSnapshotAndScreenshot } from "./capture.js";
-import { parseArgs, type CliArgs } from "./cliArgs.js";
+import { formatHelpText, parseArgs, type CliArgs } from "./cliArgs.js";
 import { RetryExhaustedError } from "./errors.js";
 import { computeFacts, type StateDay } from "./facts.js";
 import { appendFactsLogLine } from "./factsLog.js";
@@ -32,6 +32,14 @@ function parseArgsOrExit(): CliArgs {
 }
 
 const args = parseArgsOrExit();
+
+// --help/-h: print and exit 0, before touching .env values, state, or
+// anything else — "ничего не запуская" means exactly that, not just "no
+// network yet".
+if (args.help) {
+	console.log(formatHelpText());
+	process.exit(0);
+}
 
 function readEnv(args: CliArgs) {
 	const stateFile = path.resolve(process.env.STATE_FILE || "data/state.json");
@@ -80,7 +88,11 @@ function readEnv(args: CliArgs) {
 		// profile fills gaps, it never forces a value nobody asked to change.
 		aiProvider: providerProfile,
 		aiBaseUrl: process.env.AI_BASE_URL || providerProfile.baseUrl,
-		aiApiKey: process.env.AI_API_KEY || "",
+		// Which env var actually holds the secret is itself part of the
+		// catalog entry now (AiProviderProfile.apiKeyVar) — never a literal
+		// "AI_API_KEY" here, so a future provider naming a different variable
+		// doesn't need a code change to be read correctly.
+		aiApiKey: process.env[providerProfile.apiKeyVar] || "",
 		aiModel: process.env.AI_MODEL || providerProfile.primaryModel,
 		aiModelFallback: process.env.AI_MODEL_FALLBACK || providerProfile.fallbackModel,
 		aiTimeoutMs: Number(process.env.AI_TIMEOUT_MS || 25000),
@@ -123,7 +135,7 @@ function validateStartupConfig(): void {
 		process.exit(1);
 	}
 	if (env.aiEnabled && (!env.aiBaseUrl || !env.aiApiKey || !env.aiModel || !env.aiModelFallback)) {
-		console.error("[startup] AI_ENABLED=1 requires AI_BASE_URL, AI_API_KEY, AI_MODEL, and AI_MODEL_FALLBACK to all be set.");
+		console.error(`[startup] AI_ENABLED=1 requires AI_BASE_URL, ${env.aiProvider.apiKeyVar}, AI_MODEL, and AI_MODEL_FALLBACK to all be set.`);
 		process.exit(1);
 	}
 }

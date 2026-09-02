@@ -1,0 +1,37 @@
+{
+  "openrouter": {
+    "name": "openrouter",
+    "baseUrl": "https://openrouter.ai/api/v1",
+    "authStyle": "bearer",
+    "apiKeyVar": "AI_API_KEY",
+    "extraHeaders": {
+      "HTTP-Referer": "https://github.com/morning-post",
+      "X-Title": "morning-post",
+      "X-OpenRouter-Metadata": "enabled"
+    },
+    "primaryModel": "anthropic/claude-sonnet-5",
+    "fallbackModel": "anthropic/claude-opus-5",
+    "costSource": "provider",
+    "priceTable": {},
+    "inputOverhead": 0,
+    "balanceSource": "api",
+    "unitRate": 1
+  },
+  "anthropic": {
+    "name": "anthropic",
+    "baseUrl": "https://api.anthropic.com/v1",
+    "authStyle": "x-api-key",
+    "apiKeyVar": "AI_API_KEY",
+    "extraHeaders": {},
+    "primaryModel": "claude-sonnet-4-7",
+    "fallbackModel": "claude-opus-5",
+    "costSource": "table",
+    "priceTable": {
+      "claude-sonnet-4-7": { "priceInPerMillion": 14, "priceOutPerMillion": 42 },
+      "claude-opus-5": { "priceInPerMillion": 20, "priceOutPerMillion": 60 }
+    },
+    "inputOverhead": 0,
+    "balanceSource": "manual",
+    "unitRate": 1
+  }
+}

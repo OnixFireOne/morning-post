@@ -1290,7 +1290,9 @@ function readEnv() {
 	const provider = resolveProviderProfile(process.env.AI_PROVIDER);
 	return {
 		baseUrl: process.env.AI_BASE_URL || provider.baseUrl,
-		apiKey: process.env.AI_API_KEY || "",
+		// Which env var holds the key is part of the catalog entry itself
+		// (AiProviderProfile.apiKeyVar) — same as src/index.ts's own readEnv().
+		apiKey: process.env[provider.apiKeyVar] || "",
 		proxyUrl: process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "",
 		model: process.env.AI_MODEL || provider.primaryModel,
 		modelFallback: process.env.AI_MODEL_FALLBACK || provider.fallbackModel,
@@ -1417,7 +1419,7 @@ async function main() {
 	const env = readEnv();
 
 	if (!env.baseUrl || !env.apiKey) {
-		console.error("[ai:compare] AI_BASE_URL and AI_API_KEY must both be set in .env.");
+		console.error(`[ai:compare] AI_BASE_URL and ${env.provider.apiKeyVar} must both be set in .env.`);
 		process.exitCode = 1;
 		return;
 	}

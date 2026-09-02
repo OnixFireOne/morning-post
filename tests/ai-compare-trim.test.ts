@@ -11,6 +11,7 @@ function testProvider(overrides: Partial<AiProviderProfile> = {}): AiProviderPro
 		name: "test-provider",
 		baseUrl: "https://provider.example.com",
 		authStyle: "bearer",
+		apiKeyVar: "AI_API_KEY",
 		extraHeaders: {},
 		primaryModel: "m",
 		fallbackModel: "m",

@@ -13,7 +13,23 @@ RUN npm ci
 
 COPY tsconfig.json ./
 COPY src ./src
+# 02.09: config/providers.json — src/ai/providers.ts reads it at startup
+# (AI_PROVIDERS_FILE unset) whenever the process runs at all, dry or not.
+# Missing here means every container run, including a plain --dry smoke
+# test, dies immediately on "providers catalog: cannot read
+# /app/config/providers.json" — this file is not optional cargo.
+COPY config ./config
 
 # Одноразовый скрипт: запустился → сделал пост (или упал с алертом) →
 # завершился. Никакого демона внутри — расписание снаружи, через cron.
-CMD ["npx", "tsx", "src/index.ts"]
+#
+# ENTRYPOINT, not CMD: `docker compose run --rm morning-post` still runs the
+# same command as before (ENTRYPOINT + empty CMD), but
+# `docker compose run --rm morning-post --dry` now actually reaches
+# src/cliArgs.ts instead of being silently dropped — a bare CMD is *replaced*
+# wholesale by any trailing `run` arguments, an ENTRYPOINT's arguments are
+# appended to it. The cron line on the VPS passes no arguments at all, so
+# this changes nothing for it — see README's own note on `--entrypoint sh`
+# for the one real consequence (shell debugging needs that flag now).
+ENTRYPOINT ["npx", "tsx", "src/index.ts"]
+CMD []

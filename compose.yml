@@ -1,5 +1,18 @@
 # One-shot: `docker compose run --rm morning-post` делает один пост и
 # выходит. Никакого `docker compose up` — сервис не демон, restart: "no".
+#
+# 02.09: Dockerfile переехал на ENTRYPOINT (npx tsx src/index.ts) + пустой
+# CMD — специально, чтобы `docker compose run --rm morning-post --dry` (и
+# любые другие флаги cliArgs.ts) доходили до скрипта, а не тихо терялись
+# (с одним CMD без ENTRYPOINT трейлинг-аргументы run заменяли всю команду
+# целиком, а не добавлялись к ней). Явных аргументов `docker compose run`
+# ключ `command:` здесь не касается — они всё равно побеждают что угодно.
+# Но ключа `command:` в этом файле намеренно нет: если его добавить, он
+# заменит пустой CMD как аргумент по умолчанию для запуска БЕЗ явных
+# аргументов — то есть именно для строки в кроне (`docker compose run --rm
+# morning-post`, без хвоста). `command: ["--dry"]` тут превратил бы боевой
+# крон в сухой прогон молча. Прежде чем заводить command: — проверить,
+# что дефолт (без аргументов) остаётся боевым, это и есть цель ENTRYPOINT.
 services:
   morning-post:
     image: ghcr.io/onixfireone/morning-post:latest
