@@ -177,45 +177,68 @@ export async function buildParagraphsAI(options: BuildParagraphsAiOptions): Prom
 				if (!result.ok) {
 					// result.content is never touched here — ok:false means there is
 					// nothing trustworthy to read, only errorKind/httpStatus are.
-					const outcome = result.errorKind === "timeout" ? "timeout" : result.errorKind === "http_error" ? `http_${result.httpStatus}` : "network_error";
+					// usage/rawUsage/responseModel/finishReason, however, are read
+					// from the result exactly like the ok:true branch below — for a
+					// genuine transport failure (timeout/network/http_error) they're
+					// always null/false anyway (see client.ts/clientMessages.ts), but
+					// "empty_response" (plan §6.1 fact 1: max_tokens spent with no
+					// output text) is a real, billed attempt that still has to be
+					// priced and logged, not silently dropped from the day's spend.
+					const outcome =
+						result.errorKind === "timeout"
+							? "timeout"
+							: result.errorKind === "http_error"
+								? `http_${result.httpStatus}`
+								: result.errorKind === "empty_response"
+									? "empty_response"
+									: "network_error";
+					const cost = computeAttemptCost(options.provider, modelConfig.model, result.usage, result.rawUsage);
 					safeAppendUsage(options.usageFile, {
 						timestamp: new Date().toISOString(),
 						attempt: attemptCounter,
 						provider: options.client.providerHost,
 						providerName: options.provider.name,
-						responseProvider: null,
-						responseModel: null,
+						responseProvider: result.responseProvider,
+						responseModel: result.responseModel,
 						model: modelConfig.model,
 						promptVersion: options.promptVersion,
-						tokensIn: null,
-						tokensOut: null,
-						tokensTotal: null,
-						cachedTokens: null,
-						usageReported: false,
+						tokensIn: result.usage?.promptTokens ?? null,
+						tokensOut: result.usage?.completionTokens ?? null,
+						tokensTotal: result.usage?.totalTokens ?? null,
+						cachedTokens: result.usage?.cachedTokens ?? null,
+						usageReported: result.usageReported,
 						durationMs: result.durationMs,
 						outcome,
-						finishReason: null,
-						costEstimate: null,
+						finishReason: result.finishReason,
+						costEstimate: cost,
 						costSource: options.provider.costSource,
 						dryRun: options.dryRun,
 					});
 					attempts.push({
 						attempt: attemptCounter,
 						model: modelConfig.model,
-						rawResponse: null,
-						tokensIn: null,
-						tokensOut: null,
-						tokensTotal: null,
-						cachedTokens: null,
-						usageReported: false,
+						rawResponse: result.content,
+						tokensIn: result.usage?.promptTokens ?? null,
+						tokensOut: result.usage?.completionTokens ?? null,
+						tokensTotal: result.usage?.totalTokens ?? null,
+						cachedTokens: result.usage?.cachedTokens ?? null,
+						usageReported: result.usageReported,
 						durationMs: result.durationMs,
 						outcome,
-						finishReason: null,
-						costEstimate: null,
+						finishReason: result.finishReason,
+						costEstimate: cost,
 						costSource: options.provider.costSource,
-						responseProvider: null,
-						responseModel: null,
+						responseProvider: result.responseProvider,
+						responseModel: result.responseModel,
 					});
+					if (result.usage) {
+						totalTokensIn += result.usage.promptTokens;
+						totalTokensOut += result.usage.completionTokens;
+					}
+					if (cost !== null) {
+						totalCost += cost;
+						anyCostKnown = true;
+					}
 					failureSummary.push(`${modelConfig.model} attempt ${attemptOnModel}: ${outcome}${result.errorMessage ? ` (${result.errorMessage})` : ""}`);
 					// Transport-level failure: no retry on this model, straight to the next one.
 					break;

@@ -166,9 +166,38 @@ export function createMessagesClient(opts: AiMessagesClientOptions): AiClient {
 					}
 				: null;
 
+		const content = extractTextContent(data.content);
+
+		// plan/ai-providering.md §6.1 fact 1, reproduced live against a real
+		// proxy: max_tokens can be spent entirely on the provider's own
+		// internal reasoning, leaving zero output text — content: "" with
+		// stop_reason: "max_tokens" is a paid non-answer, not a terse valid
+		// one. Every OTHER stop_reason still returns content: "" as usual (an
+		// actually-empty completion is rare but not inherently wrong). usage/
+		// rawUsage are still attached below despite ok:false — the request
+		// was billed, so generate.ts still has to price and log this attempt,
+		// unlike a genuine transport failure where nothing was ever parsed.
+		if (content === "" && data.stop_reason === "max_tokens") {
+			return {
+				ok: false,
+				content: null,
+				finishReason: data.stop_reason,
+				usage,
+				usageReported: usage !== null,
+				httpStatus: response.status,
+				durationMs,
+				errorKind: "empty_response",
+				errorMessage: `empty response body at stop_reason "max_tokens" — the token limit (${opts.maxTokens}) was spent before any output text`,
+				rawUsage: data.usage ?? null,
+				responseModel: data.model ?? null,
+				responseProvider: null,
+				openrouterMetadata: null,
+			};
+		}
+
 		return {
 			ok: true,
-			content: extractTextContent(data.content),
+			content,
 			finishReason: data.stop_reason ?? null,
 			usage,
 			usageReported: usage !== null,

@@ -199,7 +199,16 @@ function buildDailyReport(input: UsageReportInput, balance: BalanceWindow | null
 	// with no usable token count at all — distinct from dayTokensTotal above,
 	// which is generate.ts's own already-summed total across the attempts
 	// that *did* report usage, and says nothing about the ones that didn't.
-	const untrackedToday = records.filter((r) => moscowDateKey(r.timestamp) === input.dateKey && !r.usageReported).length;
+	const todayRecords = records.filter((r) => moscowDateKey(r.timestamp) === input.dateKey);
+	const untrackedToday = todayRecords.filter((r) => !r.usageReported).length;
+	// plan §6.1 fact 3, generalized: a provider that reports usage at all but
+	// says promptTokens: 0 didn't actually count the (always non-empty)
+	// prompt — a literal, reported zero, not the "nothing reported" case
+	// above. computeAttemptCost still runs the "table" math on this 0 as if
+	// it were real (nothing else it can do with what it was given), quietly
+	// underpricing the input side — this line is the honest flag that the
+	// day's shown cost may not be the whole story, not a fix to the math.
+	const zeroPromptTokensToday = todayRecords.filter((r) => r.usageReported && r.tokensIn === 0).length;
 
 	const lines: string[] = [];
 
@@ -211,6 +220,7 @@ function buildDailyReport(input: UsageReportInput, balance: BalanceWindow | null
 	lines.push(`${dateLabel} — модель ${today.model ?? "—"}, попыток ${today.attempts}, source ${today.source}`);
 	lines.push(dayTokensTotal !== null ? `Токены за день: вход ${today.tokensIn}, выход ${today.tokensOut}` : "Токены за день: нет данных");
 	if (untrackedToday > 0) lines.push(`${untrackedToday} попыток без учёта токенов`);
+	if (zeroPromptTokensToday > 0) lines.push(`${zeroPromptTokensToday} попыток: входные токены не отданы`);
 	lines.push(today.totalCost !== null ? `Стоимость дня: ${formatMoney(today.totalCost)}` : "Стоимость дня: не посчитана");
 
 	lines.push(...formatBalanceLines(balance, input.balanceAsOf));

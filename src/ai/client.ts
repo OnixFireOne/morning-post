@@ -29,7 +29,8 @@ export type AiGenerateParams = {
 	responseFormat?: unknown;
 };
 
-export type AiErrorKind = "timeout" | "network" | "http_error" | null;
+/** "empty_response" (clientMessages.ts only, plan/ai-providering.md §6.1 fact 1): a "messages"-protocol reply whose text came back empty at stop_reason "max_tokens" — the token limit was spent before any output, not a genuine (if terse) answer. Unlike the other three kinds, this one still carries real usage/rawUsage — the request was billed, so it must still be priced and logged, just not treated as valid content. */
+export type AiErrorKind = "timeout" | "network" | "http_error" | "empty_response" | null;
 
 export type AiGenerateResult = {
 	ok: boolean;

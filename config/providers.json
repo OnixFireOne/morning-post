@@ -17,21 +17,38 @@
     "balanceSource": "api",
     "unitRate": 1
   },
-  "anthropic": {
-    "name": "anthropic",
-    "baseUrl": "https://api.anthropic.com/v1",
+  "aiprime.messages": {
+    "name": "aiprime.messages",
+    "baseUrl": "https://aiprimetech.io/v1",
     "protocol": "messages",
-    "apiVersion": "2023-06-01",
     "maxTokens": 1024,
     "authStyle": "x-api-key",
     "apiKeyVar": "AI_API_KEY",
     "extraHeaders": {},
-    "primaryModel": "TODO(unverified)",
-    "fallbackModel": "TODO(unverified)",
+    "modelsPath": "/models",
+    "primaryModel": "claude-sonnet-5",
+    "fallbackModel": "claude-opus-5",
     "costSource": "table",
     "priceTable": {
-      "TODO(unverified)": { "priceInPerMillion": 0, "priceOutPerMillion": 0 }
+      "claude-sonnet-5": { "priceInPerMillion": 2, "priceOutPerMillion": 10 },
+      "claude-opus-5": { "priceInPerMillion": 5, "priceOutPerMillion": 25 }
     },
+    "inputOverhead": 0,
+    "balanceSource": "manual",
+    "unitRate": 1
+  },
+  "aiprime.chat_completions": {
+    "name": "aiprime.chat_completions",
+    "baseUrl": "https://aiprimetech.io/v1",
+    "protocol": "chat_completions",
+    "authStyle": "bearer",
+    "apiKeyVar": "AI_API_KEY",
+    "extraHeaders": {},
+    "modelsPath": "/models",
+    "primaryModel": "claude-sonnet-5",
+    "fallbackModel": "claude-opus-5",
+    "costSource": "none",
+    "priceTable": {},
     "inputOverhead": 0,
     "balanceSource": "manual",
     "unitRate": 1

@@ -14,6 +14,9 @@ function client(fetchImpl: FetchLike, extra: Partial<AiMessagesClientOptions> = 
 	return createMessagesClient({ baseUrl: BASE_URL, apiKey: "test-key", maxTokens: 1024, fetchImpl, ...extra });
 }
 
+/** Shared base for every stop_reason: "max_tokens" fixture below — spread from, not copied, per plan/ai-providering.md §9's "экономия тестов" rule. */
+const EMPTY_CONTENT_MAX_TOKENS_BODY: { content: { type: string; text?: string }[]; stop_reason: string } = { content: [], stop_reason: "max_tokens" };
+
 describe("createMessagesClient: generate — request shape", () => {
 	it("POSTs to {baseUrl}/messages with system as its own top-level field, max_tokens, and a single user message", async () => {
 		const fetchImpl: FetchLike = async (url, init) => {
@@ -96,9 +99,43 @@ describe("createMessagesClient: generate — response parsing", () => {
 	});
 
 	it("finishReason is stop_reason as-is, no translation to an OpenAI-style value", async () => {
-		const fetchImpl: FetchLike = async () => ({ ok: true, status: 200, json: async () => ({ content: [], stop_reason: "max_tokens" }) });
+		const fetchImpl: FetchLike = async () => ({ ok: true, status: 200, json: async () => ({ ...EMPTY_CONTENT_MAX_TOKENS_BODY }) });
 		const result = await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+		// This particular body is also the empty_response case tested in detail
+		// below (empty content + stop_reason "max_tokens") — finishReason is
+		// preserved on that path too, which is exactly the point here.
 		expect(result.finishReason).toBe("max_tokens");
+	});
+
+	// plan/ai-providering.md §6.1 fact 1, reproduced live against a real proxy:
+	// max_tokens can be spent entirely on the provider's own internal
+	// reasoning, leaving zero output text. This is the main behavior change
+	// in this revision of the spec.
+	it("empty content with stop_reason \"max_tokens\" is errorKind empty_response, not a valid empty answer — usage/rawUsage still preserved (the attempt was billed)", async () => {
+		const fetchImpl: FetchLike = async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({ ...EMPTY_CONTENT_MAX_TOKENS_BODY, content: [{ type: "text", text: "" }], usage: { input_tokens: 1315, output_tokens: 32 } }),
+		});
+		const result = await client(fetchImpl, { maxTokens: 32 }).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+		expect(result.ok).toBe(false);
+		expect(result.errorKind).toBe("empty_response");
+		expect(result.content).toBeNull();
+		expect(result.finishReason).toBe("max_tokens");
+		// paid attempt: usage/rawUsage survive so generate.ts can still price and log it
+		expect(result.usage).toEqual({ promptTokens: 1315, completionTokens: 32, totalTokens: 1347, cachedTokens: null });
+		expect(result.rawUsage).toEqual({ input_tokens: 1315, output_tokens: 32 });
+		expect(result.errorMessage).not.toBeNull();
+		expect(result.errorMessage).not.toContain("test-key");
+		expect(result.errorMessage).not.toContain(BASE_URL);
+	});
+
+	it("empty content with any other stop_reason stays content: \"\", not an error", async () => {
+		const fetchImpl: FetchLike = async () => ({ ok: true, status: 200, json: async () => ({ ...EMPTY_CONTENT_MAX_TOKENS_BODY, stop_reason: "end_turn" }) });
+		const result = await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
+		expect(result.ok).toBe(true);
+		expect(result.content).toBe("");
+		expect(result.errorKind).toBeNull();
 	});
 
 	it("maps usage: input_tokens/output_tokens to promptTokens/completionTokens, totalTokens is their own sum, cachedTokens from cache_read_input_tokens or null", async () => {

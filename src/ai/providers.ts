@@ -343,6 +343,36 @@ export function resolveProviderProfile(providerName: string | undefined): AiProv
 	return profile;
 }
 
+/** The exact placeholder tools/ai-probe.ts's deriveProfileDraft writes for a value it couldn't derive from a live probe — see plan/ai-providering.md §7.3/§7.2. A profile committed with this still in it must never reach the network. */
+export const TODO_PLACEHOLDER = "TODO(unverified)";
+
+/**
+ * Scans every free-text field of a *resolved* profile (the one AI_PROVIDER
+ * selected) for TODO_PLACEHOLDER, including priceTable's own keys — a
+ * schema-valid profile (validateProviderProfile doesn't know or care what a
+ * string *means*) can still be nothing but unverified guesses. Returns the
+ * field name to name in the startup error, or null when nothing is a
+ * placeholder. Called by src/index.ts's validateStartupConfig, before any
+ * network call — the alternative (a placeholder model id reaching the
+ * provider) is a paid `http_404` and a post that silently degrades to the
+ * template, exactly the failure mode this guard exists to catch at zero cost.
+ */
+export function findTodoPlaceholderField(profile: AiProviderProfile): string | null {
+	const stringFields: [string, string | undefined | null][] = [
+		["baseUrl", profile.baseUrl],
+		["apiKeyVar", profile.apiKeyVar],
+		["primaryModel", profile.primaryModel],
+		["fallbackModel", profile.fallbackModel],
+		["apiVersion", profile.apiVersion],
+		["modelsPath", profile.modelsPath],
+	];
+	for (const [field, value] of stringFields) {
+		if (value === TODO_PLACEHOLDER) return field;
+	}
+	if (Object.keys(profile.priceTable).includes(TODO_PLACEHOLDER)) return "priceTable";
+	return null;
+}
+
 /**
  * A single attempt's cost in USD — the one function that actually reads
  * costSource/priceTable/inputOverhead/unitRate, so every caller (generate.ts,

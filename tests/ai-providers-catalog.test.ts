@@ -12,7 +12,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { listProviderNames, resolveProviderProfile, validateProviderProfile } from "../src/ai/providers.js";
+import { findTodoPlaceholderField, listProviderNames, resolveProviderProfile, TODO_PLACEHOLDER, validateProviderProfile, type AiProviderProfile } from "../src/ai/providers.js";
 
 const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CATALOG_FILE = path.join(REPO_ROOT, "config", "providers.json");
@@ -50,6 +50,21 @@ describe("config/providers.json: the real committed catalog", () => {
 		const text = readFileSync(CATALOG_FILE, "utf8");
 		expect(text).not.toMatch(/sk-[A-Za-z0-9_-]{10,}/);
 		expect(text).not.toMatch(/"apiKey"\s*:/); // the field must be apiKeyVar, never a literal apiKey
+	});
+
+	// plan/ai-providering.md §6 (filled in from the 04.09.2026 ai:probe run):
+	// the unverifiable "anthropic" profile is gone, replaced by the real
+	// aiprime.* profiles, and nothing in the committed catalog is still a
+	// placeholder — a TODO(unverified) reaching git would defeat the whole
+	// point of probing before committing.
+	it("has aiprime.messages and aiprime.chat_completions, no anthropic, and no leftover TODO(unverified) anywhere", () => {
+		const names = listProviderNames();
+		expect(names).toContain("aiprime.messages");
+		expect(names).toContain("aiprime.chat_completions");
+		expect(names).not.toContain("anthropic");
+		for (const name of names) {
+			expect(findTodoPlaceholderField(resolveProviderProfile(name)), `profile "${name}" still has a TODO(unverified) field`).toBeNull();
+		}
 	});
 });
 
@@ -314,5 +329,45 @@ describe("validateProviderProfile: protocol/apiVersion/maxTokens/modelsPath (pla
 
 	it("unknown field is still rejected once the four new fields exist — the allowlist grew, it isn't wide open", () => {
 		expect(() => validateProviderProfile("test", validProfile({ notARealField: true }))).toThrow(/notARealField.*not a recognized field/);
+	});
+});
+
+describe("findTodoPlaceholderField: plan §7.2 — a profile with an unfilled npm run ai:probe placeholder must never reach the network", () => {
+	function cleanProfile(overrides: Partial<AiProviderProfile> = {}): AiProviderProfile {
+		return {
+			name: "test",
+			baseUrl: "https://example.com/v1",
+			protocol: "messages",
+			authStyle: "x-api-key",
+			apiKeyVar: "AI_API_KEY",
+			extraHeaders: {},
+			primaryModel: "real-model",
+			fallbackModel: "real-fallback",
+			costSource: "table",
+			priceTable: { "real-model": { priceInPerMillion: 1, priceOutPerMillion: 2 } },
+			inputOverhead: 0,
+			balanceSource: "manual",
+			unitRate: 1,
+			apiVersion: "2023-06-01",
+			maxTokens: 1024,
+			modelsPath: "/models",
+			...overrides,
+		};
+	}
+
+	it("a fully filled-in profile has no placeholder field", () => {
+		expect(findTodoPlaceholderField(cleanProfile())).toBeNull();
+	});
+
+	it.each<[string, Partial<AiProviderProfile>]>([
+		["baseUrl", { baseUrl: TODO_PLACEHOLDER }],
+		["apiKeyVar", { apiKeyVar: TODO_PLACEHOLDER }],
+		["primaryModel", { primaryModel: TODO_PLACEHOLDER }],
+		["fallbackModel", { fallbackModel: TODO_PLACEHOLDER }],
+		["apiVersion", { apiVersion: TODO_PLACEHOLDER }],
+		["modelsPath", { modelsPath: TODO_PLACEHOLDER }],
+		["priceTable", { priceTable: { [TODO_PLACEHOLDER]: { priceInPerMillion: 0, priceOutPerMillion: 0 } } }],
+	])("detects a TODO(unverified) placeholder in %s, naming that exact field", (field, overrides) => {
+		expect(findTodoPlaceholderField(cleanProfile(overrides))).toBe(field);
 	});
 });

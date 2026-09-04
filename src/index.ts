@@ -2,7 +2,7 @@ import "dotenv/config";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { formatAlert, sendAlert } from "./alert.js";
-import { resolveProviderProfile } from "./ai/providers.js";
+import { findTodoPlaceholderField, resolveProviderProfile } from "./ai/providers.js";
 import { buildUsageReport } from "./ai/usageReport.js";
 import { captureSnapshotAndScreenshot } from "./capture.js";
 import { formatHelpText, parseArgs, type CliArgs } from "./cliArgs.js";
@@ -150,6 +150,17 @@ function validateStartupConfig(): void {
 	if (env.aiEnabled && env.aiStructuredOutput && env.aiProvider.protocol === "messages") {
 		console.error(`[startup] AI_STRUCTURED_OUTPUT=1 is not supported by profile "${env.aiProvider.name}" (protocol: messages).`);
 		process.exit(1);
+	}
+	// plan §7.2: a profile committed with an unfilled npm run ai:probe
+	// placeholder must never reach the network — that's a paid http_404 and a
+	// post that silently degrades to the template, not a config error anyone
+	// would notice until the day's post is already wrong.
+	if (env.aiEnabled) {
+		const todoField = findTodoPlaceholderField(env.aiProvider);
+		if (todoField) {
+			console.error(`[startup] profile "${env.aiProvider.name}": ${todoField} is still "TODO(unverified)" — fill it in from a real npm run ai:probe before enabling AI.`);
+			process.exit(1);
+		}
 	}
 }
 

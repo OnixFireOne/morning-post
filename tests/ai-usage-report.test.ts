@@ -243,7 +243,7 @@ describe("buildUsageReport: mixed costSource within one balance window is flagge
 	});
 });
 
-describe("buildUsageReport: plan/ai-providering.md §7.1 — attempts with no token accounting at all", () => {
+describe("buildUsageReport: plan/ai-providering.md §7.1/§6.1 — the daily summary flags attempts whose token accounting isn't trustworthy", () => {
 	it("adds an 'N попыток без учёта токенов' line for today's own records that reported no usage", () => {
 		const { file, dir } = tmpUsageFile([
 			usageLine({ timestamp: "2026-08-25T06:00:00.000Z", usageReported: true, tokensIn: 100, tokensOut: 50 }),
@@ -275,6 +275,30 @@ describe("buildUsageReport: plan/ai-providering.md §7.1 — attempts with no to
 		try {
 			const report = buildUsageReport(baseInput({ usageFile: file, dateKey: "2026-08-25" }));
 			expect(report).not.toContain("без учёта токенов");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	// plan §6.1 fact 3: a chat_completions-shaped proxy that answers with
+	// usage present but promptTokens: 0 (our own prompt is never actually
+	// empty) — a reported zero, not a missing report, and not to be shown as
+	// an honest $0 input cost.
+	it("adds a 'входные токены не отданы' line for today's records that reported usage but promptTokens: 0", () => {
+		const { file, dir } = tmpUsageFile([usageLine({ timestamp: "2026-08-25T06:00:00.000Z", usageReported: true, tokensIn: 0, tokensOut: 40 })]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, dateKey: "2026-08-25" }));
+			expect(report).toContain("1 попыток: входные токены не отданы");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not flag a genuine tokensIn: null (no usage at all) as 'входные токены не отданы' — that's the separate 'без учёта токенов' case above", () => {
+		const { file, dir } = tmpUsageFile([usageLine({ timestamp: "2026-08-25T06:00:00.000Z", usageReported: false, tokensIn: null, tokensOut: null, costEstimate: null })]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, dateKey: "2026-08-25" }));
+			expect(report).not.toContain("входные токены не отданы");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
