@@ -546,7 +546,7 @@ export function renderProbeReport(results: ProbeResult[], draft: ProfileDraft, m
 		"```",
 		"",
 		draft.fallbackModelVerified === null ? "- Fallback model: not probed (AI_PROBE_MODEL_FALLBACK not set)." : `- Fallback model: ${draft.fallbackModelVerified ? "responded 200 (probe 8)." : "did NOT respond 200 (probe 8) — check the id."}`,
-		draft.secondProfileSuggested ? "- Probe 7 (/chat/completions) returned 200 — a second `*.openai` profile on the same key is possible." : "- Probe 7 (/chat/completions) did not return 200 — no second protocol on this key/endpoint.",
+		draft.secondProfileSuggested ? "- Probe 7 (/chat/completions) returned 200 — a second `*.chat_completions` profile on the same key is possible." : "- Probe 7 (/chat/completions) did not return 200 — no second protocol on this key/endpoint.",
 	];
 
 	const report = [

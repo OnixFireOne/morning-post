@@ -72,6 +72,7 @@ export type AiJsonAttempt = {
 	cachedTokens: number | null;
 	usageReported: boolean;
 	durationMs: number;
+	/** Same closed-in-practice set as UsageRecord.outcome (usage.ts) — see its own doc comment. */
 	outcome: string;
 	finishReason: string | null;
 	costEstimate: number | null;

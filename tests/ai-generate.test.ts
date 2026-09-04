@@ -263,6 +263,36 @@ describe("buildParagraphsAI: usage.jsonl is written for rejected attempts too, b
 		expect(lines[0]!.usageReported).toBe(false);
 	});
 
+	// plan/ai-providering.md §6.1 fact 1: unlike the other three transport
+	// failure kinds, empty_response is a real, billed attempt — its own
+	// distinct outcome string (not lumped into "network_error"), with its
+	// real usage/cost, and it still never counts as a success even though
+	// both models produced one (plan's task 3).
+	it("logs outcome: empty_response with its own real cost — distinct from network_error, and the run still falls back to template", async () => {
+		const usage = { promptTokens: 1315, completionTokens: 32, totalTokens: 1347, cachedTokens: null };
+		const rawUsage = { input_tokens: 1315, output_tokens: 32 };
+		const { client } = fakeClient("provider.example.com", [
+			failResult("empty_response", { usage, usageReported: true, rawUsage }),
+			failResult("empty_response", { usage, usageReported: true, rawUsage }),
+		]);
+		const options = baseOptions({ client });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(result.source).toBe("template"); // real usage/cost never makes a failed attempt count as a success
+		const lines = readUsageLines(options.usageFile);
+		expect(lines).toHaveLength(2);
+		for (const line of lines) {
+			expect(line.outcome).toBe("empty_response");
+			expect(line.outcome).not.toBe("network_error");
+			expect(line.tokensIn).toBe(1315);
+			expect(line.costEstimate).not.toBeNull();
+		}
+		// the spend is still accounted for in the run's own total, even on template fallback
+		expect(result.totalCost).not.toBeNull();
+		expect(result.totalCost).toBeGreaterThan(0);
+	});
+
 	it("usage: null and usageReported: false round-trip through the log without inventing zeros", async () => {
 		const { client } = fakeClient("provider.example.com", [okResult(fixtureText("observation-good"), { usage: null, usageReported: false })]);
 		const options = baseOptions({ client });
@@ -371,6 +401,33 @@ describe("buildParagraphsAI: retry vs fallback split by errorKind", () => {
 		expect(calls[1]!.model).toBe("fallback-model"); // straight to fallback, not a second primary attempt
 		expect(result.source).toBe("ai");
 		expect(result.model).toBe("fallback-model");
+	});
+
+	// plan/ai-providering.md §6.1 fact 1 + this revision's task 2: a same-model
+	// retry at the same maxTokens would reliably reproduce the same empty
+	// answer and get billed for it again — empty_response has to take the
+	// same "straight to fallback" path as any other transport failure, never
+	// a same-model retry the way a content-level validator rejection does.
+	it("empty_response (a paid non-answer) also skips straight to the fallback model — no same-model repeat at the same maxTokens", async () => {
+		const usage = { promptTokens: 1315, completionTokens: 32, totalTokens: 1347, cachedTokens: null };
+		const { client, calls } = fakeClient("provider.example.com", [
+			failResult("empty_response", { usage, usageReported: true, rawUsage: { input_tokens: 1315, output_tokens: 32 } }),
+			okResult(fixtureText("observation-good")),
+		]);
+		const options = baseOptions({ client, primary: modelConfig("primary-model"), fallback: modelConfig("fallback-model"), maxAttemptsPerModel: 2 });
+
+		const result = await buildParagraphsAI(options);
+
+		expect(calls).toHaveLength(2);
+		expect(calls[0]!.model).toBe("primary-model");
+		expect(calls[1]!.model).toBe("fallback-model"); // straight to fallback, not a second primary attempt
+		expect(result.source).toBe("ai");
+		expect(result.model).toBe("fallback-model");
+
+		// the failed primary attempt still shows up in usage.jsonl, priced, not silently dropped
+		const lines = readUsageLines(options.usageFile);
+		expect(lines[0]!.outcome).toBe("empty_response");
+		expect(lines[0]!.costEstimate).not.toBeNull();
 	});
 });
 

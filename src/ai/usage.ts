@@ -28,7 +28,7 @@ export type UsageRecord = {
 	/** false when the provider omitted the usage block entirely for this attempt. */
 	usageReported: boolean;
 	durationMs: number;
-	/** "ok" | "invalid_json" | "validator:<reason>" | "timeout" | "http_<code>" | "network_error". */
+	/** "ok" | "invalid_json" | "validator:<reason>" | "timeout" | "http_<code>" | "network_error" | "empty_response" (plan/ai-providering.md §6.1 fact 1 — a "messages" response that spent max_tokens on internal reasoning with zero output text; billed, so it still carries a real tokensIn/tokensOut/costEstimate above despite being a failure). */
 	outcome: string;
 	finishReason: string | null;
 	/** null unless costEstimate was actually computable for this attempt — see providers.ts's computeAttemptCost for exactly when that is. Always USD now, for both costSource values. */

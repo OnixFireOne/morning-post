@@ -284,7 +284,14 @@ async function runOne(
 	const result = await client.generate({ model: modelId, system, user, timeoutMs });
 
 	if (!result.ok) {
-		const label = result.errorKind === "timeout" ? "таймаут" : result.errorKind === "http_error" ? `HTTP ${result.httpStatus}` : "сетевая ошибка";
+		const label =
+			result.errorKind === "timeout"
+				? "таймаут"
+				: result.errorKind === "http_error"
+					? `HTTP ${result.httpStatus}`
+					: result.errorKind === "empty_response"
+						? "пустой ответ (empty_response)" // plan §6.1 fact 1 — a paid attempt, not an unlabeled network blip
+						: "сетевая ошибка";
 		return { kind: "transport", label, errorMessage: result.errorMessage, durationMs: result.durationMs };
 	}
 
