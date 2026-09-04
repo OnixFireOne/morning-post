@@ -20,15 +20,17 @@
   "anthropic": {
     "name": "anthropic",
     "baseUrl": "https://api.anthropic.com/v1",
+    "protocol": "messages",
+    "apiVersion": "2023-06-01",
+    "maxTokens": 1024,
     "authStyle": "x-api-key",
     "apiKeyVar": "AI_API_KEY",
     "extraHeaders": {},
-    "primaryModel": "claude-sonnet-4-7",
-    "fallbackModel": "claude-opus-5",
+    "primaryModel": "TODO(unverified)",
+    "fallbackModel": "TODO(unverified)",
     "costSource": "table",
     "priceTable": {
-      "claude-sonnet-4-7": { "priceInPerMillion": 14, "priceOutPerMillion": 42 },
-      "claude-opus-5": { "priceInPerMillion": 20, "priceOutPerMillion": 60 }
+      "TODO(unverified)": { "priceInPerMillion": 0, "priceOutPerMillion": 0 }
     },
     "inputOverhead": 0,
     "balanceSource": "manual",

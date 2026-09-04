@@ -6,10 +6,11 @@
 // directly and inject a mocked fetchImpl, proving the gate never lets a
 // real HTTP request through, instead of trusting the wiring by inspection.
 import path from "node:path";
-import { createAiClient, type FetchLike } from "./ai/client.js";
+import type { FetchLike } from "./ai/client.js";
 import { buildParagraphsAI, type AiModelConfig } from "./ai/generate.js";
 import { stateHistoryToAiHistory } from "./ai/payload.js";
 import type { AiProviderProfile } from "./ai/providers.js";
+import { createTransport } from "./ai/transport.js";
 import type { Facts } from "./facts.js";
 import { buildCaption, buildCaptionFromParagraphs, buildLeaderLines, buildParagraphs, CAPTION_LIMIT, type PostParagraphs } from "./render.js";
 import type { StateHistory } from "./state.js";
@@ -41,7 +42,6 @@ export type RenderPostConfig = {
 	dryRun: boolean;
 	/** --ai — the only way to spend real money outside a real (non-dry) publish. Meaningless when dryRun is false: a real publish already asks the model whenever aiEnabled is true, this field or not. */
 	aiFlag: boolean;
-	aiBaseUrl: string;
 	aiApiKey: string;
 	aiProxyUrl: string;
 	aiModel: string;
@@ -83,8 +83,8 @@ function templateResult(facts: Facts): RenderedPost {
  * first (plan/ai-start-integration.md, section 9).
  *
  * `fetchImpl` is optional and only ever passed by tests — production always
- * leaves it undefined, so createAiClient() falls through to the real global
- * fetch exactly as before this parameter existed.
+ * leaves it undefined, so createTransport()'s underlying client falls
+ * through to the real global fetch exactly as before this parameter existed.
  */
 export async function renderPost(facts: Facts, history: StateHistory, skipAi: boolean, config: RenderPostConfig, fetchImpl?: FetchLike): Promise<RenderedPost> {
 	if (!config.aiEnabled || skipAi) {
@@ -107,12 +107,9 @@ export async function renderPost(facts: Facts, history: StateHistory, skipAi: bo
 	}
 
 	const aiHistory = stateHistoryToAiHistory(history, facts.dateKey);
-	const client = createAiClient({
-		baseUrl: config.aiBaseUrl,
+	const client = createTransport(config.aiProvider, {
 		apiKey: config.aiApiKey,
 		proxyUrl: config.aiProxyUrl || undefined,
-		authStyle: config.aiProvider.authStyle,
-		extraHeaders: config.aiProvider.extraHeaders,
 		fetchImpl,
 	});
 	const primary: AiModelConfig = { model: config.aiModel };

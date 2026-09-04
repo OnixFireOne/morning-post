@@ -1,8 +1,8 @@
 // Prints exactly what would go to the model — no network call, ever. This is
 // the one tool in tools/ that must be safe to run with a dead/misconfigured
-// AI_BASE_URL, no AI_API_KEY, or even offline: it never imports client.ts
-// (no createAiClient, no fetch), so there is no transport to accidentally
-// exercise. Deliberately narrow: it only ever calls the exact same functions
+// provider, no AI_API_KEY, or even offline: it never imports a transport
+// module (no createTransport, no fetch), so there is no transport to
+// accidentally exercise. Deliberately narrow: it only ever calls the exact same functions
 // generate.ts calls (buildSystemPrompt/buildUserPrompt/buildRetryObservationPrompt,
 // buildAiPayload, stateHistoryToAiHistory) — no reimplementation, no
 // preview-only branch, so what this prints can never quietly diverge from

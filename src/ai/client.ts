@@ -5,7 +5,8 @@
 // the underlying error text is discarded entirely (not scrubbed) and replaced
 // with a message built only from known-safe parts (host, masked proxy).
 import { ProxyAgent } from "undici";
-import { getHost, maskProxyUrl } from "./mask.js";
+import { joinUrl, sanitizeNetworkError } from "./http.js";
+import { getHost } from "./mask.js";
 
 export type AiUsage = {
 	promptTokens: number;
@@ -140,10 +141,6 @@ type OpenAiModelList = {
 	data?: { id: string }[];
 };
 
-function joinUrl(baseUrl: string, path: string): string {
-	return `${baseUrl.replace(/\/+$/, "")}${path}`;
-}
-
 /** Defensive on purpose (see OpenAiChatCompletion.openrouter_metadata's own comment) — a missing field, or one with neither sub-field a usable string, comes back null rather than `{model: null, provider: null}`: the caller (tools/ai-compare.ts) treats null as "try the next fallback tier", and an object with two nulls would look like a confirmed-empty answer instead. */
 function extractOpenrouterMetadata(data: OpenAiChatCompletion): { model: string | null; provider: string | null } | null {
 	const raw = data.openrouter_metadata;
@@ -154,14 +151,12 @@ function extractOpenrouterMetadata(data: OpenAiChatCompletion): { model: string 
 	return { model, provider };
 }
 
-/** The raw error is discarded on purpose — it can embed the proxy URL with credentials. */
-function sanitizeNetworkError(baseUrl: string, proxyUrl: string | undefined): string {
-	const parts = ["network error calling", getHost(baseUrl)];
-	if (proxyUrl) parts.push(`via proxy ${maskProxyUrl(proxyUrl)}`);
-	return parts.join(" ");
+/** plan/ai-providering.md §7.1: a usage block with only one of the two token counts is worse than no usage block at all — half a count invites a wrong-looking cost estimate instead of an honest "unknown". Both counts present and numeric, or the caller treats it as absent. */
+function hasCompleteTokenCounts(usage: NonNullable<OpenAiChatCompletion["usage"]>): boolean {
+	return typeof usage.prompt_tokens === "number" && typeof usage.completion_tokens === "number";
 }
 
-export function createAiClient(opts: AiClientOptions): AiClient {
+export function createChatCompletionsClient(opts: AiClientOptions): AiClient {
 	const fetchImpl = opts.fetchImpl ?? (fetch as unknown as FetchLike);
 	const dispatcher = opts.proxyUrl ? new ProxyAgent(opts.proxyUrl) : undefined;
 	const providerHost = getHost(opts.baseUrl);
@@ -261,14 +256,15 @@ export function createAiClient(opts: AiClientOptions): AiClient {
 		}
 
 		const choice = data.choices?.[0];
-		const usage = data.usage
-			? {
-					promptTokens: data.usage.prompt_tokens,
-					completionTokens: data.usage.completion_tokens,
-					totalTokens: data.usage.total_tokens,
-					cachedTokens: data.usage.prompt_tokens_details?.cached_tokens ?? null,
-				}
-			: null;
+		const usage =
+			data.usage && hasCompleteTokenCounts(data.usage)
+				? {
+						promptTokens: data.usage.prompt_tokens,
+						completionTokens: data.usage.completion_tokens,
+						totalTokens: data.usage.total_tokens,
+						cachedTokens: data.usage.prompt_tokens_details?.cached_tokens ?? null,
+					}
+				: null;
 
 		return {
 			ok: true,

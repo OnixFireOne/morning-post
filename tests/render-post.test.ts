@@ -47,6 +47,7 @@ function testProvider(overrides: Partial<AiProviderProfile> = {}): AiProviderPro
 	return {
 		name: "test-provider",
 		baseUrl: "https://provider.example.com",
+		protocol: "chat_completions",
 		authStyle: "bearer",
 		apiKeyVar: "AI_API_KEY",
 		extraHeaders: {},
@@ -66,7 +67,6 @@ function baseConfig(overrides: Partial<RenderPostConfig> = {}): RenderPostConfig
 		aiEnabled: true,
 		dryRun: false,
 		aiFlag: false,
-		aiBaseUrl: "https://proxy.example.com/v1",
 		aiApiKey: "test-key",
 		aiProxyUrl: "",
 		aiModel: "primary-model",

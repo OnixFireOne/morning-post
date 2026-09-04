@@ -153,17 +153,103 @@ Windows-скрипта — там только `.env` и CLI-флаги, см. �
   набирать заново на каждый конкретный прогон обкатки, нечему остаться
   забытым включённым между прогонами.
 - **Каталог провайдеров — `config/providers.json`**, не код. Ключ объекта —
-  имя провайдера (`AI_PROVIDER` выбирает один из них), значения — базовый
-  URL, стиль авторизации, `apiKeyVar` (имя переменной с ключом, не сам ключ —
-  секретов в файле нет), модели по умолчанию, тарификация. `src/ai/
-  providers.ts` — единственная точка входа: грузит файл и проверяет его по
-  схеме при старте (неизвестное поле, отсутствующий `baseUrl`, `costSource:
-  "table"` без `priceTable`, пустой `apiKeyVar` — всё это падает с понятным
-  сообщением, называющим провайдера и поле). `AI_PROVIDERS_FILE` — путь к
-  альтернативному каталогу вне репозитория (правка на VPS без `git pull`);
-  пусто — берётся встроенный `config/providers.json`; если путь задан, но
-  файл не читается или не проходит проверку — старт падает, отката на
-  встроенный каталог нет.
+  имя провайдера (`AI_PROVIDER` выбирает один из них, **обязателен**: пусто →
+  ошибка старта со списком ключей каталога, никакого молчаливого выбора
+  провайдера по умолчанию), значения — базовый URL, протокол, стиль
+  авторизации, `apiKeyVar` (имя переменной с ключом, не сам ключ — секретов в
+  файле нет), модели по умолчанию, тарификация. `src/ai/providers.ts` —
+  единственная точка входа: грузит файл и проверяет его по схеме при старте
+  (неизвестное поле, отсутствующий `baseUrl`, `costSource: "table"` без
+  `priceTable`, пустой `apiKeyVar` — всё это падает с понятным сообщением,
+  называющим провайдера и поле). `AI_PROVIDERS_FILE` — путь к альтернативному
+  каталогу вне репозитория (правка на VPS без `git pull`); пусто — берётся
+  встроенный `config/providers.json`; если путь задан, но файл не читается
+  или не проходит проверку — старт падает, отката на встроенный каталог нет.
+
+  Профиль — три независимые оси, ни одна не выводится из другой: ключ
+  (`apiKeyVar`), адрес (`baseUrl`) и формат протокола (`protocol`). Один
+  прокси на одном ключе может отдавать оба формата на разных путях — тогда
+  это два профиля (`myproxy.messages` + `myproxy.openai`), переключение между
+  ними — одна строка `AI_PROVIDER=` в `.env`, без повторного ввода секрета.
+
+  | Поле | Тип | Правило |
+  | --- | --- | --- |
+  | `protocol` | `"chat_completions" \| "messages"` | необязательное, отсутствие = `"chat_completions"` (обратная совместимость профиля `openrouter`) |
+  | `apiVersion` | `string` | только при `protocol: "messages"` (шлётся заголовком `anthropic-version`); запрещено при `"chat_completions"` — там такого заголовка нет |
+  | `maxTokens` | `number > 0` | обязательно при `protocol: "messages"` (`max_tokens` — обязательное поле `POST /messages`); опционально при `"chat_completions"` |
+  | `modelsPath` | `string \| null` | необязательное, отсутствие = `"/models"`; `null` = у провайдера нет листинга — `npm run ai:models` печатает одну строку и выходит, публикацию это не блокирует |
+  | `costSource` | `"provider" \| "table" \| "none"` | `"provider"` читает реальную стоимость из ответа; `"table"` считает по `priceTable` (обязателен непустым); `"none"` — ни то ни другое, `costEstimate` всегда `null`, никогда не выдуманный 0. `priceTable` обязан быть пустым (`{}`) при `"provider"`/`"none"` |
+
+  Остальные поля (`baseUrl`/`authStyle`/`apiKeyVar`/`extraHeaders`/
+  `primaryModel`/`fallbackModel`/`priceTable`/`inputOverhead`/
+  `balanceSource`/`unitRate`) не изменились — см. `src/ai/providers.ts`.
+
+  Два примера для стороннего прокси (подключение — правка каталога, ноль
+  правок в `src/`), один и тот же ключ на оба протокола:
+
+  ```json
+  "myproxy.messages": {
+    "name": "myproxy.messages",
+    "baseUrl": "https://proxy.example/anthropic/v1",
+    "protocol": "messages",
+    "maxTokens": 1024,
+    "authStyle": "bearer",
+    "apiKeyVar": "AI_API_KEY",
+    "extraHeaders": {},
+    "primaryModel": "<id из npm run ai:probe / ai:models>",
+    "fallbackModel": "<id из npm run ai:probe / ai:models>",
+    "costSource": "none",
+    "priceTable": {},
+    "inputOverhead": 0,
+    "balanceSource": "manual",
+    "unitRate": 1
+  },
+  "myproxy.openai": {
+    "name": "myproxy.openai",
+    "baseUrl": "https://proxy.example/openai/v1",
+    "protocol": "chat_completions",
+    "authStyle": "bearer",
+    "apiKeyVar": "AI_API_KEY",
+    "extraHeaders": {},
+    "primaryModel": "<id из npm run ai:probe / ai:models>",
+    "fallbackModel": "<id из npm run ai:probe / ai:models>",
+    "costSource": "none",
+    "priceTable": {},
+    "inputOverhead": 0,
+    "balanceSource": "manual",
+    "unitRate": 1
+  }
+  ```
+
+  **Профиль `anthropic` не сверен**: `primaryModel`/`fallbackModel`/
+  `priceTable` — буквально `"TODO(unverified)"` в `config/providers.json`
+  (правдоподобная догадка вместо реального id — худший исход, пост молча
+  ушёл бы в шаблон каждый день). Настоящие значения появляются только после
+  живой проверки (`npm run ai:probe` → `npm run dry -- --ai`, раздел 8
+  `plan/ai-providering.md`) и ручной правки каталога. **Дата последней сверки
+  цен: не сверялись** — обновить эту строку в README тем же коммитом, что и
+  реальные цены в `config/providers.json`.
+
+  Ключ — одна переменная (`apiKeyVar`), пока ключ фактически один: сейчас у
+  всех профилей `apiKeyVar: "AI_API_KEY"`. Вторая переменная (`AI_API_KEY_2`
+  и т.д.) заводится только тогда, когда ключей реально стало два — например,
+  один прокси даёт разные ключи под разные протоколы, или старый и новый
+  провайдер временно живут параллельно на переезде. Это правка данных, не
+  кода: `apiKeyVar` уже читается из каталога (`process.env[profile.apiKeyVar]`
+  в `src/index.ts`), заранее заводить вторую переменную не нужно.
+- **`npm run ai:probe`** — диагностика прокси/провайдера одной командой, без
+  единого реального запроса от боевого кода: восемь изолированных проб
+  (`GET /models` под `x-api-key` и `Bearer`, `POST /messages` с `anthropic-
+  version` и без, путь `/v1/messages`, `Bearer` вместо `x-api-key`,
+  `POST /chat/completions` — доступен ли второй протокол на том же ключе,
+  опционально — вторая, фолбэк-модель); ошибка на одной пробе не прерывает
+  остальные. Отчёт — `reports/probe/probe-<дата>-<время>.md` (в `.gitignore`,
+  в отличие от `reports/*.md` у `ai:compare` — это одноразовая диагностика,
+  не платный воспроизводимый прогон), ключ в нём везде замаскирован. В конце
+  отчёта — черновик профиля для `config/providers.json`, где у каждого поля
+  подписано, из какой пробы оно выведено, а невыводимое помечено
+  `TODO(unverified)`. Переменные `AI_PROBE_*` в `.env.example` читаются
+  только этим скриптом, никогда кодом в `src/`.
 - **`AI_USAGE_REPORT`** (`daily` / `weekly` / `0`) — ежедневная (или
   недельная) сводка расхода и остатка баланса на `TELEGRAM_ADMIN_CHAT_ID`
   после каждой публикации.

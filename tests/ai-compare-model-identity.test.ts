@@ -110,6 +110,17 @@ describe("resolveModelIdentity: three tiers, never throws", () => {
 		const result = await resolveModelIdentity(source(), "https://openrouter.ai/api/v1", "key", "m", fetchImpl);
 		expect(result).toEqual({ source: "response_body", model: null, provider: null });
 	});
+
+	// plan/ai-providering.md §4: tier 2 (GET /models/{slug}) is OpenRouter-only
+	// — a "messages" profile or one with modelsPath: null skips it entirely
+	// (tools/ai-compare.ts's own shouldSkipCanonicalLookup), going straight to
+	// tier 3 instead of spending a request that could only ever 404.
+	it("skipCanonicalLookup: true skips tier 2 entirely, going straight to tier 3, even when tier 1 is empty", async () => {
+		const fetchImpl = vi.fn<FetchLike>();
+		const result = await resolveModelIdentity(source({ responseModel: "claude-x", responseProvider: null }), "https://api.anthropic.com/v1", "key", "m", fetchImpl, true);
+		expect(result).toEqual({ source: "response_body", model: "claude-x", provider: null });
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
 });
 
 describe("formatModelIdentityLine", () => {

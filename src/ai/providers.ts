@@ -10,10 +10,12 @@
 // tests/ai-providers-leak.test.ts, which scans the rest of src/ for exactly
 // those two things (it excludes this file, not the catalog file — the
 // catalog lives outside src/ entirely, so it was never in that scan's scope
-// to begin with). Selected by AI_PROVIDER (src/index.ts's readEnv());
-// AI_BASE_URL/AI_MODEL/AI_MODEL_FALLBACK, when set in .env, still override a
-// profile's own defaults for exactly that field — the profile fills gaps, it
-// doesn't force a value nobody asked to change.
+// to begin with). Selected by AI_PROVIDER (src/index.ts's readEnv()) —
+// required, no silent default: an empty AI_PROVIDER is a startup error
+// naming the catalog's own keys, not a fallback to whichever profile used to
+// be first. No env override for baseUrl/model/protocol/maxTokens/etc. either
+// (plan/ai-providering.md §7.2) — a provider's own properties live only in
+// the catalog; .env only ever picks *which* profile and holds secrets.
 //
 // The dollar is the only unit anywhere in this project — see
 // src/ai/usageReport.ts's own CURRENCY_SYMBOL comment. A provider's own
@@ -25,22 +27,28 @@ import path from "node:path";
 
 export type AiAuthStyle = "bearer" | "x-api-key";
 
+/** "chat_completions" (OpenAI-shaped POST /chat/completions, the historical default) or "messages" (Anthropic-native POST /messages). Named after the wire format, not a vendor — a third-party proxy speaking either shape gets read honestly, and tests/ai-providers-leak.test.ts's ban on provider names in src/ stays satisfied without an exception. src/ai/transport.ts's createTransport is the one place in the project that switches on this value. */
+export type AiProtocol = "chat_completions" | "messages";
+
 export type AiModelPrice = { priceInPerMillion: number; priceOutPerMillion: number };
 
 /**
- * Describes *accuracy*, not a unit — both values already produce genuine USD
- * figures (computeAttemptCost applies unitRate to both). "provider": the
- * response itself carries the real bill (OpenRouter's `usage.cost`, verified
- * 26.08 against a live request — matches the public per-model price to the
- * digit, keyed by `usage.prompt_tokens`, the same count billing uses) —
- * exact, nothing to estimate. "table": the response has no cost field at
- * all, so this attempt is priced from `priceTable` below instead — an
- * estimate under our own assumed per-model rate, not the provider's own
- * confirmed charge. A balance window mixing the two isn't mixing
- * incompatible units (usageReport.ts's own note is careful to say so) — it's
- * mixing an exact sum with a partly-estimated one.
+ * Describes *accuracy*, not a unit — both non-"none" values already produce
+ * genuine USD figures (computeAttemptCost applies unitRate to both).
+ * "provider": the response itself carries the real bill (OpenRouter's
+ * `usage.cost`, verified 26.08 against a live request — matches the public
+ * per-model price to the digit, keyed by `usage.prompt_tokens`, the same
+ * count billing uses) — exact, nothing to estimate. "table": the response
+ * has no cost field at all, so this attempt is priced from `priceTable`
+ * below instead — an estimate under our own assumed per-model rate, not the
+ * provider's own confirmed charge. "none": neither a real bill nor a price
+ * table entry is possible for this provider — computeAttemptCost always
+ * returns null, never a fabricated 0 (see its own comment). A balance window
+ * mixing "provider" and "table" isn't mixing incompatible units
+ * (usageReport.ts's own note is careful to say so) — it's mixing an exact
+ * sum with a partly-estimated one; "none" attempts are excluded from both.
  */
-export type AiCostSource = "provider" | "table";
+export type AiCostSource = "provider" | "table" | "none";
 
 /** "api": balance is meant to be read from the provider's own account/credits endpoint — not implemented yet (no real call happens anywhere in this codebase; see README before wiring one in). "manual": there is no such endpoint — the only balance this app can ever know is AI_BALANCE_START minus what usage.jsonl itself records having spent. */
 export type AiBalanceSource = "api" | "manual";
@@ -48,6 +56,8 @@ export type AiBalanceSource = "api" | "manual";
 export type AiProviderProfile = {
 	name: string;
 	baseUrl: string;
+	/** Always resolved by the validator (default "chat_completions" when the JSON field is absent) — never actually undefined on a profile that came from loadCatalog(). createTransport() still defends against undefined for a hand-built profile that skipped validation. */
+	protocol: AiProtocol;
 	authStyle: AiAuthStyle;
 	/** Name of the environment variable holding this provider's API key — never the key value itself (the catalog file is committed to git; see index.ts's readEnv, `process.env[providerProfile.apiKeyVar]`, for where the real value actually gets read). Same pattern as LiteLLM's `os.environ/VAR` and llm-env's `api_key_var=`. Both current profiles point at "AI_API_KEY" today — nothing stops a future entry from naming a different variable if it needs its own secret. */
 	apiKeyVar: string;
@@ -73,9 +83,13 @@ export type AiProviderProfile = {
 	balanceSource: AiBalanceSource;
 	/** How many USD one unit of priceTable/usage.cost is worth — 1 for both current profiles (both already bill in USD). The one place this ever gets multiplied in is computeAttemptCost() below; everything downstream of it (usage.jsonl, *.ai.json, every report) only ever sees the resulting dollar figure. */
 	unitRate: number;
+	/** `anthropic-version` header value at protocol "messages" — undefined when the profile doesn't set one (a proxy usually doesn't require it; api.anthropic.com does). Forbidden at protocol "chat_completions": that wire format has no such header, so a value here would silently do nothing. */
+	apiVersion?: string;
+	/** POST /messages' required `max_tokens` field — required (and validated > 0) at protocol "messages". Optional at "chat_completions": when set there, it's sent as max_tokens too; when unset, chat_completions requests carry no max_tokens at all, unchanged from before this field existed. */
+	maxTokens?: number;
+	/** GET path for listModels() — undefined defaults to "/models" (both current profiles' real behavior); explicit null means the provider has no listing endpoint at all, and listModels() throws a distinct "not supported" error instead of making a request. Empty string is rejected by the validator — not a meaningful third state. */
+	modelsPath?: string | null;
 };
-
-export const DEFAULT_PROVIDER_NAME = "openrouter";
 
 /** cwd-relative, same convention as every other default path in this app (STATE_FILE, OUT_DIR, FACTS_LOG_FILE) — the app is always run from the repo root, whether via `npm run`, tsx directly, or the Dockerfile's WORKDIR. */
 const DEFAULT_PROVIDERS_FILE = "config/providers.json";
@@ -83,6 +97,7 @@ const DEFAULT_PROVIDERS_FILE = "config/providers.json";
 const KNOWN_PROFILE_FIELDS = new Set([
 	"name",
 	"baseUrl",
+	"protocol",
 	"authStyle",
 	"apiKeyVar",
 	"extraHeaders",
@@ -93,6 +108,9 @@ const KNOWN_PROFILE_FIELDS = new Set([
 	"inputOverhead",
 	"balanceSource",
 	"unitRate",
+	"apiVersion",
+	"maxTokens",
+	"modelsPath",
 ]);
 
 /**
@@ -129,10 +147,50 @@ export function validateProviderProfile(key: string, raw: unknown): AiProviderPr
 
 	const baseUrl = requireString("baseUrl");
 
+	const protocolRaw = obj.protocol;
+	let protocol: AiProtocol;
+	if (protocolRaw === undefined) {
+		protocol = "chat_completions";
+	} else if (protocolRaw === "chat_completions" || protocolRaw === "messages") {
+		protocol = protocolRaw;
+	} else {
+		fail("protocol", 'must be "chat_completions" or "messages" (omit for the default, "chat_completions")');
+	}
+
 	const authStyle = requireString("authStyle");
 	if (authStyle !== "bearer" && authStyle !== "x-api-key") fail("authStyle", 'must be "bearer" or "x-api-key"');
 
 	const apiKeyVar = requireString("apiKeyVar");
+
+	const apiVersionRaw = obj.apiVersion;
+	let apiVersion: string | undefined;
+	if (apiVersionRaw !== undefined) {
+		if (typeof apiVersionRaw !== "string" || apiVersionRaw.trim() === "") fail("apiVersion", "must be a non-empty string when present");
+		if (protocol === "chat_completions") fail("apiVersion", 'is not allowed at protocol "chat_completions" — anthropic-version is a "messages"-only header');
+		apiVersion = apiVersionRaw;
+	}
+
+	const maxTokensRaw = obj.maxTokens;
+	let maxTokens: number | undefined;
+	if (maxTokensRaw !== undefined) {
+		if (typeof maxTokensRaw !== "number" || !Number.isFinite(maxTokensRaw) || maxTokensRaw <= 0) fail("maxTokens", "must be a positive number when present");
+		maxTokens = maxTokensRaw;
+	}
+	if (protocol === "messages" && maxTokens === undefined) {
+		fail("maxTokens", 'is required at protocol "messages" — POST /messages requires it on every request');
+	}
+
+	const modelsPathRaw = obj.modelsPath;
+	let modelsPath: string | null | undefined;
+	if (modelsPathRaw === undefined) {
+		modelsPath = undefined;
+	} else if (modelsPathRaw === null) {
+		modelsPath = null;
+	} else if (typeof modelsPathRaw === "string" && modelsPathRaw.trim() !== "") {
+		modelsPath = modelsPathRaw;
+	} else {
+		fail("modelsPath", 'must be a non-empty string, null (no listing endpoint), or omitted (default "/models")');
+	}
 
 	const extraHeadersRaw = obj.extraHeaders;
 	if (typeof extraHeadersRaw !== "object" || extraHeadersRaw === null || Array.isArray(extraHeadersRaw)) {
@@ -148,7 +206,7 @@ export function validateProviderProfile(key: string, raw: unknown): AiProviderPr
 	const fallbackModel = requireString("fallbackModel");
 
 	const costSource = requireString("costSource");
-	if (costSource !== "provider" && costSource !== "table") fail("costSource", 'must be "provider" or "table"');
+	if (costSource !== "provider" && costSource !== "table" && costSource !== "none") fail("costSource", 'must be "provider", "table", or "none"');
 
 	const priceTableRaw = obj.priceTable;
 	if (typeof priceTableRaw !== "object" || priceTableRaw === null || Array.isArray(priceTableRaw)) {
@@ -168,6 +226,13 @@ export function validateProviderProfile(key: string, raw: unknown): AiProviderPr
 	if (costSource === "table" && Object.keys(priceTable).length === 0) {
 		fail("priceTable", 'must have at least one entry when costSource is "table"');
 	}
+	// "provider" reads the real bill straight off the response; "none" has no
+	// price to look up at all — either way a non-empty priceTable here would
+	// be data nothing ever reads, exactly the kind of stale leftover that
+	// outlives a costSource change and misleads the next person reading it.
+	if ((costSource === "provider" || costSource === "none") && Object.keys(priceTable).length > 0) {
+		fail("priceTable", 'must be empty ({}) when costSource is "provider" or "none" — it is never consulted');
+	}
 
 	const inputOverheadRaw = obj.inputOverhead;
 	if (typeof inputOverheadRaw !== "number" || !Number.isFinite(inputOverheadRaw) || inputOverheadRaw < 0) {
@@ -185,6 +250,7 @@ export function validateProviderProfile(key: string, raw: unknown): AiProviderPr
 	return {
 		name,
 		baseUrl,
+		protocol,
 		authStyle,
 		apiKeyVar,
 		extraHeaders,
@@ -195,6 +261,9 @@ export function validateProviderProfile(key: string, raw: unknown): AiProviderPr
 		inputOverhead: inputOverheadRaw,
 		balanceSource,
 		unitRate: unitRateRaw,
+		apiVersion,
+		maxTokens,
+		modelsPath,
 	};
 }
 
@@ -260,10 +329,13 @@ export function listProviderNames(): string[] {
 	return Object.keys(loadCatalog());
 }
 
-/** Empty/undefined resolves to DEFAULT_PROVIDER_NAME; any other unrecognized name throws — a typo in AI_PROVIDER must fail loudly at startup, not silently fall back to some default provider and spend against the wrong account. */
+/** AI_PROVIDER is required — empty/undefined throws, listing the catalog's own keys, same as an unrecognized name. A silent default (the old DEFAULT_PROVIDER_NAME="openrouter") is exactly the "someone's specific wallet, chosen by nobody typing anything" this project otherwise refuses to do (a typo/omission must fail loudly at startup, never spend against a provider nobody asked for). */
 export function resolveProviderProfile(providerName: string | undefined): AiProviderProfile {
-	const name = providerName || DEFAULT_PROVIDER_NAME;
 	const catalog = loadCatalog();
+	const name = providerName?.trim();
+	if (!name) {
+		throw new Error(`AI_PROVIDER is required — expected one of: ${Object.keys(catalog).join(", ")}`);
+	}
 	const profile = catalog[name];
 	if (!profile) {
 		throw new Error(`unknown AI_PROVIDER: "${name}" — expected one of: ${Object.keys(catalog).join(", ")}`);
@@ -283,6 +355,10 @@ export function resolveProviderProfile(providerName: string | undefined): AiProv
  * one; a "table" cost source never looks at it at all.
  */
 export function computeAttemptCost(profile: AiProviderProfile, modelId: string, usage: { promptTokens: number; completionTokens: number } | null, rawUsage: unknown): number | null {
+	// "none": no real bill and nothing to look up — always null, never a
+	// fabricated 0 (see AiCostSource's own comment).
+	if (profile.costSource === "none") return null;
+
 	if (profile.costSource === "provider") {
 		if (!rawUsage || typeof rawUsage !== "object" || !("cost" in rawUsage)) return null;
 		const cost = (rawUsage as Record<string, unknown>).cost;

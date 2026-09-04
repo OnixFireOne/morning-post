@@ -243,6 +243,73 @@ describe("buildUsageReport: mixed costSource within one balance window is flagge
 	});
 });
 
+describe("buildUsageReport: plan/ai-providering.md §7.1 — attempts with no token accounting at all", () => {
+	it("adds an 'N попыток без учёта токенов' line for today's own records that reported no usage", () => {
+		const { file, dir } = tmpUsageFile([
+			usageLine({ timestamp: "2026-08-25T06:00:00.000Z", usageReported: true, tokensIn: 100, tokensOut: 50 }),
+			usageLine({ timestamp: "2026-08-25T07:00:00.000Z", usageReported: false, tokensIn: null, tokensOut: null, costEstimate: null }),
+		]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, dateKey: "2026-08-25" }));
+			expect(report).toContain("1 попыток без учёта токенов");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("says nothing when every one of today's records reported usage", () => {
+		const { file, dir } = tmpUsageFile([usageLine({ timestamp: "2026-08-25T06:00:00.000Z", usageReported: true })]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, dateKey: "2026-08-25" }));
+			expect(report).not.toContain("без учёта токенов");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("only counts *today's* records, not other days in the same file", () => {
+		const { file, dir } = tmpUsageFile([
+			usageLine({ timestamp: "2026-08-24T06:00:00.000Z", usageReported: false, tokensIn: null, tokensOut: null, costEstimate: null }),
+			usageLine({ timestamp: "2026-08-25T06:00:00.000Z", usageReported: true }),
+		]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, dateKey: "2026-08-25" }));
+			expect(report).not.toContain("без учёта токенов");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("buildUsageReport: mixedCostSource also fires for partial cost coverage (plan §7.1), not just mixed provider/table", () => {
+	it("flags the window when a real response has no costEstimate mixed with a record that did get priced, even under the same costSource", () => {
+		const { file, dir } = tmpUsageFile([
+			usageLine({ timestamp: "2026-08-24T06:00:00.000Z", costSource: "table", costEstimate: 0.05, usageReported: true }),
+			usageLine({ timestamp: "2026-08-25T06:00:00.000Z", costSource: "table", costEstimate: null, usageReported: true }),
+		]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-24" }));
+			expect(report).toContain("вовсе не учтена");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does NOT flag a uniformly-untracked window (costSource: none throughout, nothing ever priced) — that's a consistent zero, not a partial one", () => {
+		const { file, dir } = tmpUsageFile([
+			usageLine({ timestamp: "2026-08-24T06:00:00.000Z", costSource: "none", costEstimate: null, usageReported: true }),
+			usageLine({ timestamp: "2026-08-25T06:00:00.000Z", costSource: "none", costEstimate: null, usageReported: true }),
+		]);
+		try {
+			const report = buildUsageReport(baseInput({ usageFile: file, balanceStart: 1000, balanceAsOf: "2026-08-24" }));
+			expect(report).not.toContain("вовсе не учтена");
+			expect(report).not.toContain("оценка по таблице цен");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("buildUsageReport: dryRun lines count toward balance/remaining but not the average/forecast (section 3.4)", () => {
 	it("a dryRun:true day's spend reduces the balance but is excluded from среднее/прогноз", () => {
 		const { file, dir } = tmpUsageFile([

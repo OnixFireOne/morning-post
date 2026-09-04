@@ -116,6 +116,7 @@ function testProvider(overrides: Partial<AiProviderProfile> = {}): AiProviderPro
 	return {
 		name: "test-provider",
 		baseUrl: "https://provider.example.com",
+		protocol: "chat_completions",
 		authStyle: "bearer",
 		apiKeyVar: "AI_API_KEY",
 		extraHeaders: {},

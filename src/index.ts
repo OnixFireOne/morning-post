@@ -81,20 +81,22 @@ function readEnv(args: CliArgs) {
 		// .env.example. When it's off, none of the fields below are read.
 		aiEnabled: process.env.AI_ENABLED === "1",
 		// AI_PROVIDER selects the profile (src/ai/providers.ts) — the one place
-		// a provider name, base URL default, model default, or price number may
-		// live (tests/ai-providers-leak.test.ts enforces this). AI_BASE_URL/
-		// AI_MODEL/AI_MODEL_FALLBACK, when actually set in .env, still override
-		// the selected profile's own default for exactly that field — the
-		// profile fills gaps, it never forces a value nobody asked to change.
+		// a provider name, base URL, protocol, model default, or price number
+		// may live (tests/ai-providers-leak.test.ts enforces this). No env
+		// override for any of those any more (plan/ai-providering.md §7.2) —
+		// .env only ever picks *which* profile and holds secrets.
 		aiProvider: providerProfile,
-		aiBaseUrl: process.env.AI_BASE_URL || providerProfile.baseUrl,
 		// Which env var actually holds the secret is itself part of the
 		// catalog entry now (AiProviderProfile.apiKeyVar) — never a literal
 		// "AI_API_KEY" here, so a future provider naming a different variable
 		// doesn't need a code change to be read correctly.
 		aiApiKey: process.env[providerProfile.apiKeyVar] || "",
-		aiModel: process.env.AI_MODEL || providerProfile.primaryModel,
-		aiModelFallback: process.env.AI_MODEL_FALLBACK || providerProfile.fallbackModel,
+		aiModel: providerProfile.primaryModel,
+		aiModelFallback: providerProfile.fallbackModel,
+		// json_schema/response_format has no equivalent at protocol "messages"
+		// at all — validateStartupConfig below refuses to start rather than
+		// silently sending an unlabeled request (plan §4).
+		aiStructuredOutput: process.env.AI_STRUCTURED_OUTPUT === "1",
 		aiTimeoutMs: Number(process.env.AI_TIMEOUT_MS || 25000),
 		aiTotalBudgetMs: Number(process.env.AI_TOTAL_BUDGET_MS || 70000),
 		aiMaxAttempts: Number(process.env.AI_MAX_ATTEMPTS || 2),
@@ -104,8 +106,9 @@ function readEnv(args: CliArgs) {
 		// run. Meaningless (and unchecked) outside --dry: a real, non-dry
 		// publish already asks the model whenever AI_ENABLED=1, flag or not.
 		aiFlag: args.ai,
-		// Not AI_BASE_URL's own proxy (AiClientOptions.proxyUrl) — this is the
-		// outbound network proxy for reaching it at all (section 2).
+		// The outbound network proxy for reaching the provider at all (section 2)
+		// — separate from a proxy *being* the provider (AI_PROVIDER pointing at
+		// one instead of api.anthropic.com/openrouter.ai directly).
 		aiProxyUrl: process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "",
 		// Section 3.3: daily/weekly usage summary to the admin chat.
 		aiUsageReport: usageReportMode as "daily" | "weekly" | "0",
@@ -134,8 +137,18 @@ function validateStartupConfig(): void {
 		console.error("[startup] TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_CHAT_ID must both be set — alerts have nowhere to go otherwise.");
 		process.exit(1);
 	}
-	if (env.aiEnabled && (!env.aiBaseUrl || !env.aiApiKey || !env.aiModel || !env.aiModelFallback)) {
-		console.error(`[startup] AI_ENABLED=1 requires AI_BASE_URL, ${env.aiProvider.apiKeyVar}, AI_MODEL, and AI_MODEL_FALLBACK to all be set.`);
+	// baseUrl/primaryModel/fallbackModel always come from the profile itself,
+	// already non-empty (validateProviderProfile guarantees it) — the one
+	// value left for the operator to actually get wrong is the secret.
+	if (env.aiEnabled && !env.aiApiKey) {
+		console.error(`[startup] AI_ENABLED=1 requires ${env.aiProvider.apiKeyVar} to be set — profile "${env.aiProvider.name}" reads its key from that variable.`);
+		process.exit(1);
+	}
+	// response_format/json_schema has no equivalent at protocol "messages" —
+	// see src/ai/clientMessages.ts's own comment. Refuse to start rather than
+	// silently send a request without the schema nobody would notice is missing.
+	if (env.aiEnabled && env.aiStructuredOutput && env.aiProvider.protocol === "messages") {
+		console.error(`[startup] AI_STRUCTURED_OUTPUT=1 is not supported by profile "${env.aiProvider.name}" (protocol: messages).`);
 		process.exit(1);
 	}
 }

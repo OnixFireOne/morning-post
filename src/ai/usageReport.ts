@@ -112,6 +112,15 @@ type BalanceWindow = {
 	 * providers.ts's own AiCostSource doc comment) — formatBalanceLines turns
 	 * this into a note that the sum includes an estimate, not that it mixed
 	 * incompatible currencies.
+	 *
+	 * plan/ai-providering.md §7.1 extends the same flag to a second trigger:
+	 * some in-window record got a real response (usageReported) yet still has
+	 * no costEstimate at all — a costSource:"none" profile, or a "table"
+	 * profile with a model missing from its own priceTable — mixed with
+	 * *other* records that did get priced. A uniformly-untracked window
+	 * (every record costSource:"none", nothing ever priced) does NOT trip
+	 * this — that's an honest, consistent zero, not a partial one; only an
+	 * inconsistent mix within the same window is worth flagging.
 	 */
 	mixedCostSource: boolean;
 };
@@ -142,7 +151,11 @@ function computeBalanceWindow(records: UsageRecord[], balanceStart: number, bala
 	const inWindow = records.filter((r) => moscowDateKey(r.timestamp) >= balanceAsOf);
 	const accumulated = inWindow.reduce((sum, r) => sum + (r.costEstimate ?? 0), 0);
 	const daysCount = new Set(inWindow.map((r) => moscowDateKey(r.timestamp))).size;
-	const mixedCostSource = new Set(inWindow.map(costSourceKey)).size > 1;
+	const differentCostSources = new Set(inWindow.map(costSourceKey)).size > 1;
+	// See BalanceWindow.mixedCostSource's own comment — a real response with
+	// no price mixed in with at least one record that did get priced.
+	const partiallyUncosted = inWindow.some((r) => r.costEstimate !== null) && inWindow.some((r) => r.usageReported && r.costEstimate === null);
+	const mixedCostSource = differentCostSources || partiallyUncosted;
 
 	const realRecords = inWindow.filter((r) => (r.dryRun ?? false) === false);
 	const realAccumulated = realRecords.reduce((sum, r) => sum + (r.costEstimate ?? 0), 0);
@@ -163,7 +176,7 @@ function formatBalanceLines(balance: BalanceWindow | null, balanceAsOf: string |
 		`Остаток баланса: ${formatMoney(balance.remaining)}`,
 	];
 	if (balance.mixedCostSource) {
-		lines.push("⚠️ часть этой суммы — оценка по таблице цен (costSource: table), не точный счёт от провайдера (costSource: provider).");
+		lines.push("⚠️ часть этой суммы — оценка по таблице цен (costSource: table) или вовсе не учтена (ответ был, стоимость посчитать не удалось), не точный счёт от провайдера (costSource: provider).");
 	}
 	// Real-only rate — a dry-run obkatka burst on one day must not inflate the
 	// modeled daily spend, even though that same spend already reduced
@@ -177,11 +190,16 @@ function formatBalanceLines(balance: BalanceWindow | null, balanceAsOf: string |
 	return lines;
 }
 
-function buildDailyReport(input: UsageReportInput, balance: BalanceWindow | null): string {
+function buildDailyReport(input: UsageReportInput, balance: BalanceWindow | null, records: UsageRecord[]): string {
 	const { today } = input;
 	const dateLabel = dateKeyToLabel(input.dateKey);
 	const dayTokensTotal = today.tokensIn !== null && today.tokensOut !== null ? today.tokensIn + today.tokensOut : null;
 	const underBalanceWarn = balance !== null && input.balanceWarn !== null && balance.remaining < input.balanceWarn;
+	// plan §7.1: how many of *today's own* attempts (any outcome) came back
+	// with no usable token count at all — distinct from dayTokensTotal above,
+	// which is generate.ts's own already-summed total across the attempts
+	// that *did* report usage, and says nothing about the ones that didn't.
+	const untrackedToday = records.filter((r) => moscowDateKey(r.timestamp) === input.dateKey && !r.usageReported).length;
 
 	const lines: string[] = [];
 
@@ -192,6 +210,7 @@ function buildDailyReport(input: UsageReportInput, balance: BalanceWindow | null
 
 	lines.push(`${dateLabel} — модель ${today.model ?? "—"}, попыток ${today.attempts}, source ${today.source}`);
 	lines.push(dayTokensTotal !== null ? `Токены за день: вход ${today.tokensIn}, выход ${today.tokensOut}` : "Токены за день: нет данных");
+	if (untrackedToday > 0) lines.push(`${untrackedToday} попыток без учёта токенов`);
 	lines.push(today.totalCost !== null ? `Стоимость дня: ${formatMoney(today.totalCost)}` : "Стоимость дня: не посчитана");
 
 	lines.push(...formatBalanceLines(balance, input.balanceAsOf));
@@ -242,5 +261,5 @@ export function buildUsageReport(input: UsageReportInput): string | null {
 	const records = readUsageRecords(input.usageFile);
 	const balance = input.balanceStart !== null && input.balanceAsOf !== null ? computeBalanceWindow(records, input.balanceStart, input.balanceAsOf) : null;
 
-	return input.mode === "weekly" ? buildWeeklyReport(input, balance, records) : buildDailyReport(input, balance);
+	return input.mode === "weekly" ? buildWeeklyReport(input, balance, records) : buildDailyReport(input, balance, records);
 }

@@ -12,15 +12,18 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_PROVIDER_NAME, listProviderNames, resolveProviderProfile, validateProviderProfile } from "../src/ai/providers.js";
+import { listProviderNames, resolveProviderProfile, validateProviderProfile } from "../src/ai/providers.js";
 
 const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CATALOG_FILE = path.join(REPO_ROOT, "config", "providers.json");
 
 describe("config/providers.json: the real committed catalog", () => {
-	it("loads and resolves the default provider profile", () => {
-		const profile = resolveProviderProfile(undefined);
-		expect(profile.name).toBe(DEFAULT_PROVIDER_NAME);
+	it("AI_PROVIDER is required — an empty/undefined value throws instead of resolving some default profile", () => {
+		expect(() => resolveProviderProfile(undefined)).toThrow(/AI_PROVIDER is required/);
+	});
+
+	it("resolves a real profile by its own key", () => {
+		const profile = resolveProviderProfile("openrouter");
 		expect(profile.baseUrl).toBeTruthy();
 		expect(profile.apiKeyVar).toBeTruthy();
 	});
@@ -120,7 +123,17 @@ describe("validateProviderProfile: negative cases — each names the provider an
 	});
 
 	it("invalid costSource", () => {
-		expect(() => validateProviderProfile("test", validProfile({ costSource: "estimate" }))).toThrow(/costSource.*"provider" or "table"/);
+		expect(() => validateProviderProfile("test", validProfile({ costSource: "estimate" }))).toThrow(/costSource.*"provider", "table", or "none"/);
+	});
+
+	it("costSource 'none' is accepted, with an empty priceTable — nothing to look up", () => {
+		expect(() => validateProviderProfile("test", validProfile({ costSource: "none", priceTable: {} }))).not.toThrow();
+	});
+
+	it("costSource 'provider'/'none' reject a non-empty priceTable — it would never be read", () => {
+		const table = { m: { priceInPerMillion: 1, priceOutPerMillion: 2 } };
+		expect(() => validateProviderProfile("test", validProfile({ costSource: "provider", priceTable: table }))).toThrow(/priceTable.*empty.*"provider" or "none"/);
+		expect(() => validateProviderProfile("test", validProfile({ costSource: "none", priceTable: table }))).toThrow(/priceTable.*empty.*"provider" or "none"/);
 	});
 
 	it("invalid balanceSource", () => {
@@ -237,6 +250,69 @@ describe("AI_PROVIDERS_FILE: an alternative catalog outside the repo", () => {
 
 	it("an empty AI_PROVIDERS_FILE (whitespace only) is treated as unset — falls through to config/providers.json", () => {
 		process.env.AI_PROVIDERS_FILE = "   ";
-		expect(resolveProviderProfile(undefined).name).toBe(DEFAULT_PROVIDER_NAME);
+		expect(resolveProviderProfile("openrouter").name).toBe("openrouter");
+	});
+});
+
+describe("validateProviderProfile: protocol/apiVersion/maxTokens/modelsPath (plan/ai-providering.md §3)", () => {
+	function validProfile(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			name: "test",
+			baseUrl: "https://example.com/v1",
+			authStyle: "bearer",
+			apiKeyVar: "TEST_API_KEY",
+			extraHeaders: {},
+			primaryModel: "m",
+			fallbackModel: "m",
+			costSource: "provider",
+			priceTable: {},
+			inputOverhead: 0,
+			balanceSource: "api",
+			unitRate: 1,
+			...overrides,
+		};
+	}
+
+	it("protocol omitted defaults to \"chat_completions\" — backward compatible with a profile that never set it", () => {
+		expect(validateProviderProfile("test", validProfile()).protocol).toBe("chat_completions");
+	});
+
+	it("invalid protocol value is rejected, naming the field", () => {
+		expect(() => validateProviderProfile("test", validProfile({ protocol: "bogus" }))).toThrow(/protocol.*"chat_completions" or "messages"/);
+	});
+
+	it("apiVersion is forbidden at protocol \"chat_completions\" (the default) — that wire format has no such header", () => {
+		expect(() => validateProviderProfile("test", validProfile({ apiVersion: "2023-06-01" }))).toThrow(/apiVersion.*not allowed at protocol "chat_completions"/);
+	});
+
+	it("apiVersion is allowed (and optional) at protocol \"messages\"", () => {
+		const withVersion = validateProviderProfile("test", validProfile({ protocol: "messages", maxTokens: 1024, apiVersion: "2023-06-01" }));
+		expect(withVersion.apiVersion).toBe("2023-06-01");
+		const withoutVersion = validateProviderProfile("test", validProfile({ protocol: "messages", maxTokens: 1024 }));
+		expect(withoutVersion.apiVersion).toBeUndefined();
+	});
+
+	it("maxTokens is required at protocol \"messages\"", () => {
+		expect(() => validateProviderProfile("test", validProfile({ protocol: "messages" }))).toThrow(/maxTokens.*required at protocol "messages"/);
+	});
+
+	it("maxTokens must be a positive number when present, at either protocol", () => {
+		expect(() => validateProviderProfile("test", validProfile({ protocol: "messages", maxTokens: 0 }))).toThrow(/maxTokens.*positive number/);
+		expect(() => validateProviderProfile("test", validProfile({ maxTokens: -5 }))).toThrow(/maxTokens.*positive number/);
+	});
+
+	it("maxTokens is optional at protocol \"chat_completions\" — omitting it is fine", () => {
+		expect(() => validateProviderProfile("test", validProfile())).not.toThrow();
+	});
+
+	it("modelsPath: omitted, explicit null, and non-empty string are all valid; empty string is not", () => {
+		expect(validateProviderProfile("test", validProfile()).modelsPath).toBeUndefined();
+		expect(validateProviderProfile("test", validProfile({ modelsPath: null })).modelsPath).toBeNull();
+		expect(validateProviderProfile("test", validProfile({ modelsPath: "/v1/models" })).modelsPath).toBe("/v1/models");
+		expect(() => validateProviderProfile("test", validProfile({ modelsPath: "" }))).toThrow(/modelsPath.*non-empty string, null.*or omitted/);
+	});
+
+	it("unknown field is still rejected once the four new fields exist — the allowlist grew, it isn't wide open", () => {
+		expect(() => validateProviderProfile("test", validProfile({ notARealField: true }))).toThrow(/notARealField.*not a recognized field/);
 	});
 });

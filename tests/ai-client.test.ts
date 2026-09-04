@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { createAiClient, type AiClientOptions, type FetchLike } from "../src/ai/client.js";
+import { createChatCompletionsClient, type AiClientOptions, type FetchLike } from "../src/ai/client.js";
 
 const BASE_URL = "https://proxy.example.com/v1";
 
 function client(fetchImpl: FetchLike, extra: Partial<AiClientOptions> = {}) {
-	return createAiClient({ baseUrl: BASE_URL, apiKey: "test-key", fetchImpl, ...extra });
+	return createChatCompletionsClient({ baseUrl: BASE_URL, apiKey: "test-key", fetchImpl, ...extra });
 }
 
-describe("createAiClient: generate — success", () => {
+describe("createChatCompletionsClient: generate — success", () => {
 	it("returns content, usage, and finishReason, and calls the right URL/headers", async () => {
 		const fetchImpl: FetchLike = async (url, init) => {
 			expect(url).toBe("https://proxy.example.com/v1/chat/completions");
@@ -110,7 +110,7 @@ describe("createAiClient: generate — success", () => {
 	});
 });
 
-describe("createAiClient: generate — failure classification", () => {
+describe("createChatCompletionsClient: generate — failure classification", () => {
 	it("marks a non-2xx response as http_error, with the status code and no content", async () => {
 		const fetchImpl: FetchLike = async () => ({ ok: false, status: 401, json: async () => ({}) });
 		const result = await client(fetchImpl).generate({ model: "m", system: "s", user: "u", timeoutMs: 1000 });
@@ -176,7 +176,7 @@ describe("createAiClient: generate — failure classification", () => {
 	});
 });
 
-describe("createAiClient: listModels", () => {
+describe("createChatCompletionsClient: listModels", () => {
 	it("returns model ids from the /models endpoint with the right auth header", async () => {
 		const fetchImpl: FetchLike = async (url, init) => {
 			expect(url).toBe("https://proxy.example.com/v1/models");
@@ -204,14 +204,14 @@ describe("createAiClient: listModels", () => {
 	});
 });
 
-describe("createAiClient: providerHost", () => {
+describe("createChatCompletionsClient: providerHost", () => {
 	it("exposes just the host of baseUrl, for safe logging", () => {
 		const c = client(async () => ({ ok: true, status: 200, json: async () => ({}) }));
 		expect(c.providerHost).toBe("proxy.example.com");
 	});
 });
 
-describe("createAiClient: authStyle (26.08 provider migration — src/ai/providers.ts's AiProviderProfile.authStyle)", () => {
+describe("createChatCompletionsClient: authStyle (26.08 provider migration — src/ai/providers.ts's AiProviderProfile.authStyle)", () => {
 	it("defaults to Bearer when authStyle is unset, unchanged from before this option existed", async () => {
 		const fetchImpl: FetchLike = async (_url, init) => {
 			expect(init.headers.Authorization).toBe("Bearer test-key");
@@ -247,7 +247,7 @@ describe("createAiClient: authStyle (26.08 provider migration — src/ai/provide
 	});
 });
 
-describe("createAiClient: responseProvider/responseModel (26.08 — OpenRouter-specific top-level response fields)", () => {
+describe("createChatCompletionsClient: responseProvider/responseModel (26.08 — OpenRouter-specific top-level response fields)", () => {
 	it("reads provider/model straight from the response body on success", async () => {
 		const fetchImpl: FetchLike = async () => ({
 			ok: true,
@@ -288,7 +288,7 @@ describe("createAiClient: responseProvider/responseModel (26.08 — OpenRouter-s
 // ("not found", not "not ready yet"). X-OpenRouter-Metadata: enabled (set by
 // providers.ts's OPENROUTER profile, on every request) makes the same
 // response carry this instead — no second call.
-describe("createAiClient: openrouterMetadata", () => {
+describe("createChatCompletionsClient: openrouterMetadata", () => {
 	function fetchWith(body: Record<string, unknown>): FetchLike {
 		return async () => ({
 			ok: true,

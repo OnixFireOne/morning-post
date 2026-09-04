@@ -45,10 +45,11 @@ import "dotenv/config";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createAiClient, type AiClient, type FetchLike } from "../src/ai/client.js";
+import type { AiClient, FetchLike } from "../src/ai/client.js";
 import { buildAiPayload, stateHistoryToAiHistory, type AiPayload } from "../src/ai/payload.js";
 import { buildRetryObservationPrompt, buildSystemPrompt, buildUserPrompt } from "../src/ai/prompt.js";
 import { computeAttemptCost, resolveProviderProfile, type AiProviderProfile } from "../src/ai/providers.js";
+import { createTransport } from "../src/ai/transport.js";
 import { attemptObservationTrim, isTrimmableReason, validateAiObservation, type ObservationValidationFailureReason, type TrimmableFailureReason } from "../src/ai/validator.js";
 import { computeFacts, shiftDateKey, type Facts, type StateHistory } from "../src/facts.js";
 import { buildParagraphs, pickPicture, type PostParagraphs } from "../src/render.js";
@@ -450,22 +451,42 @@ export async function fetchCanonicalModelSlug(baseUrl: string, apiKey: string, m
  *   1. openrouter_metadata off the response the run already got — no extra
  *      request at all (see ModelIdentitySource/client.ts's own comments).
  *   2. GET /api/v1/models/{slug} for canonical_slug — the one extra request
- *      this ever makes, only when tier 1 came up empty.
+ *      this ever makes, only when tier 1 came up empty. OpenRouter-specific
+ *      (same as tier 1, which naturally never fires for another protocol —
+ *      clientMessages.ts always reports openrouterMetadata: null); skipped
+ *      outright via `skipCanonicalLookup` for a profile that plainly isn't
+ *      OpenRouter-shaped (protocol: "messages", or modelsPath: null — plan/
+ *      ai-providering.md §4), so a profile with no listing at all doesn't
+ *      spend a request finding that out on every single report.
  *   3. The response body's own plain model/provider fields — never fails,
  *      so resolution always produces *something*, worst case a note that
  *      the exact version is unavailable (see formatModelIdentityLine).
  */
-export async function resolveModelIdentity(source: ModelIdentitySource | null, baseUrl: string, apiKey: string, modelSlug: string, fetchImpl: FetchLike): Promise<ModelIdentityResult | null> {
+export async function resolveModelIdentity(
+	source: ModelIdentitySource | null,
+	baseUrl: string,
+	apiKey: string,
+	modelSlug: string,
+	fetchImpl: FetchLike,
+	skipCanonicalLookup = false,
+): Promise<ModelIdentityResult | null> {
 	if (source === null) return null;
 
 	if (source.openrouterMetadata?.model) {
 		return { source: "openrouter_metadata", model: source.openrouterMetadata.model, provider: source.openrouterMetadata.provider };
 	}
 
-	const canonical = await fetchCanonicalModelSlug(baseUrl, apiKey, modelSlug, fetchImpl);
-	if (canonical.ok) return { source: "canonical_slug", slug: canonical.slug };
+	if (!skipCanonicalLookup) {
+		const canonical = await fetchCanonicalModelSlug(baseUrl, apiKey, modelSlug, fetchImpl);
+		if (canonical.ok) return { source: "canonical_slug", slug: canonical.slug };
+	}
 
 	return { source: "response_body", model: source.responseModel, provider: source.responseProvider };
+}
+
+/** OpenRouter-only lookups (resolveModelIdentity's tiers 1/2) are pointless for a profile that plainly can't be OpenRouter — see resolveModelIdentity's own comment. */
+function shouldSkipCanonicalLookup(provider: AiProviderProfile): boolean {
+	return provider.protocol === "messages" || provider.modelsPath === null;
 }
 
 /** Shared by runCompare and runChain's own header — null means nothing in the report ever got a real response at all. */
@@ -774,7 +795,14 @@ export async function runCompare(opts: CompareOptions): Promise<void> {
 	// path (see resolveModelIdentity's own comment). A missing/failed
 	// resolution just changes what the header line says, it never blocks the
 	// report.
-	const modelIdentity = await resolveModelIdentity(lastModelIdentitySource(allRuns), opts.provider.baseUrl, opts.apiKey, opts.modelId, opts.modelIdentityFetchImpl ?? (fetch as unknown as FetchLike));
+	const modelIdentity = await resolveModelIdentity(
+		lastModelIdentitySource(allRuns),
+		opts.provider.baseUrl,
+		opts.apiKey,
+		opts.modelId,
+		opts.modelIdentityFetchImpl ?? (fetch as unknown as FetchLike),
+		shouldSkipCanonicalLookup(opts.provider),
+	);
 
 	const header = [
 		`# ai:compare — ${opts.modelId}`,
@@ -1253,7 +1281,14 @@ export async function runChain(opts: ChainOptions): Promise<void> {
 	}
 
 	// Once, after every run — see runCompare's own identical comment.
-	const modelIdentity = await resolveModelIdentity(lastModelIdentitySource(allRuns), opts.provider.baseUrl, opts.apiKey, opts.modelId, opts.modelIdentityFetchImpl ?? (fetch as unknown as FetchLike));
+	const modelIdentity = await resolveModelIdentity(
+		lastModelIdentitySource(allRuns),
+		opts.provider.baseUrl,
+		opts.apiKey,
+		opts.modelId,
+		opts.modelIdentityFetchImpl ?? (fetch as unknown as FetchLike),
+		shouldSkipCanonicalLookup(opts.provider),
+	);
 
 	const header = [
 		`# ai:compare --chain=${opts.chainLength} — ${opts.modelId}`,
@@ -1282,20 +1317,21 @@ export async function runChain(opts: ChainOptions): Promise<void> {
 // --- CLI entry point ---
 
 function readEnv() {
-	// Same AI_PROVIDER selection and AI_BASE_URL/AI_MODEL/AI_MODEL_FALLBACK
-	// override pattern as src/index.ts's own readEnv() — see providers.ts.
-	// inputOverhead has no env knob at all (see providers.ts's own comment on
-	// the field) — this tool's own report already shows the raw usage block
-	// for a human to check by eye (formatRawUsageBlock), same as production.
+	// Same AI_PROVIDER selection as src/index.ts's own readEnv() — see
+	// providers.ts. No env override for baseUrl/model any more (plan/
+	// ai-providering.md §7.2): a provider's own properties live only in the
+	// catalog. inputOverhead has no env knob at all either (see providers.ts's
+	// own comment on the field) — this tool's own report already shows the
+	// raw usage block for a human to check by eye (formatRawUsageBlock), same
+	// as production.
 	const provider = resolveProviderProfile(process.env.AI_PROVIDER);
 	return {
-		baseUrl: process.env.AI_BASE_URL || provider.baseUrl,
 		// Which env var holds the key is part of the catalog entry itself
 		// (AiProviderProfile.apiKeyVar) — same as src/index.ts's own readEnv().
 		apiKey: process.env[provider.apiKeyVar] || "",
 		proxyUrl: process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "",
-		model: process.env.AI_MODEL || provider.primaryModel,
-		modelFallback: process.env.AI_MODEL_FALLBACK || provider.fallbackModel,
+		model: provider.primaryModel,
+		modelFallback: provider.fallbackModel,
 		provider,
 		timeoutMs: Number(process.env.AI_TIMEOUT_MS || 25000),
 		promptVersion: Number(process.env.PROMPT_VERSION || 1),
@@ -1418,31 +1454,23 @@ async function main() {
 	const args = parseCliArgs(process.argv.slice(2));
 	const env = readEnv();
 
-	if (!env.baseUrl || !env.apiKey) {
-		console.error(`[ai:compare] AI_BASE_URL and ${env.provider.apiKeyVar} must both be set in .env.`);
+	if (!env.apiKey) {
+		console.error(`[ai:compare] ${env.provider.apiKeyVar} must be set in .env.`);
 		process.exitCode = 1;
 		return;
 	}
 
+	// env.model always falls back to provider.primaryModel, itself guaranteed
+	// non-empty by validateProviderProfile — --model= is the only way this
+	// could ever come out empty, and only by passing it that value on purpose.
 	const modelId = args.model || env.model;
-	if (!modelId) {
-		console.error("[ai:compare] no model — set AI_MODEL in .env or pass --model=<id>.");
-		process.exitCode = 1;
-		return;
-	}
 
 	// computeAttemptCost (src/ai/providers.ts) already prices whichever model
 	// actually answered a given attempt by looking that model's own id up in
 	// provider.priceTable (or, for costSource: "provider", by reading the
 	// response's own real bill) — no separate primary/fallback price
 	// selection needed here the way the old per-env-var knobs required.
-	const client = createAiClient({
-		baseUrl: env.baseUrl,
-		apiKey: env.apiKey,
-		proxyUrl: env.proxyUrl || undefined,
-		authStyle: env.provider.authStyle,
-		extraHeaders: env.provider.extraHeaders,
-	});
+	const client = createTransport(env.provider, { apiKey: env.apiKey, proxyUrl: env.proxyUrl || undefined });
 	const stateHistory = readState(env.stateFile);
 
 	// reports/ is tracked by git (unlike out/) — a report from a real, paid
