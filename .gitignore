@@ -6,3 +6,7 @@ dist/
 /data/
 *.log
 .claude/
+# ai:probe's own diagnostic reports — unlike reports/*.md (real paid ai:compare
+# runs, tracked deliberately), a probe report is disposable: it just describes
+# whatever proxy was configured at the time, re-run any time for free.
+/reports/probe/

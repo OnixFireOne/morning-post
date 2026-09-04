@@ -24,3 +24,15 @@ export function getHost(url: string): string {
 		return "(invalid url)";
 	}
 }
+
+/** `sk-ant-...` -> `sk-a...12` — enough to tell two keys apart in a report without exposing either. A secret of 8 chars or less returns a fixed placeholder that contains none of it, since a short prefix+suffix would be most or all of the value. */
+export function maskSecret(secret: string): string {
+	if (!secret || secret.length <= 8) return "***";
+	return `${secret.slice(0, 4)}...${secret.slice(-2)}`;
+}
+
+/** Last-resort scrub: replaces every literal occurrence of `secret` in `text` with `***`, for text that isn't built from known-safe parts (e.g. a proxy's own response body echoing the key back in an error message). A no-op when secret is empty, so an unset key can't turn this into "mask every empty string". */
+export function redactSecret(text: string, secret: string): string {
+	if (!secret) return text;
+	return text.split(secret).join("***");
+}

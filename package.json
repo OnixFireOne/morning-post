@@ -19,7 +19,8 @@
     "post:force": "tsx src/index.ts --force",
     "ai:models": "tsx src/ai/listModels.ts",
     "ai:compare": "tsx tools/ai-compare.ts",
-    "ai:prompt": "tsx tools/ai-prompt.ts"
+    "ai:prompt": "tsx tools/ai-prompt.ts",
+    "ai:probe": "tsx tools/ai-probe.ts"
   },
   "dependencies": {
     "dotenv": "17.4.2",

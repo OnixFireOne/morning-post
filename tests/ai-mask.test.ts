@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getHost, maskProxyUrl } from "../src/ai/mask.js";
+import { getHost, maskProxyUrl, maskSecret, redactSecret } from "../src/ai/mask.js";
 
 describe("maskProxyUrl", () => {
 	it("masks the password and drops path/query, keeping protocol/user/host/port", () => {
@@ -33,5 +33,29 @@ describe("getHost", () => {
 	it("returns a safe placeholder for an unparsable URL instead of throwing", () => {
 		expect(() => getHost("not a url")).not.toThrow();
 		expect(getHost("not a url")).toBe("(invalid url)");
+	});
+});
+
+describe("maskSecret", () => {
+	it("keeps the first 4 and last 2 characters, never the middle", () => {
+		expect(maskSecret("sk-ant-api03-realvalue")).toBe("sk-a...ue");
+	});
+
+	it("returns a fixed placeholder for empty/short input, containing none of it", () => {
+		expect(maskSecret("")).toBe("***");
+		expect(maskSecret("short")).toBe("***");
+	});
+});
+
+describe("redactSecret", () => {
+	it("replaces every occurrence of the secret in the text with ***", () => {
+		const text = "error: bad key sk-real-key in request, retried with sk-real-key again";
+		const redacted = redactSecret(text, "sk-real-key");
+		expect(redacted).not.toContain("sk-real-key");
+		expect(redacted).toBe("error: bad key *** in request, retried with *** again");
+	});
+
+	it("is a no-op when the secret is empty — an unset key can't redact every empty string", () => {
+		expect(redactSecret("some text", "")).toBe("some text");
 	});
 });
